@@ -19,10 +19,16 @@
 
 ## Установка
 
-Для установки или обновления используйте встроенный скрипт:
+Вы можете установить или обновить Router Bot одной командой с помощью `curl` или `wget`:
 
+**Через curl:**
 ```bash
-sudo sh router_bot_setup.sh
+sh -c "$(curl -sSL https://raw.githubusercontent.com/zootsman/router-bot/master/install.sh)"
+```
+
+**Через wget:**
+```bash
+sh -c "$(wget -qO- https://raw.githubusercontent.com/zootsman/router-bot/master/install.sh)"
 ```
 
 ## Структура проекта
