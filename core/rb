@@ -1,0 +1,240 @@
+#!/bin/sh
+# rb — Router Bot helper. Управление ботом из терминала.
+# Установлен в /opt/bin/rb. Исходник: /opt/router_bot/core/rb
+
+BOT_DIR=/opt/router_bot
+S98=/opt/etc/init.d/S98routerbot
+S97=/opt/etc/init.d/S97tgroutes
+S99=/opt/etc/init.d/S99routerbot_health
+LOG=/opt/var/log/router_bot.log
+CONF=$BOT_DIR/config.env
+VER_FILE=$BOT_DIR/VERSION
+PIDFILE=/var/run/routerbot.pid
+GIVEUP=/var/run/routerbot.giveup
+
+show_help() {
+    cat << 'EOF'
+
+  Router Bot — управление из терминала
+
+  Использование:  rb <команда> [аргументы]
+
+  ── Сервис ─────────────────────────────────────────
+    start, s         Запустить бота
+    stop, x          Остановить бота
+    restart, r       Перезапустить
+    reset            Сбросить giveup-маркер (после 10 падений)
+    status, st       Статус: процессы, порт, giveup
+
+  ── Диагностика ────────────────────────────────────
+    logs [N]         Последние N строк лога (по умолч. 40)
+    follow, f        Лог в реальном времени (Ctrl+C — выход)
+    version, v       Версия бота
+    config, c        Содержимое config.env
+    modules, m       Включённые модули
+    routes           Маршруты Telegram (table 16385)
+    health           Запустить healthcheck
+    rebuild          Перестроить маршруты Telegram
+    procs            Дерево процессов бота
+
+  ── Обслуживание ───────────────────────────────────
+    update, u        Обновить из setup-файла
+    uninstall        Подсказка по удалению
+
+  ── Справка ────────────────────────────────────────
+    -h, --help, help      Показать эту справку
+    (без аргументов)      То же самое
+
+  Примеры:
+    rb               # эта справка
+    rb st            # статус
+    rb logs 100      # последние 100 строк лога
+    rb r             # перезапуск
+    rb v             # версия
+EOF
+    echo ""
+}
+
+do_status() {
+    echo ""
+    echo "  Router Bot — статус"
+    echo "  ────────────────────────────────────────"
+
+    if [ -f "$VER_FILE" ]; then
+        echo "  Версия:      $(cat $VER_FILE 2>/dev/null)"
+    else
+        echo "  Версия:      (VERSION-файл отсутствует)"
+    fi
+
+    if [ -f "$GIVEUP" ]; then
+        echo "  Состояние:   ❌ GIVEUP (10 падений подряд)"
+        echo "  Сброс:       rb reset"
+    else
+        if [ -f "$PIDFILE" ] && kill -0 "$(cat $PIDFILE 2>/dev/null)" 2>/dev/null; then
+            echo "  Состояние:   🟢 работает (PID $(cat $PIDFILE))"
+        else
+            echo "  Состояние:   🔴 остановлен"
+        fi
+    fi
+
+    echo "  Процессы:"
+    P=$(ps w 2>/dev/null | grep -E "routerbot_wrapper|router_bot/main.py" | grep -v grep)
+    if [ -n "$P" ]; then
+        echo "$P" | sed 's/^/    /'
+    else
+        echo "    (нет)"
+    fi
+
+    echo "  Telegram-маршруты:"
+    R=$(ip rule show 2>/dev/null | grep 16385)
+    if [ -n "$R" ]; then
+        echo "$R" | sed 's/^/    /'
+    else
+        echo "    (нет — table 16385 пуст)"
+    fi
+
+    echo "  Лог:         $LOG"
+    echo "  Конфиг:      $CONF"
+    echo ""
+}
+
+do_config() {
+    if [ -f "$CONF" ]; then
+        echo ""
+        echo "  === $CONF ==="
+        cat "$CONF"
+        echo ""
+    else
+        echo "config.env не найден"
+    fi
+}
+
+do_modules() {
+    echo ""
+    if [ -f "$CONF" ]; then
+        . "$CONF"
+        echo "  Включённые модули (ENABLED_MODULES):"
+        echo "    $ENABLED_MODULES"
+        echo ""
+        echo "  Всего модулей в проекте: 11"
+        echo "    net_watch, ssh_control, system, hydraroute, flashkeen,"
+        echo "    xkeen, bird, mtproxy, keen_pbr, neofit, usque_keenetic"
+    else
+        echo "config.env не найден"
+    fi
+    echo ""
+}
+
+do_routes() {
+    echo ""
+    echo "  === ip rule (table 16385) ==="
+    ip rule show 2>/dev/null | grep 16385 || echo "  (пусто)"
+    echo ""
+    echo "  === ip route (table 16385) ==="
+    ip route show table 16385 2>/dev/null || echo "  (пусто)"
+    echo ""
+    echo "  === route get 149.154.166.110 ==="
+    ip route get 149.154.166.110 2>/dev/null
+    echo ""
+}
+
+do_procs() {
+    echo ""
+    echo "  === Процессы бота ==="
+    ps w 2>/dev/null | grep -E "routerbot_wrapper|router_bot/main.py|tg-ws-proxy|hrneo" | grep -v grep \
+        | sed 's/^/    /' || echo "    (нет)"
+    echo ""
+}
+
+case "$1" in
+    ""|-h|--help|help|h)
+        show_help
+        ;;
+    start|s)
+        $S98 start
+        ;;
+    stop|x)
+        $S98 stop
+        ;;
+    restart|r)
+        $S98 restart
+        ;;
+    reset)
+        $S98 reset
+        ;;
+    status|st)
+        do_status
+        ;;
+    logs|log|l)
+        N="${2:-40}"
+        if [ -f "$LOG" ]; then
+            tail -n "$N" "$LOG"
+        else
+            echo "Лог не найден: $LOG"
+        fi
+        ;;
+    follow|f)
+        if [ -f "$LOG" ]; then
+            echo "Ctrl+C — выход"
+            tail -f "$LOG"
+        else
+            echo "Лог не найден: $LOG"
+        fi
+        ;;
+    version|v)
+        if [ -f "$VER_FILE" ]; then
+            cat "$VER_FILE"
+        else
+            echo "VERSION-файл отсутствует"
+        fi
+        ;;
+    config|c)
+        do_config
+        ;;
+    modules|m)
+        do_modules
+        ;;
+    routes)
+        do_routes
+        ;;
+    procs|ps)
+        do_procs
+        ;;
+    health)
+        if [ -x "$S99" ]; then
+            $S99
+        else
+            echo "S99routerbot_health не найден"
+        fi
+        ;;
+    rebuild)
+        if [ -x "$S97" ]; then
+            $S97 rebuild
+            echo "Маршруты перестроены."
+        else
+            echo "S97tgroutes не найден"
+        fi
+        ;;
+    update|u)
+        if [ -x /opt/router_bot_setup.sh ]; then
+            sh /opt/router_bot_setup.sh
+        elif [ -f /tmp/router_bot_setup.sh ]; then
+            sh /tmp/router_bot_setup.sh
+        else
+            echo "setup-файл не найден:"
+            echo "  /opt/router_bot_setup.sh"
+            echo "  /tmp/router_bot_setup.sh"
+        fi
+        ;;
+    uninstall)
+        echo ""
+        echo "  Удаление Router Bot:"
+        echo "    sh /opt/router_bot/uninstall.sh"
+        echo ""
+        ;;
+    *)
+        echo "Неизвестная команда: $1"
+        echo "Справка:  rb -h"
+        exit 1
+        ;;
+esac
