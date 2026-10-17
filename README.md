@@ -31,6 +31,34 @@ sh -c "$(curl -sSL https://raw.githubusercontent.com/zootsman/router-bot/master/
 sh -c "$(wget -qO- https://raw.githubusercontent.com/zootsman/router-bot/master/install.sh)"
 ```
 
+## Управление через командную строку (`rb`)
+
+После установки в системе доступна удобная утилита командной строки **`rb`**:
+
+### Сервис
+- `rb start` (или `s`) — запустить бота
+- `rb stop` (или `x`) — остановить бота
+- `rb restart` (или `r`) — перезапустить бота
+- `rb reset` — сбросить giveup-маркер (после 10 падений)
+- `rb status` (или `st`) — статус (процессы, порт, состояние)
+
+### Диагностика
+- `rb logs [N]` — показать последние `N` строк лога (по умолчанию 40)
+- `rb follow` (или `f`) — просмотр лога в реальном времени
+- `rb version` (или `v`) — версия бота
+- `rb config` (или `c`) — содержимое файла `config.env`
+- `rb modules` (или `m`) — список включенных модулей
+- `rb routes` — просмотр Telegram-маршрутов (table 16385)
+- `rb health` — запустить healthcheck
+- `rb rebuild` — перестроить маршруты Telegram
+- `rb procs` — дерево процессов бота
+
+### Обслуживание
+- `rb update` (или `u`) — обновить из setup-файла
+- `rb uninstall` — подсказка по удалению
+
+---
+
 ## Структура проекта
 
 - `main.py` — точка входа бота.
