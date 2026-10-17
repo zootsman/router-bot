@@ -37,13 +37,15 @@ if [ -n "$INSTALLED_VERSION" ]; then
         -1) MODE="upgrade" ;;
         0)
             printf "Версии совпадают. Переустановить? (y/N): "
-            read ANS
+            read -r ANS
+            ANS=$(printf "%s" "$ANS" | tr -d "\r\n\t ")
             case "$ANS" in y|Y) ;; *) echo "Отмена."; exit 0 ;; esac
             MODE="reinstall"
             ;;
         1)
             printf "Установлена более новая версия. Продолжить? (y/N): "
-            read ANS
+            read -r ANS
+            ANS=$(printf "%s" "$ANS" | tr -d "\r\n\t ")
             case "$ANS" in y|Y) ;; *) echo "Отмена."; exit 0 ;; esac
             MODE="downgrade"
             ;;
@@ -69,6 +71,9 @@ if [ -d /opt/router_bot ] && [ -f "$MANIFEST" ] && [ "$MODE" != "install" ]; the
         _old_hash=$(printf '%s' "$_line" | awk '{print $1}')
         _path=$(printf '%s' "$_line" | awk '{$1=""; sub(/^ /,""); print}')
         [ -z "$_path" ] && continue
+        case "$_path" in
+            */__pycache__/*|*.pyc|*.pyo) continue ;;
+        esac
         if [ ! -f "$_path" ]; then
             _missing=$((_missing+1))
             continue
@@ -427,7 +432,7 @@ async def _do_restart_confirm(q, ctx):
 
 async def _cmd_mirrors(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     msg = await update.message.reply_text(
-        '\U0001f310 Проверяю зеркала Entware... (5-10 сек)',
+        '\U0001f30d Проверяю зеркала Entware... (5-10 сек)',
     )
     results = await check_mirrors()
     current = get_current_mirror()
@@ -603,7 +608,7 @@ async def _cmd_nf(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def _cmd_usque(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await _open_module_card(update, ctx, 'usque_keenetic', '\U0001f310', 'Usque WARP')
+    await _open_module_card(update, ctx, 'usque_keenetic', '\u2601\ufe0f', 'Usque WARP')
 
 
 async def _on_router_main(query, ctx):
@@ -652,7 +657,7 @@ async def post_init(app):
         BotCommand('help',    '\u2753 Помощь'),
         BotCommand('restart', '\U0001f504 Перезапуск бота'),
         BotCommand('reboot',  '\U0001f504 Перезагрузка роутера'),
-        BotCommand('mirrors', '\U0001f310 Проверка зеркал Entware'),
+        BotCommand('mirrors', '\U0001f30d Проверка зеркал Entware'),
     ]
     if 'net_watch' in enabled_names:
         cmds.append(BotCommand('net', '\U0001f4e1 Net Watch'))
@@ -675,7 +680,7 @@ async def post_init(app):
     if 'neofit' in enabled_names:
         cmds.append(BotCommand('nf', '\U0001f500 NeoFit'))
     if 'usque_keenetic' in enabled_names:
-        cmds.append(BotCommand('usque', '\U0001f310 Usque WARP'))
+        cmds.append(BotCommand('usque', '\u2601\ufe0f Usque WARP'))
     for mod in router.all():
         for cmd, desc in getattr(mod, 'commands', []):
             cmds.append(BotCommand(cmd, desc))
@@ -722,49 +727,30 @@ def main():
 
     router = ModuleRouter()
 
-    if 'net_watch' in enabled_set:
-        from modules.net_watch.module import NetWatchModule
-        router.register(NetWatchModule(chat_id))
-
-    if 'ssh_control' in enabled_set:
-        from modules.ssh_control.module import SSHControlModule
-        router.register(SSHControlModule(chat_id))
-
-    if 'system' in enabled_set:
-        from modules.system.module import SystemModule
-        router.register(SystemModule(chat_id))
-
-    if 'hydraroute' in enabled_set:
-        from modules.hydraroute.module import HydraRouteModule
-        router.register(HydraRouteModule(chat_id))
-
-    if 'flashkeen' in enabled_set:
-        from modules.flashkeen.module import FlashkeenModule
-        router.register(FlashkeenModule(chat_id))
-
-    if 'xkeen' in enabled_set:
-        from modules.xkeen.module import XKeenModule
-        router.register(XKeenModule(chat_id))
-
-    if 'bird' in enabled_set:
-        from modules.bird.module import BirdModule
-        router.register(BirdModule(chat_id))
-
-    if 'mtproxy' in enabled_set:
-        from modules.mtproxy.module import MTProxyModule
-        router.register(MTProxyModule(chat_id))
-
-    if 'keen_pbr' in enabled_set:
-        from modules.keen_pbr.module import KeenPbrModule
-        router.register(KeenPbrModule(chat_id))
-
-    if 'neofit' in enabled_set:
-        from modules.neofit.module import NeoFitModule
-        router.register(NeoFitModule(chat_id))
-
-    if 'usque_keenetic' in enabled_set:
-        from modules.usque_keenetic.module import UsqueKeeneticModule
-        router.register(UsqueKeeneticModule(chat_id))
+    import importlib
+    _MODULES_MAP = {
+        'net_watch': ('modules.net_watch.module', 'NetWatchModule'),
+        'ssh_control': ('modules.ssh_control.module', 'SSHControlModule'),
+        'system': ('modules.system.module', 'SystemModule'),
+        'hydraroute': ('modules.hydraroute.module', 'HydraRouteModule'),
+        'flashkeen': ('modules.flashkeen.module', 'FlashkeenModule'),
+        'xkeen': ('modules.xkeen.module', 'XKeenModule'),
+        'bird': ('modules.bird.module', 'BirdModule'),
+        'mtproxy': ('modules.mtproxy.module', 'MTProxyModule'),
+        'keen_pbr': ('modules.keen_pbr.module', 'KeenPbrModule'),
+        'neofit': ('modules.neofit.module', 'NeoFitModule'),
+        'usque_keenetic': ('modules.usque_keenetic.module', 'UsqueKeeneticModule'),
+    }
+    for _mname in enabled_set:
+        if _mname not in _MODULES_MAP:
+            continue
+        _mpath, _mcls = _MODULES_MAP[_mname]
+        try:
+            _mod = importlib.import_module(_mpath)
+            _cls = getattr(_mod, _mcls)
+            router.register(_cls(chat_id))
+        except Exception as e:
+            log.exception('Failed to load %s: %s', _mname, e)
 
     if not router.all():
         log.critical('Ни один модуль не включён. Проверьте ENABLED_MODULES в config.env')
@@ -811,22 +797,18 @@ def main():
             cat_name = q.data[len('router:cat:'):]
             await q.answer()
             return await _show_category(q, ctx, cat_name)
-        if q.data == 'bird:edit_new':
-            mod = ctx.application.bot_data['router'].get('bird')
-            if mod:
-                await mod._ask_new_config(q, ctx)
-            return
+        if q.data.endswith(':edit_new'):
+            _mn = q.data[:-len(':edit_new')]
+            _m = ctx.application.bot_data['router'].get(_mn)
+            if _m and hasattr(_m, '_ask_new_config'):
+                await _m._ask_new_config(q, ctx)
+                return
         if q.data == 'router:mirrors':
             return await _on_mirrors(q, ctx)
         if q.data == 'router:mirrors_check':
             return await _on_mirrors_check(q, ctx)
         if q.data.startswith('router:mirror_apply:'):
             return await _on_mirror_apply(q, ctx, q.data[len('router:mirror_apply:'):])
-        if q.data == 'mtproxy:edit_new':
-            mod = ctx.application.bot_data['router'].get('mtproxy')
-            if mod:
-                await mod._ask_new_config(q, ctx)
-            return
         if q.data == 'router:restart_confirm':
             return await _do_restart_confirm(q, ctx)
         if q.data == 'router:reboot_confirm':
@@ -1191,7 +1173,7 @@ def apply_mirror(new_base):
 
 def build_mirrors_text(results, current):
     """Формирует текст карточки со списком зеркал."""
-    lines = ['\U0001f310 <b>Зеркала Entware</b>', '']
+    lines = ['\U0001f30d <b>Зеркала Entware</b>', '']
     if current:
         lines.append(f'Текущее: <code>{current}</code>')
     lines.append('')
@@ -1356,17 +1338,18 @@ _rb_ci_ask() {
 do_config_init() {
     _abort() {
         echo ""
-        echo "  \u23f9  Отменено \u2014 config.env не изменён"
+        echo "  ⏹  Отменено — config.env не изменён"
         return 1
     }
 
     if [ -f "$CONF" ]; then
         echo ""
-        echo "  \u26a0\ufe0f  config.env уже существует: $CONF"
+        echo "  ⚠️  config.env уже существует: $CONF"
         echo "  Он будет перезаписан. Текущий сохранится как .broken.<timestamp>"
         echo ""
         printf "  Продолжить? (y/N): "
         read _r
+        _r=$(printf "%s" "$_r" | tr -d "\r\n\t ")
         case "$_r" in
             y|Y) ;;
             *) echo "  Отменено"; return 1 ;;
@@ -1374,12 +1357,12 @@ do_config_init() {
     fi
 
     echo ""
-    echo "  \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550"
+    echo "  ════════════════════════════════════════"
     echo "  Создание config.env (визард)"
-    echo "  \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550"
+    echo "  ════════════════════════════════════════"
     echo "  Отмена на любом шаге:"
-    echo "    q <Enter>   \u2014 прервать (ничего не изменится)"
-    echo "    Ctrl+C      \u2014 прервать"
+    echo "    q <Enter>   — прервать (ничего не изменится)"
+    echo "    Ctrl+C      — прервать"
     echo ""
 
     # --- 1. Токен ---
@@ -1395,7 +1378,7 @@ do_config_init() {
             return $( _abort )
         fi
         if [ -z "$_RB_CI_VAL" ]; then
-            echo "  \u274c Пусто, попробуйте ещё"
+            echo "  ❌ Пусто, попробуйте ещё"
             continue
         fi
         printf "  Проверяю токен... "
@@ -1416,21 +1399,21 @@ PYEOF
 )
         case "$_res" in
             OK:*)
-                echo "\u2705 @${_res#OK:}"
+                echo "✅ @${_res#OK:}"
                 _ci_token="$_RB_CI_VAL"
                 ;;
             FAIL_TOKEN:*)
-                echo "\u274c неверный токен: ${_res#FAIL_TOKEN:}"
+                echo "❌ неверный токен: ${_res#FAIL_TOKEN:}"
                 ;;
             FAIL_NET:*)
-                echo "\u26a0\ufe0f  сеть: ${_res#FAIL_NET:}"
+                echo "⚠️  сеть: ${_res#FAIL_NET:}"
                 echo "     токен НЕ проверен"
                 printf "     Использовать всё равно? (y/N): "
                 read _r
                 case "$_r" in y|Y) _ci_token="$_RB_CI_VAL" ;; esac
                 ;;
             *)
-                echo "\u274c $_res"
+                echo "❌ $_res"
                 ;;
         esac
     done
@@ -1448,7 +1431,7 @@ PYEOF
             return $( _abort )
         fi
         if [ -z "$_RB_CI_VAL" ]; then
-            echo "  \u274c Пусто, попробуйте ещё"
+            echo "  ❌ Пусто, попробуйте ещё"
             continue
         fi
         printf "  Отправляю тестовое сообщение... "
@@ -1471,20 +1454,20 @@ PYEOF
 )
         case "$_res" in
             OK)
-                echo "\u2705 доставлено"
+                echo "✅ доставлено"
                 _ci_chat="$_RB_CI_VAL"
                 ;;
             FAIL_CHAT:*)
-                echo "\u274c chat_id неверен: ${_res#FAIL_CHAT:}"
+                echo "❌ chat_id неверен: ${_res#FAIL_CHAT:}"
                 ;;
             FAIL_NET:*)
-                echo "\u26a0\ufe0f  сеть: ${_res#FAIL_NET:}"
+                echo "⚠️  сеть: ${_res#FAIL_NET:}"
                 printf "     Использовать всё равно? (y/N): "
                 read _r
                 case "$_r" in y|Y) _ci_chat="$_RB_CI_VAL" ;; esac
                 ;;
             *)
-                echo "\u274c $_res"
+                echo "❌ $_res"
                 ;;
         esac
     done
@@ -1540,7 +1523,7 @@ PYEOF
     _ci_route_table=$(ip rule show 2>/dev/null | awk -v src="$_ci_wan_src" '
         $0 ~ "from " src " " { for(i=1;i<=NF;i++) if($i=="lookup") { print $(i+1); exit } }')
     [ -z "$_ci_route_table" ] && _ci_route_table="16385"
-    echo "    WAN: $_ci_wan_if ($_ci_wan_src) \u2192 table $_ci_route_table"
+    echo "    WAN: $_ci_wan_if ($_ci_wan_src) → table $_ci_route_table"
 
     # --- 8. VPN ---
     _ci_use_vpn="no"
@@ -1548,9 +1531,9 @@ PYEOF
     _ci_vpn_src=""
     printf "  Проверяю Telegram напрямую... "
     if /opt/bin/curl -sf --max-time 6 "https://api.telegram.org" >/dev/null 2>&1; then
-        echo "\u2705 доступен, VPN не нужен"
+        echo "✅ доступен, VPN не нужен"
     else
-        echo "\u274c недоступен"
+        echo "❌ недоступен"
         printf "  Настроить VPN? (y/N): "
         read _r
         case "$_r" in
@@ -1558,7 +1541,7 @@ PYEOF
                 _tuns=$(ip -o link show 2>/dev/null | sed 's/@[^ :]*//g' | \
                     awk -F': ' '$2 ~ /^(opkgtun[0-9]+|nwg[0-9]+|wg[0-9]+|ppp[0-9]+|tap[0-9]+)$/ { print $2 }')
                 if [ -z "$_tuns" ]; then
-                    echo "  Туннели не найдены \u2014 VPN не настроен"
+                    echo "  Туннели не найдены — VPN не настроен"
                 else
                     _n=0
                     _tuns_list=""
@@ -1600,9 +1583,9 @@ PYEOF
 
     # --- Сводка ---
     echo ""
-    echo "  \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550"
-    echo "  Сводка \u2014 что будет записано"
-    echo "  \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550"
+    echo "  ════════════════════════════════════════"
+    echo "  Сводка — что будет записано"
+    echo "  ════════════════════════════════════════"
     case "$_ci_token" in
         *:*) _masked="${_ci_token%%:*}:... (${#_ci_token} символов)" ;;
         *)   _masked="... (${#_ci_token} символов)" ;;
@@ -1621,11 +1604,11 @@ PYEOF
         echo "  VPN:                 не используется"
     fi
     echo ""
-    printf "  \u2753 Применить и записать config.env? (y/N): "
+    printf "  ❓ Применить и записать config.env? (y/N): "
     read _r
     case "$_r" in
         y|Y) ;;
-        *) echo "  Отменено \u2014 config.env не изменён"; return 1 ;;
+        *) echo "  Отменено — config.env не изменён"; return 1 ;;
     esac
 
     # --- Запись ---
@@ -1638,7 +1621,7 @@ PYEOF
     fi
 
     {
-        echo "# Router Bot \u2014 конфиг"
+        echo "# Router Bot — конфиг"
         echo "# Создан $(date '+%Y-%m-%d %H:%M:%S') через rb config init"
         echo ""
         echo "TG_BOT_TOKEN='$_ci_token'"
@@ -1664,16 +1647,16 @@ PYEOF
     chmod 600 "${CONF}.bak"
 
     echo ""
-    echo "  \u2705 config.env создан: $CONF"
-    echo "  \u2705 Бэкап:              ${CONF}.bak"
+    echo "  ✅ config.env создан: $CONF"
+    echo "  ✅ Бэкап:              ${CONF}.bak"
     echo ""
     if [ "$_ci_use_vpn" = "yes" ] && [ -x /opt/etc/init.d/S97tgroutes ]; then
-        echo "  \u2192 Перестраиваю маршруты Telegram через $_ci_vpn_if..."
+        echo "  → Перестраиваю маршруты Telegram через $_ci_vpn_if..."
         /opt/etc/init.d/S97tgroutes rebuild >/dev/null 2>&1 || true
-        echo "  \u2705 Готово"
+        echo "  ✅ Готово"
         echo ""
     fi
-    echo "  \u2192 Перезапустить бота: rb restart"
+    echo "  → Перезапустить бота: rb restart"
     return 0
 }
 
@@ -4815,105 +4798,154 @@ def get_system_info():
 CONFIG_PATH = '/opt/router_bot/config.env'
 
 
-def get_selected_channel():
-    """Читает UPDATE_CHANNEL из config.env."""
+def _run_ndmc_pty(cmd: str, timeout: int = 30) -> str:
+    """Выполняет ndmc через pty — надёжнее для интерактивных команд."""
+    import pty, select, time
     try:
-        with open(CONFIG_PATH) as f:
-            for line in f:
-                line = line.strip()
-                if line.startswith('UPDATE_CHANNEL='):
-                    return line.split('=', 1)[1].strip().strip('"').strip("'")
-    except Exception:
-        pass
-    return 'stable'
-
-
-def set_selected_channel(channel: str) -> bool:
-    """Записывает UPDATE_CHANNEL в config.env."""
-    try:
-        lines = []
-        found = False
-        if os.path.exists(CONFIG_PATH):
-            with open(CONFIG_PATH) as f:
-                for line in f:
-                    if line.startswith('UPDATE_CHANNEL='):
-                        lines.append(f"UPDATE_CHANNEL='{channel}'\n")
-                        found = True
-                    else:
-                        lines.append(line)
-        if not found:
-            lines.append(f"\n# Канал обновлений\nUPDATE_CHANNEL='{channel}'\n")
-        tmp = CONFIG_PATH + '.tmp'
-        with open(tmp, 'w') as f:
-            f.writelines(lines)
-        os.replace(tmp, CONFIG_PATH)
-        return True
+        master, slave = pty.openpty()
     except Exception as e:
-        log.warning('set_selected_channel failed: %s', e)
-        return False
+        log.debug('pty.openpty failed: %s', e)
+        # fallback без pty
+        try:
+            p = subprocess.run(
+                ['/bin/ndmc', '-c', cmd],
+                capture_output=True, text=True, timeout=timeout,
+            )
+            return (p.stdout or '') + (p.stderr or '')
+        except Exception as e2:
+            log.debug('fallback subprocess failed: %s', e2)
+            return ''
+
+    try:
+        proc = subprocess.Popen(
+            ['/bin/ndmc', '-c', cmd],
+            stdin=slave,
+            stdout=slave,
+            stderr=slave,
+            close_fds=True,
+            start_new_session=True,
+        )
+        os.close(slave)
+        buf = b''
+        start = time.time()
+        while time.time() - start < timeout:
+            try:
+                r, _, _ = select.select([master], [], [], 0.5)
+                if r:
+                    data = os.read(master, 4096)
+                    if not data:
+                        break
+                    buf += data
+            except (OSError, IOError):
+                break
+            if proc.poll() is not None and not r:
+                # процесс умер и нет данных — выходим
+                break
+        try:
+            os.close(master)
+        except Exception:
+            pass
+        if proc.poll() is None:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+        return buf.decode('utf-8', errors='replace')
+    except Exception as e:
+        log.debug('ndmc pty failed: %s', e)
+        try:
+            os.close(master)
+        except Exception:
+            pass
+        return ''
+
+
+def _parse_versions(text: str) -> dict:
+    """Парсит вывод ndmc — устойчиво к ANSI и мусору."""
+    import re as _re
+    result = {}
+    # Убираем ANSI
+    text = _re.sub(r'\x1b\[[0-9;?]*[A-Za-z]', '', text)
+    text = _re.sub(r'\x1b\][^\x07]*\x07', '', text)
+    text = text.replace('\r', '')
+    for line in text.splitlines():
+        if ':' not in line:
+            continue
+        k, v = line.split(':', 1)
+        k = k.strip().lower()
+        v = v.strip()
+        if not v:
+            continue
+        if k in ('release', 'title', 'sandbox', 'update-available',
+                 'checking', 'current-version', 'version'):
+            result[k] = v
+    return result
+
+
+def _compare_versions(v1: str, v2: str) -> int:
+    """-1 если v1 < v2, 0 если равны, 1 если v1 > v2."""
+    import re as _re
+    def parse(s):
+        m = _re.findall(r'\d+', s)
+        return [int(x) for x in m] if m else []
+    a = parse(v1)
+    b = parse(v2)
+    for i in range(max(len(a), len(b))):
+        x = a[i] if i < len(a) else 0
+        y = b[i] if i < len(b) else 0
+        if x < y:
+            return -1
+        if x > y:
+            return 1
+    return 0
 
 
 def get_update_info():
-    """Парсит `components check-update` + `show version`."""
+    """Парсит `components check-update` + `show version` через pty."""
     result = {
         'channel': '',
         'title': '',
-        'release': '',           # доступная версия
-        'current_version': '',    # текущая версия
+        'release': '',
+        'current_version': '',
         'update_available': False,
         'checking': False,
     }
 
-    # 1. Текущая версия из show version (быстро, надёжно)
-    try:
-        p_cur = subprocess.run(
-            ['/bin/ndmc', '-c', 'show version'],
-            capture_output=True, text=True, timeout=10,
-        )
-        cur_text = (p_cur.stdout or '') + (p_cur.stderr or '')
-        for line in cur_text.splitlines():
-            if ':' not in line:
-                continue
-            k, v = line.split(':', 1)
-            k = k.strip(); v = v.strip()
-            if k == 'release':
-                result['current_version'] = v
-            elif k == 'sandbox' and not result['channel']:
-                result['channel'] = v
-    except Exception as e:
-        log.debug('show version failed: %s', e)
+    # 1. Текущая версия
+    text_cur = _run_ndmc_pty('show version', timeout=10)
+    parsed_cur = _parse_versions(text_cur)
+    result['current_version'] = parsed_cur.get('release', '')
+    result['channel'] = parsed_cur.get('sandbox', '')
 
-    # 2. Проверка обновлений (может занять 10-20 сек)
-    try:
-        p = subprocess.run(
-            ['/bin/ndmc', '-c', 'components check-update'],
-            capture_output=True, text=True, timeout=30,
-        )
-        # Читаем И stdout, И stderr — ndmc может писать в любой
-        out = (p.stdout or '') + '\n' + (p.stderr or '')
-        for line in out.splitlines():
-            if ':' not in line:
-                continue
-            k, v = line.split(':', 1)
-            k = k.strip(); v = v.strip()
-            if k == 'sandbox' and not result['channel']:
-                result['channel'] = v
-            elif k == 'title':
-                result['title'] = v
-            elif k == 'release':
-                result['release'] = v
-            elif k == 'update-available':
-                result['update_available'] = (v.lower() == 'yes')
-            elif k == 'checking':
-                result['checking'] = (v.lower() == 'yes')
-    except Exception as e:
-        log.debug('check-update failed: %s', e)
+    # 2. Проверка обновлений
+    text_upd = _run_ndmc_pty('components check-update', timeout=60)
+    parsed_upd = _parse_versions(text_upd)
 
-    # 3. Fallback — если update-available не пришёл, считаем по версиям
-    if (not result['update_available']
-            and result['release'] and result['current_version']
-            and result['release'] != result['current_version']):
+    if not result['channel']:
+        result['channel'] = parsed_upd.get('sandbox', '')
+    result['title'] = parsed_upd.get('title', '')
+    if parsed_upd.get('release'):
+        result['release'] = parsed_upd['release']
+    if parsed_upd.get('update-available', '').lower() == 'yes':
         result['update_available'] = True
+    if parsed_upd.get('checking', '').lower() == 'yes':
+        result['checking'] = True
+
+    # 3. Fallback по сравнению версий
+    if (not result['update_available']
+            and result['release'] and result['current_version']):
+        cmp = _compare_versions(result['current_version'], result['release'])
+        if cmp < 0:
+            result['update_available'] = True
+
+    # 4. Если release пуст, но title содержит номер — используем title
+    if (not result['update_available'] and result['title']
+            and result['current_version']):
+        cmp = _compare_versions(result['current_version'], result['title'])
+        if cmp < 0:
+            result['update_available'] = True
+            if not result['release']:
+                result['release'] = result['title']
 
     return result
 
@@ -4991,7 +5023,7 @@ def get_ndmc_system():
         return result
 
 
-def build_system_card():
+def build_system_card(upd=None):
     info = get_system_info()
     ndmc_info = get_ndmc_system()
     router = get_router_info()
@@ -5019,8 +5051,9 @@ def build_system_card():
     if router.get('firmware'):
         lines.append(f'\U0001f4e6 KeeneticOS: <code>{router["firmware"]}</code>')
 
-    # Информация об обновлениях
-    upd = get_update_info()
+    # Информация об обновлениях (переданная или вычисленная)
+    if upd is None:
+        upd = get_update_info()
     if upd.get('channel'):
         lines.append(f'⚙️ Канал: <code>{upd["channel"]}</code>')
     if upd.get('update_available'):
@@ -5144,27 +5177,11 @@ def _kb(update_available: bool = False):
             '\u2b06\ufe0f Установить обновление',
             callback_data='system:update_ask',
         )])
-    rows.append([InlineKeyboardButton(
-        '\U0001f50d Проверить обновления',
-        callback_data='system:check_upd',
-    )])
     rows.append([InlineKeyboardButton('\U0001f504 Обновить', callback_data='system:refresh')])
     rows.append([InlineKeyboardButton('\U0001f310 Зеркала Entware',
                                       callback_data='router:mirrors')])
     rows.append([InlineKeyboardButton('\U0001f3e0 Модули', callback_data='router:main')])
     return InlineKeyboardMarkup(rows)
-
-
-def _channel_menu_kb(current: str):
-    def label(ch, name):
-        mark = ' \u2705' if ch == current else ''
-        return f'{name}{mark}'
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(label('stable', 'stable \u2014 стабильный'), callback_data='system:set_ch:stable')],
-        [InlineKeyboardButton(label('preview', 'preview \u2014 предварительный'), callback_data='system:set_ch:preview')],
-        [InlineKeyboardButton(label('draft', 'draft \u2014 тестовый'), callback_data='system:set_ch:draft')],
-        [InlineKeyboardButton('\u2b05\ufe0f Назад', callback_data='system:main')],
-    ])
 
 
 UPDATE_STATE_FILE = '/opt/router_bot/data/system/update_state.json'
@@ -5209,24 +5226,37 @@ class SystemModule:
             self._update_task.cancel()
 
     async def _update_watch_loop(self):
-        await asyncio.sleep(90)
+        # Первый опрос — через 2 минуты после старта (дать сети подняться)
+        await asyncio.sleep(120)
         while True:
             try:
                 await self._check_updates_and_notify()
             except Exception as e:
                 log.debug('system update watch failed: %s', e)
-            await asyncio.sleep(6 * 3600)
+            # Опрос раз в 2 часа (было 6) — для более быстрой реакции
+            await asyncio.sleep(2 * 3600)
 
     async def _check_updates_and_notify(self):
+        # Проверка идёт через актуальный канал (ndmc check-update
+        # сам смотрит на текущий sandbox в системе)
         upd = await asyncio.to_thread(get_update_info)
         st = _load_update_state()
+        st['last_check'] = datetime.now().isoformat()
 
         if not upd.get('update_available'):
-            st['last_check'] = datetime.now().isoformat()
+            # Обновления нет — сбрасываем маркер «уже отправлено»,
+            # чтобы после установки обновления и следующего релиза
+            # уведомление снова пришло.
             st.pop('last_notified_version', None)
             st.pop('snoozed_until', None)
             _save_update_state(st)
+            log.info('KeenOS update check: no update (cur=%s)',
+                     upd.get('current_version', '?'))
             return
+
+        log.info('KeenOS update available: cur=%s new=%s',
+                 upd.get('current_version', '?'),
+                 upd.get('release', '?') or upd.get('title', '?'))
 
         snoozed_until = st.get('snoozed_until', '')
         if snoozed_until:
@@ -5286,8 +5316,12 @@ class SystemModule:
             log.warning('update notification failed: %s', e)
 
     async def send_card_message(self, update, ctx):
-        text = build_system_card()
-        await update.message.reply_text(text, parse_mode='HTML', reply_markup=_kb())
+        upd = get_update_info()
+        text = build_system_card(upd=upd)
+        await update.message.reply_text(
+            text, parse_mode='HTML',
+            reply_markup=_kb(upd.get('update_available', False)),
+        )
 
     async def handle_callback(self, action, q, ctx):
         if action == 'update_later':
@@ -5312,8 +5346,8 @@ class SystemModule:
                 await q.answer('Проверяю обновления...')
             else:
                 await q.answer()
-            text = build_system_card()
             upd = get_update_info()
+            text = build_system_card(upd=upd)
             try:
                 await q.edit_message_text(
                     text, parse_mode='HTML',
@@ -5380,7 +5414,7 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import MessageHandler, filters, ContextTypes
 
 from .actions import (
-    ACTIONS, is_installed, get_installed_version,
+    ACTIONS, is_installed, is_running, get_installed_version,
     UNINSTALL_TARGETS, SCAN_PATTERNS,
     get_hr_web_url, get_versions, check_updates,
     load_last_seen, save_last_seen,
@@ -5556,19 +5590,24 @@ class HydraRouteModule:
         return is_installed()
 
     def get_status_short(self) -> str:
-        return '✅' if is_installed() else '❌'
+        if not is_installed():
+            return '❌'
+        return '🟢' if is_running() else '🔴'
 
     def _build_card(self):
         installed = is_installed()
         lines = [f'{self.icon} <b>{self.title}</b>', '']
         if installed:
+            running = is_running()
             vs = get_versions()
             neo = vs.get('neo')   or '—'
             web = vs.get('web')   or '—'
             dns = vs.get('hrdns') or '—'
+            lines.append('✅ Установлен')
             lines.append(f'📦 Neo: <code>{neo}</code>')
             lines.append(f'🖥️ Web: <code>{web}</code>')
             lines.append(f'📡 hrdns: <code>{dns}</code>')
+            lines.append('Сервис: ' + ('🟢 работает' if running else '🔴 остановлен'))
             url = get_hr_web_url()
             lines.append(f'🌐 Веб: <a href="{url}">{url}</a>')
         else:
@@ -5599,13 +5638,13 @@ class HydraRouteModule:
         rows = []
         if not installed:
             rows.append([InlineKeyboardButton(
-                '📥 Установить', callback_data='hydraroute:ask:install')])
+                '⬇️ Установить', callback_data='hydraroute:ask:install')])
         else:
             rows.append([InlineKeyboardButton(
                 '🔍 Проверить обновления',
                 callback_data='hydraroute:ask:check_updates')])
             rows.append([InlineKeyboardButton(
-                '📤 Обновить', callback_data='hydraroute:ask:update')])
+                '⬆️ Обновить', callback_data='hydraroute:ask:update')])
             rows.append([InlineKeyboardButton(
                 '🗑 Удалить (стандартное)',
                 callback_data='hydraroute:ask:uninstall_std')])
@@ -5880,7 +5919,7 @@ class HydraRouteModule:
         if any_update:
             lines.append('Доступны обновления.')
             kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton('📥 Обновить',
+                [InlineKeyboardButton('⬆️ Обновить',
                                       callback_data='hydraroute:ask:update')],
                 [InlineKeyboardButton('⬅️ Назад',
                                       callback_data='hydraroute:main')],
@@ -6497,6 +6536,19 @@ def get_installed_version() -> str:
     except Exception:
         pass
     return ''
+
+
+def is_running() -> bool:
+    """Запущен ли hrneo или hrweb."""
+    import subprocess
+    try:
+        r = subprocess.run(
+            ['sh', '-c', 'ps w | grep -E "[h]rneo|[h]rweb" | grep -v grep | wc -l'],
+            capture_output=True, text=True, timeout=5,
+        )
+        return int((r.stdout or '0').strip()) > 0
+    except Exception:
+        return False
 
 
 
@@ -7603,7 +7655,10 @@ class FlashkeenModule:
                 self._buf += data
                 if len(self._buf) > 60000:
                     self._buf = self._buf[-50000:]
-                await self._refresh_interactive(ctx)
+                _now = time.time()
+                if _now - self._last_edit >= 1.0:
+                    self._last_edit = _now
+                    await self._refresh_interactive(ctx)
         finally:
             try:
                 os.close(master)
@@ -8090,13 +8145,13 @@ class XKeenModule:
             'Выберите действие:',
         ]
         rows = [
-            [InlineKeyboardButton('\U0001f4e6 Обновить ядро Xray',
+            [InlineKeyboardButton('⬆️ Обновить ядро Xray',
                                   callback_data='xkeen:ask:update_xray')],
-            [InlineKeyboardButton('\U0001f4e6 Обновить ядро Mihomo',
+            [InlineKeyboardButton('⬆️ Обновить ядро Mihomo',
                                   callback_data='xkeen:ask:update_mihomo')],
             [InlineKeyboardButton('\U0001f30d Обновить геофайлы',
                                   callback_data='xkeen:ask:update_geo')],
-            [InlineKeyboardButton('\U0001f4e6 Обновить XKeen',
+            [InlineKeyboardButton('⬆️ Обновить XKeen',
                                   callback_data='xkeen:ask:update_xkeen')],
             [InlineKeyboardButton('\U0001f504 Настроить автообновления',
                                   callback_data='xkeen:ask:update_auto')],
@@ -9191,7 +9246,7 @@ class BirdModule:
                 rows.append([InlineKeyboardButton(
                     '\u25b6\ufe0f Запустить', callback_data='bird:ask:start')])
             rows.append([InlineKeyboardButton(
-                '\U0001f4c4 Перечитать конфиг', callback_data='bird:ask:reload_conf')])
+                '📄 Перечитать конфиг', callback_data='bird:ask:reload_conf')])
             rows.append([
                 InlineKeyboardButton('\U0001f4ca Статус', callback_data='bird:ask:show_status'),
                 InlineKeyboardButton('\U0001f517 Протоколы', callback_data='bird:ask:show_protocols'),
@@ -9212,7 +9267,7 @@ class BirdModule:
                 InlineKeyboardButton('\u274c Откл. все', callback_data='bird:ask:disable_all'),
             ])
             rows.append([InlineKeyboardButton(
-                '\u270f\ufe0f Редактировать конфиг', callback_data='bird:edit_config')])
+                '✏️ Редактировать конфиг', callback_data='bird:edit_config')])
             rows.append([InlineKeyboardButton(
                 '\U0001f5d1 Удалить BIRD', callback_data='bird:ask:uninstall')])
         rows.append([InlineKeyboardButton(
@@ -10256,7 +10311,7 @@ class MTProxyModule:
             rows.append([InlineKeyboardButton(
                 '\U0001f517 Показать ссылку', callback_data='mtproxy:show_link')])
             rows.append([InlineKeyboardButton(
-                '\u2699\ufe0f Редактировать конфиг',
+                '✏️ Редактировать конфиг',
                 callback_data='mtproxy:edit_config')])
             rows.append([InlineKeyboardButton(
                 '\U0001f5d1 Удалить MTProxy',
@@ -10362,7 +10417,7 @@ class MTProxyModule:
     # ================= ссылка =================
 
     async def _show_link(self, q, ctx):
-        link = self._get_full_link()
+        link = await asyncio.to_thread(self._get_full_link)
         secret = get_secret()
         cfg = get_config()
         port = cfg.get('PORT', '?')
@@ -11319,12 +11374,12 @@ class KeenPbrModule:
             ])
             rows.append([
                 InlineKeyboardButton('\u2705 Проверить конфиг', callback_data='keen_pbr:ask:test_config'),
-                InlineKeyboardButton('\U0001f4c4 Перечитать', callback_data='keen_pbr:ask:reload'),
+                InlineKeyboardButton('📄 Перечитать конфиг', callback_data='keen_pbr:ask:reload'),
             ])
             rows.append([InlineKeyboardButton(
                 '\U0001f4c4 Показать конфиг', callback_data='keen_pbr:show_config')])
             rows.append([InlineKeyboardButton(
-                '\u2699\ufe0f Редактировать конфиг', callback_data='keen_pbr:edit_config')])
+                '✏️ Редактировать конфиг', callback_data='keen_pbr:edit_config')])
             rows.append([InlineKeyboardButton(
                 '\U0001f5d1 Удалить keen-pbr', callback_data='keen_pbr:ask:uninstall')])
         rows.append([InlineKeyboardButton(
@@ -12132,7 +12187,8 @@ from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import ContextTypes
 
 from .actions import (
-    ACTIONS, UNINSTALL_CMD, UNINSTALL_TARGETS, SCAN_PATTERNS, NEOFIT_WEB_URL,
+    ACTIONS, UNINSTALL_CMD, UNINSTALL_TARGETS, SCAN_PATTERNS,
+    get_neofit_web_url,
     is_installed, is_running, get_version, get_status_short,
 )
 from core.utils import (
@@ -12233,7 +12289,7 @@ class NeoFitModule:
             v = f' · <code>{version}</code>' if version else ''
             lines.append(f'✅ Установлен{v}')
             lines.append('Сервис: ' + ('🟢 работает' if running else '🔴 остановлен'))
-            lines.append(f'Web UI: <code>{_esc(NEOFIT_WEB_URL)}</code>')
+            lines.append(f'Web UI: <code>{_esc(get_neofit_web_url())}</code>')
             if os.path.exists('/opt/etc/neofit'):
                 lines.append('Конфиг: <code>/opt/etc/neofit/</code>')
         else:
@@ -12264,7 +12320,7 @@ class NeoFitModule:
         else:
             if running:
                 rows.append([InlineKeyboardButton(
-                    '\U0001f310 Открыть Web UI', url=NEOFIT_WEB_URL)])
+                    '\U0001f310 Открыть Web UI', url=get_neofit_web_url())])
                 rows.append([
                     InlineKeyboardButton('\u23f9 Остановить', callback_data='neofit:ask:stop'),
                     InlineKeyboardButton('\U0001f504 Перезапустить', callback_data='neofit:ask:restart'),
@@ -12749,7 +12805,34 @@ NEOFIT_INIT    = '/opt/etc/init.d/S99neofit'
 NEOFIT_CONF_DIR = '/opt/etc/neofit'
 NEOFIT_LOG     = '/opt/var/log/neofit.log'
 NEOFIT_WEB_PORT = 92
-NEOFIT_WEB_URL  = f'http://192.168.1.1:{NEOFIT_WEB_PORT}'
+
+def get_router_ip() -> str:
+    try:
+        r = subprocess.run(
+            ['sh', '-c',
+             "ip -4 addr show br0 2>/dev/null | "
+             "grep -oE 'inet [0-9.]+' | head -1 | awk '{print $2}'"],
+            capture_output=True, text=True, timeout=3)
+        ip = (r.stdout or '').strip()
+        if ip and not ip.startswith('127.'):
+            return ip
+    except Exception:
+        pass
+    import socket as _s
+    s = _s.socket(_s.AF_INET, _s.SOCK_DGRAM)
+    try:
+        s.connect(('192.168.1.1', 80))
+        ip = s.getsockname()[0]
+        if not ip.startswith('127.'):
+            return ip
+    except Exception:
+        pass
+    finally:
+        s.close()
+    return '192.168.1.1'
+
+def get_neofit_web_url() -> str:
+    return f'http://{get_router_ip()}:{NEOFIT_WEB_PORT}'
 
 
 def find_bin() -> str:
@@ -12881,6 +12964,12 @@ ACTIONS = {
         'desc': 'Общее состояние NeoFit',
         'cmd': CMD_INFO,
     },
+    'show_config': {
+        'title': 'Показать конфиг',
+        'icon': '\U0001f4c4',
+        'desc': 'Содержимое каталога /opt/etc/neofit/',
+        'cmd': 'ls -la /opt/etc/neofit/ 2>&1',
+    },
     'logs': {
         'title': 'Логи NeoFit',
         'icon': '\U0001f4dc',
@@ -12966,7 +13055,7 @@ def _strip_ansi(s):
 class UsqueKeeneticModule:
     name = 'usque_keenetic'
     title = 'Usque WARP'
-    icon = '\U0001f310'
+    icon = '\u2601\ufe0f'
     description = 'Cloudflare WARP (MASQUE)'
     category = 'services'
     category_title = 'Сервис'
@@ -13721,7 +13810,7 @@ else
         echo "→ opkg update..."
         opkg update >/dev/null 2>&1 || true
         echo "→ opkg install$MISSING_OPKG"
-        opkg install $MISSING_OPKG || { echo "❌ opkg install не удался"; exit 1; }
+        opkg install --force-overwrite $MISSING_OPKG || { echo "❌ opkg install не удался"; exit 1; }
     fi
 
     if [ -n "$MISSING_PIP" ]; then
@@ -13819,6 +13908,13 @@ if [ "$MODE" != "install" ]; then
     if [ -f /opt/router_bot/restore_init.sh ]; then
         sh /opt/router_bot/restore_init.sh
     fi
+    # Чистим .pyc-мусор в бэкапе от старых версий (до v2)
+    if [ -d /opt/router_bot/.user_backup ]; then
+        find /opt/router_bot/.user_backup -name '*.pyc' -delete 2>/dev/null || true
+        find /opt/router_bot/.user_backup -type d -name __pycache__ -empty -delete 2>/dev/null || true
+    fi
+    # Чистим __pycache__ в установке — Python пересоздаст при старте
+    find /opt/router_bot -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true
     echo ""
     echo "────────────────────────────────────────────"
     echo "  Режим: $MODE"
@@ -13862,6 +13958,7 @@ if [ "$MODE" != "install" ]; then
     # --- 1. Маршрут к api.telegram.org ---
     printf "→ Обновить маршрут к api.telegram.org? (y/N): "
     read _ANS_R
+    _ANS_R=$(printf "%s" "$_ANS_R" | tr -d "\r\n\t ")
     if [ "$_ANS_R" = "y" ] || [ "$_ANS_R" = "Y" ]; then
         echo ""
         _TUNABLES=$(ip -o link show 2>/dev/null \
@@ -13936,6 +14033,10 @@ if [ "$MODE" != "install" ]; then
                 sed -i "s|^VPN_IF=.*|VPN_IF='$_new_vpn_if'|" /opt/router_bot/config.env
                 sed -i "s|^VPN_SRC=.*|VPN_SRC='$_new_vpn_src'|" /opt/router_bot/config.env
                 sed -i "s|^USE_VPN=.*|USE_VPN='yes'|" /opt/router_bot/config.env
+                if [ ! -x /opt/etc/init.d/S97tgroutes ] && [ -f /opt/router_bot/init/S97tgroutes ]; then
+                    cp -f /opt/router_bot/init/S97tgroutes /opt/etc/init.d/S97tgroutes
+                    chmod +x /opt/etc/init.d/S97tgroutes
+                fi
                 /opt/etc/init.d/S97tgroutes rebuild >/dev/null 2>&1 || true
                 echo "  ✅ config.env обновлён"
             else
@@ -13950,6 +14051,7 @@ if [ "$MODE" != "install" ]; then
     # --- 2. Токен ---
     printf "→ Обновить токен бота? (y/N): "
     read _ANS_T
+    _ANS_T=$(printf "%s" "$_ANS_T" | tr -d "\r\n\t ")
     if [ "$_ANS_T" = "y" ] || [ "$_ANS_T" = "Y" ]; then
         while true; do
             printf "  Токен бота (от @BotFather): "
@@ -13997,6 +14099,7 @@ PYEOF
     # --- 3. Chat ID ---
     printf "→ Обновить chat_id? (y/N): "
     read _ANS_C
+    _ANS_C=$(printf "%s" "$_ANS_C" | tr -d "\r\n\t ")
     if [ "$_ANS_C" = "y" ] || [ "$_ANS_C" = "Y" ]; then
         _cur_token=$(sed -n "s/^TG_BOT_TOKEN='\(.*\)'/\1/p" /opt/router_bot/config.env)
         while true; do
@@ -14042,6 +14145,7 @@ PYEOF
     fi
     echo ""
 
+    rm -f /var/run/routerbot.giveup /var/run/routerbot.fail
     echo "→ Перезапускаю бота..."
     /opt/etc/init.d/S98routerbot restart 2>/dev/null || true
     echo ""
@@ -14190,6 +14294,7 @@ else
             echo "  ВНИМАНИЕ: туннель $VPN_IF в состоянии DOWN."
             printf "  Продолжить с ним? (y/N): "
             read _C
+            _C=$(printf "%s" "$_C" | tr -d "\r\n\t ")
             [ "$_C" = "y" ] || [ "$_C" = "Y" ] || exit 1
         fi
     fi
@@ -14611,8 +14716,7 @@ echo "✅ config.env (+ backup)"
 # =================== продолжение в следующей части ===================
 
 # ---------- 9. init: S97tgroutes ----------
-if [ "$USE_VPN" = "yes" ]; then
-    cat > "$INIT_DIR/S97tgroutes" << 'EOF97'
+cat > "$INIT_DIR/S97tgroutes" << 'EOF97'
 #!/bin/sh
 # Маршруты Telegram через VPN-туннель.
 # WAN_IF и WAN_SRC определяются автоматически.
@@ -14678,7 +14782,7 @@ rebuild_rules() {
     fi
 
     # чистка старых правил
-    for src in $(ip rule show | awk '/lookup 16385/ {for(i=1;i<=NF;i++) if($i=="from") print $(i+1)}'); do
+    for src in $(ip rule show | awk -v tbl="$ROUTE_TABLE" '$0 ~ "lookup " tbl " " {for(i=1;i<=NF;i++) if($i=="from") print $(i+1)}'); do
         case "$src" in
             [0-9]*) ip rule del from "$src" lookup "$ROUTE_TABLE" 2>/dev/null || true ;;
         esac
@@ -14711,7 +14815,7 @@ case "$1" in
         ip rule del to "$net" lookup "$ROUTE_TABLE" 2>/dev/null || true
         ip route del "$net" table "$ROUTE_TABLE" 2>/dev/null || true
     done
-    for src in $(ip rule show | awk '/lookup 16385/ {for(i=1;i<=NF;i++) if($i=="from") print $(i+1)}'); do
+    for src in $(ip rule show | awk -v tbl="$ROUTE_TABLE" '$0 ~ "lookup " tbl " " {for(i=1;i<=NF;i++) if($i=="from") print $(i+1)}'); do
         case "$src" in
             [0-9]*) ip rule del from "$src" lookup "$ROUTE_TABLE" 2>/dev/null || true ;;
         esac
@@ -14722,10 +14826,9 @@ case "$1" in
 esac
 EOF97
     chmod +x "$INIT_DIR/S97tgroutes"
-    mkdir -p /opt/router_bot/init
-    cp -f "$INIT_DIR/S97tgroutes" /opt/router_bot/init/S97tgroutes
-    echo "✅ S97tgroutes"
-fi
+mkdir -p /opt/router_bot/init
+cp -f "$INIT_DIR/S97tgroutes" /opt/router_bot/init/S97tgroutes
+echo "✅ S97tgroutes"
 
 # ---------- 10. wrapper в /opt/bin ----------
 echo "→ Устанавливаю routerbot_wrapper.sh..."
@@ -14922,6 +15025,12 @@ fi
 
 /opt/etc/init.d/S98routerbot start
 sleep 5
+if [ -f /var/run/routerbot.pid ] && kill -0 "$(cat /var/run/routerbot.pid)" 2>/dev/null; then
+    echo "✅ Router Bot запущен (PID $(cat /var/run/routerbot.pid))"
+else
+    echo "⚠️  Router Bot не запустился. Проверьте:"
+    echo "     tail -50 $LOG_DIR/router_bot.log"
+fi
 
 # ---------- 16. Итог ----------
 echo ""
@@ -15063,6 +15172,13 @@ printf "Удалить эти файлы? (y/N): "
 read ANS
 
 if [ "$ANS" = "y" ] || [ "$ANS" = "Y" ]; then
+    echo "→ Чищу данные новых модулей..."
+    rm -rf "$BASE_DIR/data/hydraroute"
+    rm -rf "$BASE_DIR/data/mtproxy"
+    rm -rf "$BASE_DIR/data/keen_pbr"
+    rm -rf "$BASE_DIR/data/neofit"
+    rm -rf "$BASE_DIR/data/usque_keenetic"
+    rm -f /opt/etc/HydraRoute/hrneo.conf.bak.*
     rm -rf "$BASE_DIR"
     rm -f "$LOG_DIR/router_bot.log"*
     echo "✅ Данные и логи удалены"
@@ -15164,16 +15280,6 @@ echo ""
 echo "  Если отказались удалять зависимости —"
 echo "  они остались в системе."
 echo ""
-# ---------- XX. Чистка новых модулей ----------
-echo "→ Чищу данные новых модулей..."
-rm -rf "$BASE_DIR/data/hydraroute"
-rm -rf "$BASE_DIR/data/mtproxy"
-rm -rf "$BASE_DIR/data/keen_pbr"
-rm -rf "$BASE_DIR/data/neofit"
-rm -rf "$BASE_DIR/data/usque_keenetic"
-
-# ---------- XX. Чистка hrneo от наследия ----------
-rm -f /opt/etc/HydraRoute/hrneo.conf.bak.*
 RB_UNINSTALL_SH_EOF
 
 echo "  → core/wrapper.sh"
@@ -15326,6 +15432,9 @@ if command -v sha256sum >/dev/null 2>&1; then
     find /opt/router_bot -type f \
         ! -path '*/data/*' \
         ! -path '*/.user_backup/*' \
+        ! -path '*/__pycache__/*' \
+        ! -name '*.pyc' \
+        ! -name '*.pyo' \
         ! -name '.manifest' \
         ! -name 'VERSION' \
         ! -name 'config.env*' \
