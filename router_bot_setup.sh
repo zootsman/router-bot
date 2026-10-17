@@ -54,6 +54,45 @@ fi
 export RB_MODE="$MODE"
 export RB_VERSION="$SETUP_VERSION"
 
+# ============================================================
+#  Сверка файлов с манифестом (обнаружение правок пользователя)
+# ============================================================
+MANIFEST="/opt/router_bot/.manifest"
+USER_BACKUP="/opt/router_bot/.user_backup"
+
+if [ -d /opt/router_bot ] && [ -f "$MANIFEST" ] && [ "$MODE" != "install" ]; then
+    echo "→ Сверяю файлы с предыдущей установкой..."
+    _conflicts=0
+    _missing=0
+    while IFS= read -r _line; do
+        [ -z "$_line" ] && continue
+        _old_hash=$(printf '%s' "$_line" | awk '{print $1}')
+        _path=$(printf '%s' "$_line" | awk '{$1=""; sub(/^ /,""); print}')
+        [ -z "$_path" ] && continue
+        if [ ! -f "$_path" ]; then
+            _missing=$((_missing+1))
+            continue
+        fi
+        _cur_hash=$(sha256sum "$_path" 2>/dev/null | awk '{print $1}')
+        if [ -n "$_cur_hash" ] && [ "$_cur_hash" != "$_old_hash" ]; then
+            _rel="${_path#/opt/router_bot/}"
+            _bak="$USER_BACKUP/$_rel"
+            mkdir -p "$(dirname "$_bak")"
+            cp -p "$_path" "$_bak" 2>/dev/null || true
+            echo "  ⚠️  изменён: $_rel (сохранён в .user_backup/)"
+            _conflicts=$((_conflicts+1))
+        fi
+    done < "$MANIFEST"
+
+    if [ "$_conflicts" -eq 0 ] && [ "$_missing" -eq 0 ]; then
+        echo "  ✅ изменений нет"
+    else
+        [ "$_conflicts" -gt 0 ] && echo "  Всего изменено: $_conflicts"
+        [ "$_missing" -gt 0 ] && echo "  Отсутствует: $_missing (будут восстановлены)"
+    fi
+    echo ""
+fi
+
 echo "→ Создаю структуру /opt/router_bot/..."
 mkdir -p /opt/router_bot/core
 mkdir -p /opt/bin
@@ -1214,7 +1253,7 @@ show_help() {
     logs [N]         Последние N строк лога (по умолч. 40)
     follow, f        Лог в реальном времени (Ctrl+C — выход)
     version, v       Версия бота
-    config, c        Содержимое config.env
+    config, c        Конфиг: показать/править/восстановить
     modules, m       Включённые модули
     routes           Маршруты Telegram (table 16385)
     health           Запустить healthcheck
@@ -1235,6 +1274,10 @@ show_help() {
     rb logs 100      # последние 100 строк лога
     rb r             # перезапуск
     rb v             # версия
+    rb config        # показать config.env
+    rb config init   # создать заново (с подтверждением)
+    rb config edit   # править конфиг
+    rb config check  # проверить обязательные ключи
 EOF
     echo ""
 }
@@ -1282,15 +1325,531 @@ do_status() {
     echo ""
 }
 
-do_config() {
+
+_rb_ci_ask() {
+    # Задаёт вопрос. Возвращает:
+    #   0 — введено (значение в _RB_CI_VAL)
+    #   1 — отмена (q/quit/Ctrl+C/EOF)
+    _prompt="$1"
+    _def="$2"
+    if [ -n "$_def" ]; then
+        printf "%s [%s]: " "$_prompt" "$_def"
+    else
+        printf "%s: " "$_prompt"
+    fi
+    if ! IFS= read -r _RB_CI_VAL; then
+        echo
+        return 1
+    fi
+    _RB_CI_VAL=$(printf '%s' "$_RB_CI_VAL" | tr -d '\r')
+    case "$_RB_CI_VAL" in
+        q|Q|quit|QUIT|exit|EXIT|отмена|Отмена|ОТМЕНА)
+            return 1
+            ;;
+        "")
+            _RB_CI_VAL="$_def"
+            ;;
+    esac
+    return 0
+}
+
+do_config_init() {
+    _abort() {
+        echo ""
+        echo "  \u23f9  Отменено \u2014 config.env не изменён"
+        return 1
+    }
+
     if [ -f "$CONF" ]; then
         echo ""
-        echo "  === $CONF ==="
-        cat "$CONF"
+        echo "  \u26a0\ufe0f  config.env уже существует: $CONF"
+        echo "  Он будет перезаписан. Текущий сохранится как .broken.<timestamp>"
         echo ""
-    else
-        echo "config.env не найден"
+        printf "  Продолжить? (y/N): "
+        read _r
+        case "$_r" in
+            y|Y) ;;
+            *) echo "  Отменено"; return 1 ;;
+        esac
     fi
+
+    echo ""
+    echo "  \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550"
+    echo "  Создание config.env (визард)"
+    echo "  \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550"
+    echo "  Отмена на любом шаге:"
+    echo "    q <Enter>   \u2014 прервать (ничего не изменится)"
+    echo "    Ctrl+C      \u2014 прервать"
+    echo ""
+
+    # --- 1. Токен ---
+    _ci_token=""
+    _attempt=0
+    while [ -z "$_ci_token" ]; do
+        _attempt=$((_attempt+1))
+        if [ "$_attempt" -gt 5 ]; then
+            echo "  Слишком много попыток, отмена"
+            return 1
+        fi
+        if ! _rb_ci_ask "  Токен бота (от @BotFather)" ""; then
+            return $( _abort )
+        fi
+        if [ -z "$_RB_CI_VAL" ]; then
+            echo "  \u274c Пусто, попробуйте ещё"
+            continue
+        fi
+        printf "  Проверяю токен... "
+        _res=$(TG_TOKEN="$_RB_CI_VAL" /opt/bin/python3 - << 'PYEOF' 2>/dev/null
+import os, json, urllib.request, urllib.error
+tok = os.environ.get("TG_TOKEN", "")
+try:
+    r = urllib.request.urlopen(f"https://api.telegram.org/bot{tok}/getMe", timeout=10)
+    d = json.loads(r.read())
+    print("OK:" + d["result"].get("username", "") if d.get("ok") else "FAIL_OTHER:bad")
+except urllib.error.HTTPError as e:
+    print(f"FAIL_TOKEN:HTTP {e.code}")
+except urllib.error.URLError as e:
+    print(f"FAIL_NET:{e.reason}")
+except Exception as e:
+    print(f"FAIL_OTHER:{type(e).__name__}")
+PYEOF
+)
+        case "$_res" in
+            OK:*)
+                echo "\u2705 @${_res#OK:}"
+                _ci_token="$_RB_CI_VAL"
+                ;;
+            FAIL_TOKEN:*)
+                echo "\u274c неверный токен: ${_res#FAIL_TOKEN:}"
+                ;;
+            FAIL_NET:*)
+                echo "\u26a0\ufe0f  сеть: ${_res#FAIL_NET:}"
+                echo "     токен НЕ проверен"
+                printf "     Использовать всё равно? (y/N): "
+                read _r
+                case "$_r" in y|Y) _ci_token="$_RB_CI_VAL" ;; esac
+                ;;
+            *)
+                echo "\u274c $_res"
+                ;;
+        esac
+    done
+
+    # --- 2. Chat ID ---
+    _ci_chat=""
+    _attempt=0
+    while [ -z "$_ci_chat" ]; do
+        _attempt=$((_attempt+1))
+        if [ "$_attempt" -gt 5 ]; then
+            echo "  Слишком много попыток, отмена"
+            return 1
+        fi
+        if ! _rb_ci_ask "  Chat ID (узнать у @userinfobot)" ""; then
+            return $( _abort )
+        fi
+        if [ -z "$_RB_CI_VAL" ]; then
+            echo "  \u274c Пусто, попробуйте ещё"
+            continue
+        fi
+        printf "  Отправляю тестовое сообщение... "
+        _res=$(TG_TOKEN="$_ci_token" TG_CHAT="$_RB_CI_VAL" /opt/bin/python3 - << 'PYEOF' 2>/dev/null
+import os, json, urllib.request, urllib.parse, urllib.error
+tok = os.environ["TG_TOKEN"]
+chat = os.environ["TG_CHAT"]
+try:
+    data = urllib.parse.urlencode({"chat_id": chat, "text": "Router Bot: проверка chat_id"}).encode()
+    r = urllib.request.urlopen(f"https://api.telegram.org/bot{tok}/sendMessage", data=data, timeout=10)
+    d = json.loads(r.read())
+    print("OK" if d.get("ok") else "FAIL_OTHER:not ok")
+except urllib.error.HTTPError as e:
+    print(f"FAIL_CHAT:HTTP {e.code}")
+except urllib.error.URLError as e:
+    print(f"FAIL_NET:{e.reason}")
+except Exception as e:
+    print(f"FAIL_OTHER:{type(e).__name__}")
+PYEOF
+)
+        case "$_res" in
+            OK)
+                echo "\u2705 доставлено"
+                _ci_chat="$_RB_CI_VAL"
+                ;;
+            FAIL_CHAT:*)
+                echo "\u274c chat_id неверен: ${_res#FAIL_CHAT:}"
+                ;;
+            FAIL_NET:*)
+                echo "\u26a0\ufe0f  сеть: ${_res#FAIL_NET:}"
+                printf "     Использовать всё равно? (y/N): "
+                read _r
+                case "$_r" in y|Y) _ci_chat="$_RB_CI_VAL" ;; esac
+                ;;
+            *)
+                echo "\u274c $_res"
+                ;;
+        esac
+    done
+
+    # --- 3. Модули ---
+    _all_mods="net_watch,ssh_control,system,hydraroute,flashkeen,xkeen,bird,mtproxy,keen_pbr,neofit,usque_keenetic"
+    echo ""
+    echo "  Доступные модули:"
+    echo "    net_watch ssh_control system hydraroute flashkeen xkeen"
+    echo "    bird mtproxy keen_pbr neofit usque_keenetic"
+    if ! _rb_ci_ask "  Модули (через запятую, Enter = все)" "$_all_mods"; then
+        return $( _abort )
+    fi
+    _ci_mods="$_RB_CI_VAL"
+
+    # --- 4. POLL_INTERVAL ---
+    if ! _rb_ci_ask "  Интервал опроса ndmc, сек" "5"; then
+        return $( _abort )
+    fi
+    _ci_poll="$_RB_CI_VAL"
+    case "$_ci_poll" in
+        ''|*[!0-9]*) _ci_poll=5 ;;
+    esac
+
+    # --- 5. HEARTBEAT_INTERVAL ---
+    if ! _rb_ci_ask "  Heartbeat, сек (0 = выкл)" "3600"; then
+        return $( _abort )
+    fi
+    _ci_hb="$_RB_CI_VAL"
+    case "$_ci_hb" in
+        ''|*[!0-9]*) _ci_hb=3600 ;;
+    esac
+
+    # --- 6. VENDOR_LOOKUP ---
+    if ! _rb_ci_ask "  Искать вендора по MAC (on/off)" "on"; then
+        return $( _abort )
+    fi
+    _ci_vendor="$_RB_CI_VAL"
+    case "$_ci_vendor" in
+        on|ON|On|off|OFF|Off) ;;
+        *) _ci_vendor=on ;;
+    esac
+
+    # --- 7. Автоопределение сети ---
+    echo ""
+    echo "  Определяю параметры сети..."
+    _ci_wan_if=$(ip route show default 2>/dev/null | awk '{
+        for(i=1;i<=NF;i++) if ($i=="dev") iface=$(i+1);
+        if (iface !~ /^(opkgtun|tun|wg|tap|ppp)/) { print iface; exit }
+    }')
+    [ -z "$_ci_wan_if" ] && _ci_wan_if="eth3"
+    _ci_wan_src=$(ip -4 -o addr show dev "$_ci_wan_if" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
+    _ci_route_table=$(ip rule show 2>/dev/null | awk -v src="$_ci_wan_src" '
+        $0 ~ "from " src " " { for(i=1;i<=NF;i++) if($i=="lookup") { print $(i+1); exit } }')
+    [ -z "$_ci_route_table" ] && _ci_route_table="16385"
+    echo "    WAN: $_ci_wan_if ($_ci_wan_src) \u2192 table $_ci_route_table"
+
+    # --- 8. VPN ---
+    _ci_use_vpn="no"
+    _ci_vpn_if=""
+    _ci_vpn_src=""
+    printf "  Проверяю Telegram напрямую... "
+    if /opt/bin/curl -sf --max-time 6 "https://api.telegram.org" >/dev/null 2>&1; then
+        echo "\u2705 доступен, VPN не нужен"
+    else
+        echo "\u274c недоступен"
+        printf "  Настроить VPN? (y/N): "
+        read _r
+        case "$_r" in
+            y|Y)
+                _tuns=$(ip -o link show 2>/dev/null | sed 's/@[^ :]*//g' | \
+                    awk -F': ' '$2 ~ /^(opkgtun[0-9]+|nwg[0-9]+|wg[0-9]+|ppp[0-9]+|tap[0-9]+)$/ { print $2 }')
+                if [ -z "$_tuns" ]; then
+                    echo "  Туннели не найдены \u2014 VPN не настроен"
+                else
+                    _n=0
+                    _tuns_list=""
+                    for _t in $_tuns; do
+                        _n=$((_n+1))
+                        _tuns_list="$_tuns_list $_t"
+                        _tip=$(ip -4 -o addr show dev "$_t" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
+                        if ip -o link show dev "$_t" 2>/dev/null | grep -q '<[^>]*UP[^>]*>'; then
+                            echo "    $_n) $_t  ${_tip:-no-IP}  [UP]"
+                        else
+                            echo "    $_n) $_t  ${_tip:-no-IP}  [DOWN]"
+                        fi
+                    done
+                    if ! _rb_ci_ask "  Номер туннеля" "1"; then
+                        return $( _abort )
+                    fi
+                    _sel="$_RB_CI_VAL"
+                    case "$_sel" in
+                        ''|*[!0-9]*)
+                            _ci_vpn_if=$(echo "$_tuns_list" | awk '{print $1}')
+                            ;;
+                        *)
+                            if [ "$_sel" -ge 1 ] && [ "$_sel" -le "$_n" ]; then
+                                _ci_vpn_if=$(echo "$_tuns_list" | awk -v n="$_sel" '{print $n}')
+                            else
+                                _ci_vpn_if=$(echo "$_tuns_list" | awk '{print $1}')
+                            fi
+                            ;;
+                    esac
+                    if [ -n "$_ci_vpn_if" ]; then
+                        _ci_vpn_src=$(ip -4 -o addr show dev "$_ci_vpn_if" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
+                        _ci_use_vpn="yes"
+                        echo "  Выбран: $_ci_vpn_if ($_ci_vpn_src)"
+                    fi
+                fi
+                ;;
+        esac
+    fi
+
+    # --- Сводка ---
+    echo ""
+    echo "  \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550"
+    echo "  Сводка \u2014 что будет записано"
+    echo "  \u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550\u2550"
+    case "$_ci_token" in
+        *:*) _masked="${_ci_token%%:*}:... (${#_ci_token} символов)" ;;
+        *)   _masked="... (${#_ci_token} символов)" ;;
+    esac
+    echo "  TG_BOT_TOKEN:        $_masked"
+    echo "  TG_CHAT_ID:          $_ci_chat"
+    echo "  ENABLED_MODULES:     $_ci_mods"
+    echo "  POLL_INTERVAL:       $_ci_poll"
+    echo "  HEARTBEAT_INTERVAL:  $_ci_hb"
+    echo "  VENDOR_LOOKUP:       $_ci_vendor"
+    echo "  WAN_IF / WAN_SRC:    $_ci_wan_if / $_ci_wan_src"
+    echo "  ROUTE_TABLE:         $_ci_route_table"
+    if [ "$_ci_use_vpn" = "yes" ]; then
+        echo "  VPN:                 $_ci_vpn_if ($_ci_vpn_src)"
+    else
+        echo "  VPN:                 не используется"
+    fi
+    echo ""
+    printf "  \u2753 Применить и записать config.env? (y/N): "
+    read _r
+    case "$_r" in
+        y|Y) ;;
+        *) echo "  Отменено \u2014 config.env не изменён"; return 1 ;;
+    esac
+
+    # --- Запись ---
+    mkdir -p "$(dirname "$CONF")"
+    if [ -f "$CONF" ]; then
+        _ts=$(date +%s)
+        cp -p "$CONF" "${CONF}.broken.${_ts}"
+        chmod 600 "${CONF}.broken.${_ts}" 2>/dev/null
+        echo "  Старый конфиг сохранён: config.env.broken.${_ts}"
+    fi
+
+    {
+        echo "# Router Bot \u2014 конфиг"
+        echo "# Создан $(date '+%Y-%m-%d %H:%M:%S') через rb config init"
+        echo ""
+        echo "TG_BOT_TOKEN='$_ci_token'"
+        echo "TG_CHAT_ID='$_ci_chat'"
+        echo ""
+        echo "ENABLED_MODULES='$_ci_mods'"
+        echo ""
+        echo "POLL_INTERVAL=$_ci_poll"
+        echo "HEARTBEAT_INTERVAL=$_ci_hb"
+        echo "VENDOR_LOOKUP=$_ci_vendor"
+        echo "NDMC_PATH=/bin/ndmc"
+        echo ""
+        echo "WAN_IF='$_ci_wan_if'"
+        echo "WAN_SRC='$_ci_wan_src'"
+        echo "ROUTE_TABLE='$_ci_route_table'"
+        echo ""
+        echo "USE_VPN='$_ci_use_vpn'"
+        echo "VPN_IF='$_ci_vpn_if'"
+        echo "VPN_SRC='$_ci_vpn_src'"
+    } > "$CONF"
+    chmod 600 "$CONF"
+    cp -p "$CONF" "${CONF}.bak"
+    chmod 600 "${CONF}.bak"
+
+    echo ""
+    echo "  \u2705 config.env создан: $CONF"
+    echo "  \u2705 Бэкап:              ${CONF}.bak"
+    echo ""
+    if [ "$_ci_use_vpn" = "yes" ] && [ -x /opt/etc/init.d/S97tgroutes ]; then
+        echo "  \u2192 Перестраиваю маршруты Telegram через $_ci_vpn_if..."
+        /opt/etc/init.d/S97tgroutes rebuild >/dev/null 2>&1 || true
+        echo "  \u2705 Готово"
+        echo ""
+    fi
+    echo "  \u2192 Перезапустить бота: rb restart"
+    return 0
+}
+
+do_config() {
+    _sub="${1:-show}"
+    _key="$2"
+    _val="$3"
+    _bak="${CONF}.bak"
+
+    case "$_sub" in
+        show|"")
+            if [ -f "$CONF" ]; then
+                echo ""
+                echo "  === $CONF ==="
+                cat "$CONF"
+                echo ""
+                if [ -f "$_bak" ] && [ "$CONF" -nt "$_bak" ]; then
+                    echo "  ⚠️  config.env новее бэкапа (rb config backup чтобы обновить)"
+                fi
+            elif [ -f "$_bak" ]; then
+                echo ""
+                echo "  ❌ config.env отсутствует!"
+                echo "  ✅ есть резервная копия: $_bak"
+                echo ""
+                echo "  Восстановить: rb config restore"
+            else
+                echo ""
+                echo "  ❌ config.env отсутствует, резервной копии нет"
+                echo "     Переустановите бот: sh /tmp/router_bot_setup.sh"
+                return 1
+            fi
+            ;;
+
+        edit|e)
+            if [ ! -f "$CONF" ]; then
+                echo "❌ config.env не найден. Сначала: rb config restore"
+                return 1
+            fi
+            _ed="${EDITOR:-nano}"
+            command -v "$_ed" >/dev/null 2>&1 || _ed="vi"
+            if [ "$_ed" = "vi" ] && ! command -v vi >/dev/null 2>&1; then
+                echo "❌ Редактор не найден (ни nano, ни vi)"
+                return 1
+            fi
+            "$_ed" "$CONF"
+            cp -p "$CONF" "$_bak"
+            chmod 600 "$CONF" "$_bak" 2>/dev/null || true
+            echo ""
+            echo "✅ Изменения сохранены, бэкап обновлён"
+            echo "   Перезапустить бота: rb restart"
+            ;;
+
+        restore|r)
+            if [ ! -f "$_bak" ]; then
+                echo "❌ Резервная копия $_bak отсутствует — восстанавливать нечего"
+                echo "   Переустановите бот: sh /tmp/router_bot_setup.sh"
+                return 1
+            fi
+            if [ -f "$CONF" ]; then
+                _ts=$(date +%s)
+                cp -p "$CONF" "${CONF}.broken.${_ts}"
+                chmod 600 "${CONF}.broken.${_ts}" 2>/dev/null || true
+                echo "⚠️  Текущий файл сохранён: config.env.broken.${_ts}"
+            fi
+            cp -p "$_bak" "$CONF"
+            chmod 600 "$CONF"
+            echo "✅ config.env восстановлен из бэкапа"
+            echo "   Перезапустить бота: rb restart"
+            ;;
+
+        backup|b)
+            if [ ! -f "$CONF" ]; then
+                echo "❌ config.env отсутствует — бэкапить нечего"
+                return 1
+            fi
+            cp -p "$CONF" "$_bak"
+            chmod 600 "$_bak" 2>/dev/null || true
+            echo "✅ Бэкап обновлён: $_bak"
+            ;;
+
+        init|new|create)
+            do_config_init
+            return $?
+            ;;
+
+        check|chk)
+            if [ ! -f "$CONF" ]; then
+                echo "❌ config.env отсутствует"
+                if [ -f "$_bak" ]; then
+                    echo "   Восстановить: rb config restore"
+                fi
+                return 1
+            fi
+            echo ""
+            echo "  → Проверка ключей в $CONF"
+            _err=0
+            for _k in TG_BOT_TOKEN TG_CHAT_ID ENABLED_MODULES; do
+                if grep -q "^${_k}=" "$CONF"; then
+                    _v=$(sed -n "s/^${_k}='\(.*\)'/\1/p" "$CONF" | head -1)
+                    [ -z "$_v" ] && _v=$(sed -n "s/^${_k}=\(.*\)/\1/p" "$CONF" | head -1)
+                    if [ -z "$_v" ]; then
+                        echo "  ❌ $_k: пустой"
+                        _err=$((_err+1))
+                    else
+                        case "$_k" in
+                            TG_BOT_TOKEN)
+                                echo "  ✅ $_k: ${_v%:*}:... (${#_v} символов)"
+                                ;;
+                            *)
+                                echo "  ✅ $_k: $_v"
+                                ;;
+                        esac
+                    fi
+                else
+                    echo "  ❌ $_k: отсутствует"
+                    _err=$((_err+1))
+                fi
+            done
+            echo ""
+            if [ "$_err" -eq 0 ]; then
+                echo "  ✅ Все обязательные ключи на месте"
+            else
+                echo "  ❌ Ошибок: $_err"
+                return 1
+            fi
+            ;;
+
+        get|show-key)
+            if [ -z "$_key" ]; then
+                echo "Использование: rb config get KEY"
+                echo "Пример: rb config get TG_CHAT_ID"
+                return 1
+            fi
+            if [ ! -f "$CONF" ]; then
+                echo "❌ config.env отсутствует"
+                return 1
+            fi
+            sed -n "s/^${_key}='\(.*\)'/\1/p" "$CONF" | head -1
+            ;;
+
+        set)
+            if [ -z "$_key" ] || [ -z "$_val" ]; then
+                echo "Использование: rb config set KEY VALUE"
+                echo "Пример: rb config set POLL_INTERVAL 10"
+                return 1
+            fi
+            if [ ! -f "$CONF" ]; then
+                echo "❌ config.env отсутствует. Сначала: rb config restore"
+                return 1
+            fi
+            if grep -q "^${_key}=" "$CONF"; then
+                sed -i "s|^${_key}=.*|${_key}='${_val}'|" "$CONF"
+                echo "✅ $_key = $_val"
+            else
+                printf "\n%s='%s'\n" "$_key" "$_val" >> "$CONF"
+                echo "✅ $_key = $_val (добавлен)"
+            fi
+            cp -p "$CONF" "$_bak"
+            chmod 600 "$CONF" "$_bak" 2>/dev/null || true
+            echo "   Бэкап обновлён. Перезапустить бота: rb restart"
+            ;;
+
+        *)
+            echo "Неизвестная подкоманда: $_sub"
+            echo ""
+            echo "  rb config [show]            показать конфиг"
+            echo "  rb config init              создать заново (визард)"
+            echo "  rb config edit              редактировать"
+            echo "  rb config restore           восстановить из .bak"
+            echo "  rb config backup            обновить .bak"
+            echo "  rb config check             проверить ключи"
+            echo "  rb config get KEY           показать значение"
+            echo "  rb config set KEY VALUE     изменить ключ"
+            return 1
+            ;;
+    esac
 }
 
 do_modules() {
@@ -1373,7 +1932,7 @@ case "$1" in
         fi
         ;;
     config|c)
-        do_config
+        do_config "$2" "$3" "$4"
         ;;
     modules|m)
         do_modules
@@ -13209,6 +13768,15 @@ $BASE_DIR/modules/bird/actions.py
 $BASE_DIR/modules/mtproxy/__init__.py
 $BASE_DIR/modules/mtproxy/module.py
 $BASE_DIR/modules/mtproxy/actions.py
+$BASE_DIR/modules/keen_pbr/__init__.py
+$BASE_DIR/modules/keen_pbr/module.py
+$BASE_DIR/modules/keen_pbr/actions.py
+$BASE_DIR/modules/neofit/__init__.py
+$BASE_DIR/modules/neofit/module.py
+$BASE_DIR/modules/neofit/actions.py
+$BASE_DIR/modules/usque_keenetic/__init__.py
+$BASE_DIR/modules/usque_keenetic/module.py
+$BASE_DIR/modules/usque_keenetic/actions.py
 "
 MISSING_FILES=""
 for f in $REQUIRED; do
@@ -13232,10 +13800,248 @@ fi
 
 # ---------- 2b. Режим обновления ----------
 if [ "$MODE" != "install" ]; then
+    # --- Self-heal: целостность установки ---
+    if [ ! -f /opt/router_bot/config.env ]; then
+        if [ -f /opt/router_bot/config.env.bak ]; then
+            echo "⚠️  config.env отсутствует, восстанавливаю из бэкапа..."
+            cp -p /opt/router_bot/config.env.bak /opt/router_bot/config.env
+            chmod 600 /opt/router_bot/config.env
+            echo "  ✅ config.env восстановлен"
+            echo "  ⚠️  Проверьте актуальность: rb config"
+        else
+            echo "⚠️  config.env отсутствует, резервной копии тоже нет."
+            echo "   Нужна полная переустановка:"
+            echo "     rm /opt/router_bot/VERSION && sh /tmp/router_bot_setup.sh"
+            exit 1
+        fi
+    fi
+    echo "→ Проверяю целостность установки..."
+    if [ -f /opt/router_bot/restore_init.sh ]; then
+        sh /opt/router_bot/restore_init.sh
+    fi
+    echo ""
     echo "────────────────────────────────────────────"
     echo "  Режим: $MODE"
     echo "────────────────────────────────────────────"
     echo ""
+
+    # --- Сводка о сохранённых изменениях ---
+    if [ -d /opt/router_bot/.user_backup ]; then
+        _bk=$(find /opt/router_bot/.user_backup -type f 2>/dev/null | wc -l | tr -d " ")
+        [ -z "$_bk" ] && _bk=0
+        if [ "$_bk" -gt 0 ]; then
+            echo "════════════════════════════════════════════"
+            echo "  ⚠️  Найдены изменённые файлы ($_bk)"
+            echo "════════════════════════════════════════════"
+            echo ""
+            echo "Файлы, которые вы правили вручную:"
+            find /opt/router_bot/.user_backup -type f 2>/dev/null | sed "s|/opt/router_bot/.user_backup/|    • |"
+            echo ""
+            echo "В системе они уже перезаписаны эталоном из архива."
+            echo "Ваши копии сохранены в /opt/router_bot/.user_backup/"
+            echo ""
+            printf "Восстановить ваши версии? (y/N): "
+            read _RESTORE
+            if [ "$_RESTORE" = "y" ] || [ "$_RESTORE" = "Y" ]; then
+                ( cd /opt/router_bot/.user_backup && find . -type f ) | while IFS= read -r _rel; do
+                    _rel="${_rel#./}"
+                    _src="/opt/router_bot/.user_backup/$_rel"
+                    _dst="/opt/router_bot/$_rel"
+                    mkdir -p "$(dirname "$_dst")"
+                    cp -p "$_src" "$_dst" 2>/dev/null || true
+                done
+                echo "  ✅ Ваши изменения восстановлены"
+                echo "  ⚠️  Проверьте совместимость с новой версией!"
+            else
+                echo "  Оставлены эталонные версии"
+            fi
+            echo ""
+        fi
+    fi
+
+    # --- 1. Маршрут к api.telegram.org ---
+    printf "→ Обновить маршрут к api.telegram.org? (y/N): "
+    read _ANS_R
+    if [ "$_ANS_R" = "y" ] || [ "$_ANS_R" = "Y" ]; then
+        echo ""
+        _TUNABLES=$(ip -o link show 2>/dev/null \
+            | sed "s/@[^ :]*//g" \
+            | awk -F": " '$2 ~ /^(opkgtun[0-9]+|nwg[0-9]+|wg[0-9]+|ppp[0-9]+|tap[0-9]+)$/ { print $2 }')
+        if [ -z "$_TUNABLES" ]; then
+            echo "  Туннели не найдены, пропускаю."
+        else
+            _all_tuns=""
+            _n=0
+            _first_up=""
+            for _t in $_TUNABLES; do
+                if ip -o link show dev "$_t" 2>/dev/null | grep -q '<[^>]*UP[^>]*>'; then
+                    _n=$((_n+1))
+                    _all_tuns="$_all_tuns $_t"
+                    [ -z "$_first_up" ] && _first_up="$_t"
+                    _tip=$(ip -4 -o addr show dev "$_t" 2>/dev/null | awk "{print \$4}" | cut -d/ -f1 | head -1)
+                    echo "    $_n) $_t  ${_tip:-no-IP}  [UP]"
+                fi
+            done
+            for _t in $_TUNABLES; do
+                if ! ip -o link show dev "$_t" 2>/dev/null | grep -q '<[^>]*UP[^>]*>'; then
+                    _n=$((_n+1))
+                    _all_tuns="$_all_tuns $_t"
+                    _tip=$(ip -4 -o addr show dev "$_t" 2>/dev/null | awk "{print \$4}" | cut -d/ -f1 | head -1)
+                    echo "    $_n) $_t  ${_tip:-no-IP}  [DOWN]"
+                fi
+            done
+            echo ""
+            _new_vpn_if=""
+            if [ "$_n" -eq 1 ]; then
+                _new_vpn_if=$(echo "$_all_tuns" | awk "{print \$1}")
+                echo "  Единственный туннель: $_new_vpn_if"
+            else
+                while true; do
+                    if [ -n "$_first_up" ]; then
+                        printf "  Выберите номер [1-%d] (Enter = 1, %s): " "$_n" "$_first_up"
+                    else
+                        printf "  Выберите номер [1-%d]: " "$_n"
+                    fi
+                    read _ANS
+                    _ANS=$(echo "$_ANS" | tr -d "[:space:]")
+                    if [ -z "$_ANS" ] && [ -n "$_first_up" ]; then
+                        _new_vpn_if="$_first_up"
+                        break
+                    fi
+                    case "$_ANS" in
+                        *[!0-9]*) echo "  Ошибка: число 1-$_n"; continue ;;
+                    esac
+                    if [ "$_ANS" -ge 1 ] && [ "$_ANS" -le "$_n" ]; then
+                        _new_vpn_if=$(echo "$_all_tuns" | awk -v n="$_ANS" "{print \$n}")
+                        [ -n "$_new_vpn_if" ] && break
+                    else
+                        echo "  Ошибка: число 1-$_n"
+                    fi
+                done
+            fi
+
+            _new_vpn_src=$(ip -4 -o addr show dev "$_new_vpn_if" 2>/dev/null | awk "{print \$4}" | cut -d/ -f1 | head -1)
+            _wt=$(sed -n "s/^ROUTE_TABLE='\(.*\)'/\1/p" /opt/router_bot/config.env 2>/dev/null)
+            [ -z "$_wt" ] && _wt="16385"
+            echo "  Проверяю $_new_vpn_if ($_new_vpn_src)... (до 8 сек)"
+            for _net in 149.154.160.0/20 91.108.4.0/22; do
+                ip route add "$_net" dev "$_new_vpn_if" src "$_new_vpn_src" table "$_wt" 2>/dev/null || true
+            done
+            _CURL_OK=no
+            if /opt/bin/curl -sf --max-time 8 "https://api.telegram.org" >/dev/null 2>&1; then
+                _CURL_OK=yes
+            fi
+            if [ "$_CURL_OK" = "yes" ]; then
+                echo "  ✅ Доступ через $_new_vpn_if есть"
+                sed -i "s|^VPN_IF=.*|VPN_IF='$_new_vpn_if'|" /opt/router_bot/config.env
+                sed -i "s|^VPN_SRC=.*|VPN_SRC='$_new_vpn_src'|" /opt/router_bot/config.env
+                sed -i "s|^USE_VPN=.*|USE_VPN='yes'|" /opt/router_bot/config.env
+                /opt/etc/init.d/S97tgroutes rebuild >/dev/null 2>&1 || true
+                echo "  ✅ config.env обновлён"
+            else
+                echo "  ❌ Через $_new_vpn_if доступа нет, оставляю старую настройку"
+            fi
+        fi
+    else
+        echo "  Маршрут оставлен без изменений"
+    fi
+    echo ""
+
+    # --- 2. Токен ---
+    printf "→ Обновить токен бота? (y/N): "
+    read _ANS_T
+    if [ "$_ANS_T" = "y" ] || [ "$_ANS_T" = "Y" ]; then
+        while true; do
+            printf "  Токен бота (от @BotFather): "
+            read _NEW_TOKEN
+            _NEW_TOKEN=$(echo "$_NEW_TOKEN" | tr -d " ")
+            [ -z "$_NEW_TOKEN" ] && echo "  Пусто, попробуйте ещё" && continue
+            _RES=$(TG_TOKEN="$_NEW_TOKEN" /opt/bin/python3 - << 'PYEOF'
+import os, json, urllib.request, urllib.error
+tok = os.environ.get("TG_TOKEN", "")
+try:
+    r = urllib.request.urlopen(f"https://api.telegram.org/bot{tok}/getMe", timeout=10)
+    d = json.loads(r.read())
+    print("OK:" + d["result"].get("username", "") if d.get("ok") else "FAIL_OTHER:bad")
+except urllib.error.HTTPError as e:
+    print(f"FAIL_TOKEN:HTTP {e.code}")
+except urllib.error.URLError as e:
+    print(f"FAIL_NET:{e.reason}")
+except Exception as e:
+    print(f"FAIL_OTHER:{type(e).__name__}:{e}")
+PYEOF
+)
+            case "$_RES" in
+                OK:*)
+                    _BOT_USER="${_RES#OK:}"
+                    echo "  ✅ Токен валиден, бот: @$_BOT_USER"
+                    sed -i "s|^TG_BOT_TOKEN=.*|TG_BOT_TOKEN='$_NEW_TOKEN'|" /opt/router_bot/config.env
+                    echo "  ✅ config.env обновлён"
+                    break
+                    ;;
+                FAIL_TOKEN:*)
+                    echo "  ❌ Токен неверен: ${_RES#FAIL_TOKEN:}"
+                    ;;
+                FAIL_NET:*)
+                    echo "  ⚠️  Сеть: ${_RES#FAIL_NET:}"
+                    printf "     Повторить? (Y/n): "; read _R; [ "$_R" = "n" ] && break
+                    ;;
+                *) echo "  ❌ $_RES" ;;
+            esac
+        done
+    else
+        echo "  Токен оставлен без изменений"
+    fi
+    echo ""
+
+    # --- 3. Chat ID ---
+    printf "→ Обновить chat_id? (y/N): "
+    read _ANS_C
+    if [ "$_ANS_C" = "y" ] || [ "$_ANS_C" = "Y" ]; then
+        _cur_token=$(sed -n "s/^TG_BOT_TOKEN='\(.*\)'/\1/p" /opt/router_bot/config.env)
+        while true; do
+            printf "  Chat ID: "
+            read _NEW_CHAT
+            _NEW_CHAT=$(echo "$_NEW_CHAT" | tr -d " ")
+            [ -z "$_NEW_CHAT" ] && echo "  Пусто, попробуйте ещё" && continue
+            _RES=$(TG_TOKEN="$_cur_token" TG_CHAT="$_NEW_CHAT" /opt/bin/python3 - << 'PYEOF'
+import os, json, urllib.request, urllib.parse, urllib.error
+tok = os.environ["TG_TOKEN"]; chat = os.environ["TG_CHAT"]
+try:
+    data = urllib.parse.urlencode({"chat_id": chat, "text": "Router Bot: check chat_id"}).encode()
+    r = urllib.request.urlopen(f"https://api.telegram.org/bot{tok}/sendMessage", data=data, timeout=10)
+    d = json.loads(r.read())
+    print("OK" if d.get("ok") else "FAIL_OTHER:not ok")
+except urllib.error.HTTPError as e:
+    print(f"FAIL_CHAT:HTTP {e.code}")
+except urllib.error.URLError as e:
+    print(f"FAIL_NET:{e.reason}")
+except Exception as e:
+    print(f"FAIL_OTHER:{type(e).__name__}:{e}")
+PYEOF
+)
+            case "$_RES" in
+                OK)
+                    echo "  ✅ Chat ID валиден, тестовое сообщение доставлено"
+                    sed -i "s|^TG_CHAT_ID=.*|TG_CHAT_ID='$_NEW_CHAT'|" /opt/router_bot/config.env
+                    echo "  ✅ config.env обновлён"
+                    break
+                    ;;
+                FAIL_CHAT:*)
+                    echo "  ❌ Chat ID неверен или бот не начал диалог: ${_RES#FAIL_CHAT:}"
+                    ;;
+                FAIL_NET:*)
+                    echo "  ⚠️  Сеть: ${_RES#FAIL_NET:}"
+                    printf "     Повторить? (Y/n): "; read _R; [ "$_R" = "n" ] && break
+                    ;;
+                *) echo "  ❌ $_RES" ;;
+            esac
+        done
+    else
+        echo "  Chat ID оставлен без изменений"
+    fi
+    echo ""
+
     echo "→ Перезапускаю бота..."
     /opt/etc/init.d/S98routerbot restart 2>/dev/null || true
     echo ""
@@ -13307,34 +14113,84 @@ else
         read VPN_IF
         [ -z "$VPN_IF" ] && { echo "  Отмена."; exit 1; }
     else
-        UP_LIST=""
-        DOWN_LIST=""
-        for t in $TUNABLES; do
-            tip=$(ip -4 -o addr show dev "$t" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
-            # UP определяется по флагу <...,UP,...>, а не по 'state' (у WG он UNKNOWN)
-            if ip -o link show dev "$t" 2>/dev/null | grep -q '<[^>]*UP[^>]*>'; then
-                state="UP"
-            else
-                state="DOWN"
-            fi
-            line="    • $t  ${tip:-no-IP}  [$state]"
-            if [ "$state" = "UP" ]; then
-                UP_LIST="${UP_LIST}${line}\n"
-            else
-                DOWN_LIST="${DOWN_LIST}${line}\n"
+        # Собираем нумерованный список: сначала UP, потом DOWN.
+        _all_tuns=""
+        _n=0
+        _first_up=""
+
+        for _t in $TUNABLES; do
+            if ip -o link show dev "$_t" 2>/dev/null | grep -q '<[^>]*UP[^>]*>'; then
+                _n=$((_n+1))
+                _all_tuns="$_all_tuns $_t"
+                [ -z "$_first_up" ] && _first_up="$_t"
+                _tip=$(ip -4 -o addr show dev "$_t" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
+                echo "    $_n) $_t  ${_tip:-no-IP}  [UP]"
             fi
         done
-
-        echo "  Доступные туннели:"
-        [ -n "$UP_LIST" ] && printf "$UP_LIST"
-        [ -n "$DOWN_LIST" ] && printf "$DOWN_LIST"
+        for _t in $TUNABLES; do
+            if ! ip -o link show dev "$_t" 2>/dev/null | grep -q '<[^>]*UP[^>]*>'; then
+                _n=$((_n+1))
+                _all_tuns="$_all_tuns $_t"
+                _tip=$(ip -4 -o addr show dev "$_t" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
+                echo "    $_n) $_t  ${_tip:-no-IP}  [DOWN]"
+            fi
+        done
         echo ""
-        printf "  Выберите туннель для Telegram (Enter = первый UP): "
-        read VPN_IF
-        if [ -z "$VPN_IF" ]; then
-            VPN_IF=$(echo "$UP_LIST" | head -1 | awk '{print $2}')
-            [ -z "$VPN_IF" ] && VPN_IF=$(echo "$TUNABLES" | head -1)
-            echo "  Беру по умолчанию: $VPN_IF"
+
+        if [ "$_n" -eq 0 ]; then
+            echo "  ОШИБКА: туннели не найдены"
+            exit 1
+        fi
+
+        if [ "$_n" -eq 1 ]; then
+            VPN_IF=$(echo "$_all_tuns" | awk '{print $1}')
+            echo "  Единственный туннель: $VPN_IF (выбран автоматически)"
+        else
+            while true; do
+                if [ -n "$_first_up" ]; then
+                    printf "  Выберите номер туннеля [1-%d] (Enter = 1, %s): " "$_n" "$_first_up"
+                else
+                    printf "  Выберите номер туннеля [1-%d]: " "$_n"
+                fi
+                read _ANS
+                _ANS=$(echo "$_ANS" | tr -d '[:space:]')
+
+                if [ -z "$_ANS" ]; then
+                    if [ -n "$_first_up" ]; then
+                        VPN_IF="$_first_up"
+                        echo "  Выбран по умолчанию: $VPN_IF"
+                        break
+                    else
+                        echo "  Нет UP-туннелей. Введите номер вручную."
+                        continue
+                    fi
+                fi
+
+                case "$_ANS" in
+                    *[!0-9]*)
+                        echo "  Ошибка: введите число от 1 до $_n"
+                        continue
+                        ;;
+                esac
+
+                if [ "$_ANS" -ge 1 ] && [ "$_ANS" -le "$_n" ]; then
+                    VPN_IF=$(echo "$_all_tuns" | awk -v n="$_ANS" '{print $n}')
+                    if [ -n "$VPN_IF" ]; then
+                        echo "  Выбран: $VPN_IF"
+                        break
+                    fi
+                else
+                    echo "  Ошибка: число должно быть от 1 до $_n"
+                fi
+            done
+        fi
+
+        # Предупреждение, если выбранный туннель в состоянии DOWN
+        if ! ip -o link show dev "$VPN_IF" 2>/dev/null | grep -q '<[^>]*UP[^>]*>'; then
+            echo "  ВНИМАНИЕ: туннель $VPN_IF в состоянии DOWN."
+            printf "  Продолжить с ним? (y/N): "
+            read _C
+            [ "$_C" = "y" ] || [ "$_C" = "Y" ] || exit 1
         fi
     fi
 
@@ -13363,7 +14219,11 @@ else
             exit 1
         fi
     fi
-    ip route del 149.154.166.110 table "$WAN_TABLE" 2>/dev/null
+    # Маршрут НЕ удаляем — он нужен для проверки токена (urllib).
+    # Дополнительно покрываем обе подсети Telegram.
+    for _tgnet in 149.154.160.0/20 91.108.4.0/22; do
+        ip route add "$_tgnet" dev "$VPN_IF" src "$VPN_SRC" table "$WAN_TABLE" 2>/dev/null || true
+    done
 fi
 echo ""
 
@@ -13539,21 +14399,6 @@ else
 fi
 echo ""
 
-# --- MTProxy ---
-echo "🌐 MTProxy"
-echo "   MTProto-прокси для Telegram. Установка и"
-echo "   управление, получение ссылки tg:// для клиентов."
-echo ""
-printf "   Установить? (Y/n): "
-read ANS_MT
-if [ "$ANS_MT" != "n" ] && [ "$ANS_MT" != "N" ]; then
-    ENABLED="$ENABLED,mtproxy"
-    echo "   ✅ MTProxy будет установлен"
-else
-    echo "   ⏭  MTProxy пропущен"
-fi
-echo ""
-
 # --- Keen-PBR ---
 echo "🛤 Keen-PBR"
 echo "   Policy-based routing для Keenetic."
@@ -13623,20 +14468,43 @@ echo "────────────────────────�
 echo ""
 
 while true; do
+    # Перед первым вводом токена — применить правила для подсетей Telegram,
+    # чтобы urllib-запрос getMe не ушёл в мёртвую таблицу.
+    if [ "$_TG_RULES_APPLIED" != "yes" ] && [ "$USE_VPN" = "yes" ] && [ -n "$VPN_IF" ] && [ -n "$VPN_SRC" ]; then
+        echo "-> Применяю правила Telegram через $VPN_IF для проверки токена..."
+        _p=1100
+        for _tgnet in 149.154.160.0/20 91.108.4.0/22; do
+            ip rule add to "$_tgnet" lookup "$WAN_TABLE" priority $_p 2>/dev/null || true
+            ip route add "$_tgnet" dev "$VPN_IF" src "$VPN_SRC" table "$WAN_TABLE" 2>/dev/null || true
+            _p=$((_p+1))
+        done
+        ip rule add from "$WAN_SRC" lookup "$WAN_TABLE" priority 1152 2>/dev/null || true
+        if ip route get 149.154.166.110 from "$WAN_SRC" 2>/dev/null | grep -q "$VPN_IF"; then
+            echo "  OK: маршрут через $VPN_IF активен"
+        else
+            echo "  ВНИМАНИЕ: маршрут через $VPN_IF не активен"
+        fi
+        echo ""
+        _TG_RULES_APPLIED=yes
+    fi
     printf "Токен бота (от @BotFather): "
     read TOKEN
     TOKEN=$(echo "$TOKEN" | tr -d ' ')
     [ -z "$TOKEN" ] && echo "  Пусто. Попробуйте ещё раз." && continue
 
     RES=$(TG_TOKEN="$TOKEN" /opt/bin/python3 - << 'PYEOF'
-import os, json, urllib.request
+import os, json, urllib.request, urllib.error
 tok = os.environ.get('TG_TOKEN', '')
 try:
     r = urllib.request.urlopen(f'https://api.telegram.org/bot{tok}/getMe', timeout=10)
     d = json.loads(r.read())
-    print('OK:' + d['result'].get('username', '') if d.get('ok') else 'FAIL:bad response')
+    print('OK:' + d['result'].get('username', '') if d.get('ok') else 'FAIL_OTHER:bad response')
+except urllib.error.HTTPError as e:
+    print(f'FAIL_TOKEN:HTTP {e.code} {e.reason}')
+except urllib.error.URLError as e:
+    print(f'FAIL_NET:{e.reason}')
 except Exception as e:
-    print('FAIL:' + str(e)[:100])
+    print(f'FAIL_OTHER:{type(e).__name__}:{e}')
 PYEOF
 )
     case "$RES" in
@@ -13736,7 +14604,9 @@ VPN_IF='$VPN_IF'
 VPN_SRC='$VPN_SRC'
 EOF
 chmod 600 "$BASE_DIR/config.env"
-echo "✅ config.env"
+cp -p "$BASE_DIR/config.env" "$BASE_DIR/config.env.bak"
+chmod 600 "$BASE_DIR/config.env.bak"
+echo "✅ config.env (+ backup)"
 
 # =================== продолжение в следующей части ===================
 
@@ -13852,6 +14722,8 @@ case "$1" in
 esac
 EOF97
     chmod +x "$INIT_DIR/S97tgroutes"
+    mkdir -p /opt/router_bot/init
+    cp -f "$INIT_DIR/S97tgroutes" /opt/router_bot/init/S97tgroutes
     echo "✅ S97tgroutes"
 fi
 
@@ -13935,6 +14807,8 @@ case "$1" in
 esac
 EOF98
 chmod +x "$INIT_DIR/S98routerbot"
+mkdir -p /opt/router_bot/init
+cp -f "$INIT_DIR/S98routerbot" /opt/router_bot/init/S98routerbot
 echo "✅ S98routerbot"
 
 # ---------- 11. init: S99routerbot_health ----------
@@ -14010,6 +14884,8 @@ echo "Bot process is dead, restarting..."
 /opt/etc/init.d/S98routerbot restart
 EOF99
 chmod +x "$INIT_DIR/S99routerbot_health"
+mkdir -p /opt/router_bot/init
+cp -f "$INIT_DIR/S99routerbot_health" /opt/router_bot/init/S99routerbot_health
 echo "✅ S99routerbot_health"
 
 # ---------- 12. logrotate ----------
@@ -14314,6 +15190,33 @@ if [ -f "$GIVEUP" ]; then
     exit 0
 fi
 
+# Проверка/восстановление config.env.
+#  - если файл отсутствует и есть бэкап: восстановить
+#  - если файл новее бэкапа: обновить бэкап
+#  - если файла нет и бэкапа нет: GIVEUP (запускать бессмысленно)
+check_config() {
+    CONF=/opt/router_bot/config.env
+    BAK=/opt/router_bot/config.env.bak
+    if [ -f "$CONF" ]; then
+        if [ ! -f "$BAK" ] || [ "$CONF" -nt "$BAK" ]; then
+            cp -p "$CONF" "$BAK" 2>/dev/null || true
+        fi
+        return 0
+    fi
+    if [ -f "$BAK" ]; then
+        cp -p "$BAK" "$CONF"
+        chmod 600 "$CONF"
+        echo "$(date '+%F %T') wrapper: config.env restored from backup" >> "$LOG"
+        return 0
+    fi
+    echo "$(date '+%F %T') wrapper: CRITICAL: config.env missing and no backup" >> "$LOG"
+    echo "$(date '+%F %T') wrapper: run 'rb config init' or reinstall" >> "$LOG"
+    touch "$GIVEUP"
+    return 1
+}
+
+check_config || exit 1
+
 # Ждём DNS готовности
 for i in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18; do
     if /opt/bin/python3 -c "import socket; socket.gethostbyname('api.telegram.org')" >/dev/null 2>&1; then
@@ -14329,6 +15232,7 @@ while true; do
         exit 0
     fi
 
+    check_config || exit 1
     echo "$(date '+%F %T') wrapper: Starting bot..." >> "$LOG"
     T0=$(date +%s)
     /opt/bin/python3 /opt/router_bot/main.py >> "$LOG" 2>&1
@@ -14356,8 +15260,82 @@ while true; do
 done
 RB_CORE_WRAPPER_SH_EOF
 
+echo "  → restore_init.sh"
+cat > /opt/router_bot/restore_init.sh << 'RB_RESTORE_INIT_EOF'
+#!/bin/sh
+# Восстанавливает отсутствующие init-скрипты и вспомогательные конфиги.
+# Трогает только те файлы, которых нет. Идемпотентен.
+
+RESTORE_ANY=0
+
+for _f in S98routerbot S99routerbot_health S97tgroutes; do
+    if [ -f "/opt/router_bot/init/$_f" ] && [ ! -f "/opt/etc/init.d/$_f" ]; then
+        mkdir -p /opt/etc/init.d
+        cp -f "/opt/router_bot/init/$_f" "/opt/etc/init.d/$_f"
+        chmod +x "/opt/etc/init.d/$_f"
+        echo "  + /opt/etc/init.d/$_f"
+        RESTORE_ANY=1
+    fi
+done
+
+if [ -f /opt/router_bot/core/wrapper.sh ] && [ ! -x /opt/bin/routerbot_wrapper.sh ]; then
+    mkdir -p /opt/bin
+    cp -f /opt/router_bot/core/wrapper.sh /opt/bin/routerbot_wrapper.sh
+    chmod +x /opt/bin/routerbot_wrapper.sh
+    echo "  + /opt/bin/routerbot_wrapper.sh"
+    RESTORE_ANY=1
+fi
+
+if [ ! -f /opt/etc/logrotate.d/router_bot ]; then
+    mkdir -p /opt/etc/logrotate.d
+    cat > /opt/etc/logrotate.d/router_bot << 'LREOF'
+/opt/var/log/router_bot.log {
+    weekly
+    rotate 4
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}
+LREOF
+    echo "  + /opt/etc/logrotate.d/router_bot"
+    RESTORE_ANY=1
+fi
+
+if [ -f /opt/etc/crontab ] && ! grep -q "S99routerbot_health" /opt/etc/crontab; then
+    echo "*/1 * * * * /opt/etc/init.d/S99routerbot_health" >> /opt/etc/crontab
+    echo "  + cron healthcheck"
+    RESTORE_ANY=1
+fi
+
+if [ "$RESTORE_ANY" = "0" ]; then
+    echo "  ✅ Все init-скрипты на месте"
+fi
+RB_RESTORE_INIT_EOF
+chmod +x /opt/router_bot/restore_init.sh
+
 chmod +x /opt/router_bot/install.sh
 chmod +x /opt/router_bot/uninstall.sh
+
+# ============================================================
+#  Генерация манифеста хэшей (для следующей переустановки)
+# ============================================================
+if command -v sha256sum >/dev/null 2>&1; then
+    : > /opt/router_bot/.manifest
+    find /opt/router_bot -type f \
+        ! -path '*/data/*' \
+        ! -path '*/.user_backup/*' \
+        ! -name '.manifest' \
+        ! -name 'VERSION' \
+        ! -name 'config.env*' \
+        2>/dev/null | while IFS= read -r _f; do
+            sha256sum "$_f" 2>/dev/null
+        done > /opt/router_bot/.manifest
+    _cnt=$(wc -l < /opt/router_bot/.manifest 2>/dev/null | tr -d ' ')
+    [ -z "$_cnt" ] && _cnt=0
+    echo "  → Манифест: $_cnt файлов"
+fi
 
 echo ""
 echo "Файлы распакованы в /opt/router_bot/"
