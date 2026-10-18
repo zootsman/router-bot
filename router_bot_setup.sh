@@ -36,17 +36,41 @@ if [ -n "$INSTALLED_VERSION" ]; then
     case "$cmp" in
         -1) MODE="upgrade" ;;
         0)
-            printf "Версии совпадают. Переустановить? (y/N): "
-            read -r ANS
-            ANS=$(printf "%s" "$ANS" | tr -d "\r\n\t ")
-            case "$ANS" in y|Y) ;; *) echo "Отмена."; exit 0 ;; esac
+            _RETRY=0
+            while [ "$_RETRY" -lt 3 ]; do
+                _RETRY=$((_RETRY+1))
+                printf "Версии совпадают. Переустановить? (y/N): "
+                read -r ANS
+                ANS=$(printf "%s" "$ANS" | sed 's/[^[:alnum:]]//g')
+                case "$ANS" in
+                    y|Y) break ;;
+                    n|N) echo "Отмена."; exit 0 ;;
+                    "") ;;
+                    *) echo "  Введите y (переустановить) или n (отмена)" ;;
+                esac
+            done
+            if [ "$ANS" != "y" ] && [ "$ANS" != "Y" ]; then
+                echo "Отмена."; exit 0
+            fi
             MODE="reinstall"
             ;;
         1)
-            printf "Установлена более новая версия. Продолжить? (y/N): "
-            read -r ANS
-            ANS=$(printf "%s" "$ANS" | tr -d "\r\n\t ")
-            case "$ANS" in y|Y) ;; *) echo "Отмена."; exit 0 ;; esac
+            _RETRY=0
+            while [ "$_RETRY" -lt 3 ]; do
+                _RETRY=$((_RETRY+1))
+                printf "Установлена более новая версия. Продолжить? (y/N): "
+                read -r ANS
+                ANS=$(printf "%s" "$ANS" | sed 's/[^[:alnum:]]//g')
+                case "$ANS" in
+                    y|Y) break ;;
+                    n|N) echo "Отмена."; exit 0 ;;
+                    "") ;;
+                    *) echo "  Введите y или n" ;;
+                esac
+            done
+            if [ "$ANS" != "y" ] && [ "$ANS" != "Y" ]; then
+                echo "Отмена."; exit 0
+            fi
             MODE="downgrade"
             ;;
     esac
@@ -180,6 +204,11 @@ import socket
 import subprocess
 
 # --- IPv4-патч: до импорта telegram, чтобы все соединения шли по IPv4 ---
+# ВНИМАНИЕ: глобально ограничивает getaddrinfo только IPv4.
+# Это сделано специально для Keenetic: IPv6 через VPN часто ломается,
+# а Telegram-боту IPv6 не нужен. Если понадобится IPv6 (например,
+# SSH Control к IPv6-хосту) — уберите этот блок или замените на
+# monkey-patch httpx (используется только PTB).
 _orig_getaddrinfo = socket.getaddrinfo
 def _ipv4_only(host, port, family=0, type=0, proto=0, flags=0):
     return _orig_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
@@ -257,6 +286,7 @@ async def _show_category(q, ctx, cat_name: str):
     if not mods:
         await q.answer('Категория пуста', show_alert=True)
         return
+    await q.answer()
 
     cat_title = getattr(mods[0], 'category_title', cat_name.capitalize())
     cat_icon = getattr(mods[0], 'category_icon', '\U0001f4c1')
@@ -624,29 +654,7 @@ async def _on_router_main(query, ctx):
 
 
 async def post_init(app):
-    # Записываем время старта сессии для статистики Net Watch
-    try:
-        import json as _json
-        import os as _os
-        from datetime import datetime as _dt
-        stats_path = '/opt/router_bot/data/net_watch/stats.json'
-        _os.makedirs(_os.path.dirname(stats_path), exist_ok=True)
-        data = {}
-        if _os.path.exists(stats_path):
-            try:
-                with open(stats_path) as f:
-                    data = _json.load(f)
-            except Exception:
-                data = {}
-        data['session_started'] = _dt.now().isoformat(timespec='seconds')
-        tmp = stats_path + '.tmp'
-        with open(tmp, 'w') as f:
-            _json.dump(data, f, ensure_ascii=False, indent=2)
-        _os.replace(tmp, stats_path)
-        log.info('Session started at %s', data['session_started'])
-    except Exception as e:
-        log.warning('session_started write failed: %s', e)
-
+    # session_started пишет сам NetWatchModule.startup — дублировать не нужно
     router = app.bot_data['router']
 
     # 1. Меню команд — глобальные + только для активных модулей
@@ -743,6 +751,7 @@ def main():
     }
     for _mname in enabled_set:
         if _mname not in _MODULES_MAP:
+            log.warning('Unknown module in ENABLED_MODULES: %s', _mname)
             continue
         _mpath, _mcls = _MODULES_MAP[_mname]
         try:
@@ -795,7 +804,6 @@ def main():
         q = update.callback_query
         if q.data.startswith('router:cat:'):
             cat_name = q.data[len('router:cat:'):]
-            await q.answer()
             return await _show_category(q, ctx, cat_name)
         if q.data.endswith(':edit_new'):
             _mn = q.data[:-len(':edit_new')]
@@ -1258,6 +1266,7 @@ show_help() {
     rb v             # версия
     rb config        # показать config.env
     rb config init   # создать заново (с подтверждением)
+    rb config tun    # перенастроить туннель к TG
     rb config edit   # править конфиг
     rb config check  # проверить обязательные ключи
 EOF
@@ -1349,10 +1358,10 @@ do_config_init() {
         echo ""
         printf "  Продолжить? (y/N): "
         read _r
-        _r=$(printf "%s" "$_r" | tr -d "\r\n\t ")
+        _r=$(printf "%s" "$_r" | tr -cd '[:print:]')
         case "$_r" in
             y|Y) ;;
-            *) echo "  Отменено"; return 1 ;;
+            *) echo ""; echo "  ⏹  Отменено — config.env не изменён"; return 1 ;;
         esac
     fi
 
@@ -1375,7 +1384,7 @@ do_config_init() {
             return 1
         fi
         if ! _rb_ci_ask "  Токен бота (от @BotFather)" ""; then
-            return $( _abort )
+            _abort; return 1
         fi
         if [ -z "$_RB_CI_VAL" ]; then
             echo "  ❌ Пусто, попробуйте ещё"
@@ -1428,7 +1437,7 @@ PYEOF
             return 1
         fi
         if ! _rb_ci_ask "  Chat ID (узнать у @userinfobot)" ""; then
-            return $( _abort )
+            _abort; return 1
         fi
         if [ -z "$_RB_CI_VAL" ]; then
             echo "  ❌ Пусто, попробуйте ещё"
@@ -1479,13 +1488,13 @@ PYEOF
     echo "    net_watch ssh_control system hydraroute flashkeen xkeen"
     echo "    bird mtproxy keen_pbr neofit usque_keenetic"
     if ! _rb_ci_ask "  Модули (через запятую, Enter = все)" "$_all_mods"; then
-        return $( _abort )
+        _abort; return 1
     fi
     _ci_mods="$_RB_CI_VAL"
 
     # --- 4. POLL_INTERVAL ---
     if ! _rb_ci_ask "  Интервал опроса ndmc, сек" "5"; then
-        return $( _abort )
+        _abort; return 1
     fi
     _ci_poll="$_RB_CI_VAL"
     case "$_ci_poll" in
@@ -1494,7 +1503,7 @@ PYEOF
 
     # --- 5. HEARTBEAT_INTERVAL ---
     if ! _rb_ci_ask "  Heartbeat, сек (0 = выкл)" "3600"; then
-        return $( _abort )
+        _abort; return 1
     fi
     _ci_hb="$_RB_CI_VAL"
     case "$_ci_hb" in
@@ -1503,7 +1512,7 @@ PYEOF
 
     # --- 6. VENDOR_LOOKUP ---
     if ! _rb_ci_ask "  Искать вендора по MAC (on/off)" "on"; then
-        return $( _abort )
+        _abort; return 1
     fi
     _ci_vendor="$_RB_CI_VAL"
     case "$_ci_vendor" in
@@ -1556,7 +1565,7 @@ PYEOF
                         fi
                     done
                     if ! _rb_ci_ask "  Номер туннеля" "1"; then
-                        return $( _abort )
+                        _abort; return 1
                     fi
                     _sel="$_RB_CI_VAL"
                     case "$_sel" in
@@ -1660,6 +1669,204 @@ PYEOF
     return 0
 }
 
+do_config_tun() {
+    # Перенастройка туннеля к api.telegram.org
+    _abort() {
+        echo ""
+        echo "  ⏹  Отменено — настройки туннеля не изменены"
+        return 1
+    }
+
+    echo ""
+    echo "  ════════════════════════════════════════════"
+    echo "  Перенастройка туннеля к api.telegram.org"
+    echo "  ════════════════════════════════════════════"
+    echo ""
+
+    # Текущее состояние
+    _cur_vpn_if=$(sed -n "s/^VPN_IF='\(.*\)'/\1/p" "$CONF" 2>/dev/null)
+    _cur_vpn_src=$(sed -n "s/^VPN_SRC='\(.*\)'/\1/p" "$CONF" 2>/dev/null)
+    _cur_use_vpn=$(sed -n "s/^USE_VPN='\(.*\)'/\1/p" "$CONF" 2>/dev/null)
+    _cur_route_table=$(sed -n "s/^ROUTE_TABLE='\(.*\)'/\1/p" "$CONF" 2>/dev/null)
+    [ -z "$_cur_route_table" ] && _cur_route_table="16385"
+
+    if [ "$_cur_use_vpn" = "yes" ] && [ -n "$_cur_vpn_if" ]; then
+        echo "  Текущий туннель: $_cur_vpn_if ($_cur_vpn_src)"
+        echo "  Таблица маршрутов: $_cur_route_table"
+    else
+        echo "  Туннель не используется (USE_VPN=no)"
+    fi
+    echo ""
+
+    printf "  Перенастроить туннель? (y/N): "
+    read _r
+    _r=$(printf "%s" "$_r" | tr -cd '[:print:]')
+    case "$_r" in
+        y|Y) ;;
+        *) _abort; return 1 ;;
+    esac
+
+    # --- Список туннелей ---
+    echo ""
+    echo "  Сканирую туннели..."
+    _tuns=$(ip -o link show 2>/dev/null | sed 's/@[^ :]*//g' | \
+        awk -F': ' '$2 ~ /^(opkgtun[0-9]+|nwg[0-9]+|wg[0-9]+|ppp[0-9]+|tap[0-9]+)$/ { print $2 }')
+
+    if [ -z "$_tuns" ]; then
+        echo "  ⚠️  Туннели не найдены"
+        echo "  Проверьте: ip -o link show"
+        return 1
+    fi
+
+    _all_tuns=""
+    _n=0
+    _first_up=""
+    for _t in $_tuns; do
+        if ip -o link show dev "$_t" 2>/dev/null | grep -q '<[^>]*UP[^>]*>'; then
+            _n=$((_n+1))
+            _all_tuns="$_all_tuns $_t"
+            [ -z "$_first_up" ] && _first_up="$_t"
+            _tip=$(ip -4 -o addr show dev "$_t" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
+            _mark=""
+            [ "$_t" = "$_cur_vpn_if" ] && _mark=" ← текущий"
+            echo "    $_n) $_t  ${_tip:-no-IP}  [UP]$_mark"
+        fi
+    done
+    for _t in $_tuns; do
+        if ! ip -o link show dev "$_t" 2>/dev/null | grep -q '<[^>]*UP[^>]*>'; then
+            _n=$((_n+1))
+            _all_tuns="$_all_tuns $_t"
+            _tip=$(ip -4 -o addr show dev "$_t" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
+            echo "    $_n) $_t  ${_tip:-no-IP}  [DOWN]"
+        fi
+    done
+    echo ""
+
+    _new_vpn_if=""
+    if [ "$_n" -eq 1 ]; then
+        _new_vpn_if=$(echo "$_all_tuns" | awk '{print $1}')
+        echo "  Единственный туннель: $_new_vpn_if"
+    else
+        while true; do
+            if [ -n "$_first_up" ]; then
+                printf "  Номер туннеля [1-%d] (Enter = %s, q = отмена): " "$_n" "$_first_up"
+            else
+                printf "  Номер туннеля [1-%d] (q = отмена): " "$_n"
+            fi
+            read _ANS
+            _ANS=$(printf "%s" "$_ANS" | tr -d "[:space:]")
+
+            case "$_ANS" in
+                q|Q) _abort; return 1 ;;
+            esac
+
+            if [ -z "$_ANS" ]; then
+                if [ -n "$_first_up" ]; then
+                    _new_vpn_if="$_first_up"
+                    break
+                else
+                    echo "  Введите номер вручную"
+                    continue
+                fi
+            fi
+
+            case "$_ANS" in
+                *[!0-9]*) echo "  Ошибка: число от 1 до $_n"; continue ;;
+            esac
+
+            if [ "$_ANS" -ge 1 ] && [ "$_ANS" -le "$_n" ]; then
+                _new_vpn_if=$(echo "$_all_tuns" | awk -v n="$_ANS" '{print $n}')
+                [ -n "$_new_vpn_if" ] && break
+            else
+                echo "  Ошибка: число от 1 до $_n"
+            fi
+        done
+    fi
+
+    # Предупреждение, если DOWN
+    if ! ip -o link show dev "$_new_vpn_if" 2>/dev/null | grep -q '<[^>]*UP[^>]*>'; then
+        echo "  ⚠️  Туннель $_new_vpn_if в состоянии DOWN"
+        printf "  Продолжить с ним? (y/N): "
+        read _c
+        _c=$(printf "%s" "$_c" | tr -cd '[:print:]')
+        if [ "$_c" != "y" ] && [ "$_c" != "Y" ]; then
+            _abort; return 1
+        fi
+    fi
+
+    _new_vpn_src=$(ip -4 -o addr show dev "$_new_vpn_if" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
+    if [ -z "$_new_vpn_src" ]; then
+        printf "  Введите IP туннеля %s: " "$_new_vpn_if"
+        read _new_vpn_src
+        _new_vpn_src=$(printf "%s" "$_new_vpn_src" | tr -cd '[:print:]')
+        if [ -z "$_new_vpn_src" ]; then
+            _abort; return 1
+        fi
+    fi
+
+    # --- Проверка доступа ---
+    echo ""
+    echo "  Проверяю доступ к api.telegram.org через $_new_vpn_if ($_new_vpn_src)..."
+    # Временно добавим маршруты
+    for _net in 149.154.160.0/20 91.108.4.0/22; do
+        ip route add "$_net" dev "$_new_vpn_if" src "$_new_vpn_src" table "$_cur_route_table" 2>/dev/null || true
+    done
+    ip rule add to 149.154.160.0/20 lookup "$_cur_route_table" priority 1100 2>/dev/null || true
+    ip rule add to 91.108.4.0/22 lookup "$_cur_route_table" priority 1101 2>/dev/null || true
+
+    _CURL_OK=no
+    if /opt/bin/curl -sf --max-time 8 "https://api.telegram.org" >/dev/null 2>&1; then
+        _CURL_OK=yes
+    fi
+
+    if [ "$_CURL_OK" != "yes" ]; then
+        echo "  ❌ Через $_new_vpn_if доступа нет"
+        printf "  Сохранить выбор всё равно? (y/N): "
+        read _c
+        _c=$(printf "%s" "$_c" | tr -cd '[:print:]')
+        if [ "$_c" != "y" ] && [ "$_c" != "Y" ]; then
+            _abort; return 1
+        fi
+    else
+        echo "  ✅ Доступ есть"
+    fi
+
+    # --- Запись ---
+    if [ ! -f "$CONF" ]; then
+        echo "  ❌ config.env не найден"
+        return 1
+    fi
+    _ts=$(date +%s)
+    \cp -f -p "$CONF" "${CONF}.broken.${_ts}" 2>/dev/null || true
+
+    sed -i "s|^VPN_IF=.*|VPN_IF='$_new_vpn_if'|" "$CONF"
+    sed -i "s|^VPN_SRC=.*|VPN_SRC='$_new_vpn_src'|" "$CONF"
+    sed -i "s|^USE_VPN=.*|USE_VPN='yes'|" "$CONF"
+
+    # Обновить .bak
+    \cp -f -p "$CONF" "${CONF}.bak" 2>/dev/null || true
+
+    echo ""
+    echo "  ✅ config.env обновлён:"
+    echo "     VPN_IF   = $_new_vpn_if"
+    echo "     VPN_SRC  = $_new_vpn_src"
+    echo "     USE_VPN  = yes"
+    echo ""
+
+    # --- S97 rebuild ---
+    if [ -x "$S97" ]; then
+        echo "  → Применяю маршруты (S97tgroutes rebuild)..."
+        $S97 rebuild >/dev/null 2>&1 && echo "  ✅ Маршруты применены" || \
+            echo "  ⚠️  S97tgroutes rebuild вернул ошибку"
+    else
+        echo "  ⚠️  $S97 не найден — маршруты не применены"
+    fi
+
+    echo ""
+    echo "  → Перезапустить бота: rb restart"
+    return 0
+}
+
 do_config() {
     _sub="${1:-show}"
     _key="$2"
@@ -1739,6 +1946,11 @@ do_config() {
 
         init|new|create)
             do_config_init
+            return $?
+            ;;
+
+        tun|tunnel)
+            do_config_tun
             return $?
             ;;
 
@@ -1824,6 +2036,7 @@ do_config() {
             echo ""
             echo "  rb config [show]            показать конфиг"
             echo "  rb config init              создать заново (визард)"
+            echo "  rb config tun               перенастроить туннель TG"
             echo "  rb config edit              редактировать"
             echo "  rb config restore           восстановить из .bak"
             echo "  rb config backup            обновить .bak"
@@ -2258,6 +2471,11 @@ async def get_vendor_async(mac: str) -> str:
 
 
 NAME_RULES = [
+    # Порядок важен: первое совпадение выигрывает.
+    # TV / медиа — ВЫШЕ умных колонок (Station TV — это TV).
+    ('\U0001f4fa', 'телевизор / медиа',
+        ['-tv', 'tv-', 'bravia', 'chromecast', 'apple-tv', 'androidtv', 'smarttv',
+         'телевизор', 'smart-tv']),
     ('\U0001f3ae', 'игровая консоль',
         ['xbox', 'playstation', 'ps4', 'ps5', 'nintendo', 'switch', 'консол']),
     ('\U0001f50a', 'умная колонка',
@@ -2271,9 +2489,6 @@ NAME_RULES = [
         ['camera', 'cam-', 'cam_', 'ipc', 'dvr', 'nvr', 'камера']),
     ('\U0001f697', 'автомобиль',
         ['tesla', 'bmw', 'toyota', 'audi', 'kia', 'hyundai', 'car-']),
-    ('\U0001f4fa', 'телевизор / медиа',
-        ['-tv', 'tv-', 'bravia', 'chromecast', 'apple-tv', 'androidtv', 'smarttv',
-         'телевизор', 'smart-tv']),
     ('\U0001f4bb', 'компьютер / ноутбук',
         ['laptop', 'notebook', 'macbook', 'desktop', 'pc-', '-pc',
          'ноутбук', 'компьютер', 'imac', 'mac-mini']),
@@ -2302,52 +2517,42 @@ def _fmt_bytes(n):
     return f'{n / 1024 ** 3:.2f} ГБ'
 
 
-def device_icon(name: str, vendor: str = '', ssdp_model: str = '',
-                hostname: str = '') -> str:
-    """Иконка по имени / ssdp-модели / hostname / производителю."""
+def _device_meta(name: str, vendor: str = '', ssdp_model: str = '',
+                 hostname: str = ''):
+    """Возвращает (icon, label) — иконку и тип устройства."""
     n = (name or '').lower()
     v = (vendor or '').lower()
     m = (ssdp_model or '').lower()
     h = (hostname or '').lower()
     combined = f'{n} {m} {h}'
 
-    for icon, _, keys in NAME_RULES:
+    for icon, label, keys in NAME_RULES:
         for k in keys:
             if k in combined:
-                return icon
+                return icon, label
 
     if 'apple' in v:
-        return '\U0001f4f1'
+        return '\U0001f4f1', 'смартфон / планшет'
     if 'microsoft' in v or 'xbox' in v:
-        return '\U0001f3ae'
+        return '\U0001f3ae', 'игровая консоль'
     if 'synology' in v or 'qnap' in v:
-        return '\U0001f4be'
+        return '\U0001f4be', 'NAS / хранилище'
     if 'hewlett' in v or 'canon' in v or 'epson' in v or 'brother' in v:
-        return '\U0001f5a8\ufe0f'
+        return '\U0001f5a8\ufe0f', 'принтер / МФУ'
 
-    return '\U0001f4f6'
+    return '\U0001f4f6', 'устройство'
+
+
+def device_icon(name: str, vendor: str = '', ssdp_model: str = '',
+                hostname: str = '') -> str:
+    """Иконка по имени / ssdp-модели / hostname / производителю."""
+    return _device_meta(name, vendor, ssdp_model, hostname)[0]
 
 
 def device_type(name: str, vendor: str = '', ssdp_model: str = '',
                 hostname: str = '') -> str:
-    n = (name or '').lower()
-    v = (vendor or '').lower()
-    m = (ssdp_model or '').lower()
-    h = (hostname or '').lower()
-    combined = f'{n} {m} {h}'
-    for icon, label, keys in NAME_RULES:
-        for k in keys:
-            if k in combined:
-                return label
-    if 'apple' in v:
-        return 'смартфон / планшет'
-    if 'microsoft' in v or 'xbox' in v:
-        return 'игровая консоль'
-    if 'synology' in v or 'qnap' in v:
-        return 'NAS / хранилище'
-    if 'hewlett' in v or 'canon' in v or 'epson' in v or 'brother' in v:
-        return 'принтер / МФУ'
-    return 'устройство'
+    """Тип устройства (текстом)."""
+    return _device_meta(name, vendor, ssdp_model, hostname)[1]
 
 
 def append_event(mac: str, event_type: str):
@@ -2722,7 +2927,8 @@ def _disconnect_text(info: dict) -> str:
 
 async def poll_loop(app):
     state = MonitorState()
-    app.bot_data['state'] = state
+    # state доступен через app.bot_data — если понадобится в будущем
+    app.bot_data['net_watch_state'] = state
     state.known = await get_active_clients()
     log.info('Initial clients: %s', list(state.known.keys()))
 
@@ -5615,7 +5821,18 @@ class HydraRouteModule:
         if not installed:
             try:
                 import os as _os
-                if _os.path.isdir('/opt/sbin/.xkeen'):
+                _xk_marker = _os.path.isdir('/opt/sbin/.xkeen')
+                _xk_proc = False
+                try:
+                    import subprocess as _sp
+                    _r = _sp.run(
+                        ['sh', '-c', 'ps w | grep -q "[x]keen" && echo yes'],
+                        capture_output=True, text=True, timeout=3,
+                    )
+                    _xk_proc = 'yes' in (_r.stdout or '')
+                except Exception:
+                    pass
+                if _xk_marker and _xk_proc:
                     lines.append('⚠️ <b>Конфликт с XKeen!</b>')
                     lines.append('<i>Удалите XKeen перед установкой HydraRoute.</i>')
                     lines.append('')
@@ -6510,31 +6727,64 @@ ACTIONS = {
 
 
 def is_installed() -> bool:
-    """Проверяет, установлен ли HydraRoute."""
+    """Проверяет, установлен ли HydraRoute.
+    Ищет hrneo/hrweb/hrdns в opkg И файлы на диске
+    (для случая, когда пакет поставлен вручную, не через opkg)."""
     import subprocess
-    try:
-        p = subprocess.run(
-            ['sh', '-c', 'opkg list-installed 2>/dev/null | grep -q "^hrneo "'],
-            timeout=5,
-        )
-        return p.returncode == 0
-    except Exception:
-        return False
+    import os as _os
+    # 1. opkg
+    for pkg in ('hrneo', 'hrweb', 'hrdns'):
+        try:
+            r = subprocess.run(
+                ['sh', '-c',
+                 f'opkg list-installed 2>/dev/null | grep -qE "^{pkg}([ -]|$)"'],
+                timeout=5,
+            )
+            if r.returncode == 0:
+                return True
+        except Exception:
+            pass
+    # 2. Файлы — установка вручную (install-neo.sh)
+    for f in ('/opt/sbin/hrneo', '/opt/bin/hrneo',
+              '/opt/etc/init.d/S99hrneo', '/opt/etc/HydraRoute'):
+        if _os.path.exists(f):
+            return True
+    return False
 
 
 def get_installed_version() -> str:
+    """Версия HydraRoute: из opkg, иначе из hrneo --version."""
     import subprocess
-    try:
-        p = subprocess.run(
-            ['sh', '-c', 'opkg list-installed 2>/dev/null | grep "^hrneo "'],
-            capture_output=True, text=True, timeout=5,
-        )
-        for line in p.stdout.splitlines():
-            parts = line.split()
-            if len(parts) >= 3 and parts[0] == 'hrneo':
-                return parts[2]
-    except Exception:
-        pass
+    # 1. opkg
+    for pkg in ('hrneo', 'hrweb', 'hrdns'):
+        try:
+            p = subprocess.run(
+                ['sh', '-c',
+                 f'opkg list-installed 2>/dev/null | grep -E "^{pkg}([ -]|$)"'],
+                capture_output=True, text=True, timeout=5,
+            )
+            for line in (p.stdout or '').splitlines():
+                parts = line.split()
+                if len(parts) >= 3 and parts[0] == pkg:
+                    return parts[2]
+        except Exception:
+            pass
+    # 2. hrneo --version (для ручной установки)
+    for path in ('/opt/bin/hrneo', '/opt/sbin/hrneo'):
+        try:
+            r = subprocess.run(
+                [path, '--version'],
+                capture_output=True, text=True, timeout=5,
+            )
+            out = ((r.stdout or '') + (r.stderr or '')).strip()
+            if out and 'v' in out.lower():
+                # 'hrneo v3.24.0-1' → '3.24.0-1'
+                import re as _re
+                m = _re.search(r'v?([0-9][0-9A-Za-z.\-]+)', out)
+                if m:
+                    return m.group(1)
+        except Exception:
+            pass
     return ''
 
 
@@ -10941,7 +11191,7 @@ SERVICE_RESTART = f'{_S99} stop; sleep 1; /opt/sbin/start-stop-daemon -S -b -x {
 SERVICE_STATUS = f'{_S99} status'
 
 # --- Ссылка подключения ---
-GET_LINK = 'grep -o "tg://proxy[^ \\"]*" /opt/var/log/tg-ws-proxy.log | tail -1'
+GET_LINK = 'grep -oE "tg://proxy[^[:space:]\"]+" /opt/var/log/tg-ws-proxy.log | tail -1'
 
 # Пути
 PROXY_BIN = '/opt/bin/tg-ws-proxy'
@@ -13169,7 +13419,7 @@ class UsqueKeeneticModule:
             ])
             rows.append([
                 InlineKeyboardButton('\U0001f4c4 Показать конфиг',
-                                     callback_data='usque_keenetic:ask:show_config'),
+                                     callback_data='usque_keenetic:show_config'),
                 InlineKeyboardButton('\U0001f4dc Логи',
                                      callback_data='usque_keenetic:ask:logs'),
             ])
@@ -13216,6 +13466,9 @@ class UsqueKeeneticModule:
         if action == 'cleanup:all':
             await q.answer()
             return await self._do_cleanup(q, ctx)
+        if action == 'show_config':
+            await q.answer()
+            return await self._show_config(q, ctx)
         if action == 'ask:uninstall':
             await q.answer()
             return await self._show_uninstall_menu(q, ctx)
@@ -13477,6 +13730,35 @@ class UsqueKeeneticModule:
             asyncio.create_task(self._reader_loop(ctx, pid, master))
             return
         await q.answer()
+
+    async def _show_config(self, q, ctx):
+        cfg_path = '/opt/etc/usque/usque.conf'
+        try:
+            if os.path.exists(cfg_path):
+                with open(cfg_path) as f:
+                    content = f.read()
+            else:
+                content = f'(файл {cfg_path} не найден)'
+        except Exception as e:
+            content = f'(ошибка чтения: {e})'
+        if len(content) > 3000:
+            content = content[:3000] + '\n... (сокращено)'
+        text = (
+            f'\U0001f4c4 <b>Конфиг Usque WARP</b>\n'
+            f'<code>{cfg_path}</code>\n\n'
+            f'<pre>{_esc(content)}</pre>'
+        )
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton('\u270f\ufe0f Прислать новый конфиг',
+                                  callback_data='usque_keenetic:edit_config')],
+            [InlineKeyboardButton('\u2b05\ufe0f Назад',
+                                  callback_data='usque_keenetic:main')],
+        ])
+        try:
+            await q.edit_message_text(text, parse_mode='HTML', reply_markup=kb)
+        except Exception as e:
+            if 'not modified' not in str(e).lower():
+                raise
 
     async def _check_leftovers(self, ctx):
         try: leftovers = scan_leftovers(SCAN_PATTERNS)
@@ -13958,7 +14240,7 @@ if [ "$MODE" != "install" ]; then
     # --- 1. Маршрут к api.telegram.org ---
     printf "→ Обновить маршрут к api.telegram.org? (y/N): "
     read _ANS_R
-    _ANS_R=$(printf "%s" "$_ANS_R" | tr -d "\r\n\t ")
+    _ANS_R=$(printf "%s" "$_ANS_R" | tr -cd '[:print:]')
     if [ "$_ANS_R" = "y" ] || [ "$_ANS_R" = "Y" ]; then
         echo ""
         _TUNABLES=$(ip -o link show 2>/dev/null \
@@ -14051,7 +14333,7 @@ if [ "$MODE" != "install" ]; then
     # --- 2. Токен ---
     printf "→ Обновить токен бота? (y/N): "
     read _ANS_T
-    _ANS_T=$(printf "%s" "$_ANS_T" | tr -d "\r\n\t ")
+    _ANS_T=$(printf "%s" "$_ANS_T" | tr -cd '[:print:]')
     if [ "$_ANS_T" = "y" ] || [ "$_ANS_T" = "Y" ]; then
         while true; do
             printf "  Токен бота (от @BotFather): "
@@ -14099,7 +14381,7 @@ PYEOF
     # --- 3. Chat ID ---
     printf "→ Обновить chat_id? (y/N): "
     read _ANS_C
-    _ANS_C=$(printf "%s" "$_ANS_C" | tr -d "\r\n\t ")
+    _ANS_C=$(printf "%s" "$_ANS_C" | tr -cd '[:print:]')
     if [ "$_ANS_C" = "y" ] || [ "$_ANS_C" = "Y" ]; then
         _cur_token=$(sed -n "s/^TG_BOT_TOKEN='\(.*\)'/\1/p" /opt/router_bot/config.env)
         while true; do
@@ -14294,7 +14576,7 @@ else
             echo "  ВНИМАНИЕ: туннель $VPN_IF в состоянии DOWN."
             printf "  Продолжить с ним? (y/N): "
             read _C
-            _C=$(printf "%s" "$_C" | tr -d "\r\n\t ")
+            _C=$(printf "%s" "$_C" | tr -cd '[:print:]')
             [ "$_C" = "y" ] || [ "$_C" = "Y" ] || exit 1
         fi
     fi
