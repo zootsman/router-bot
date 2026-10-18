@@ -871,23 +871,38 @@ class ModuleRouter:
 
     async def dispatch_callback(self, update, ctx):
         """Callback с префиксом '<module>:...' идёт в модуль.
-        Без префикса — в первый зарегистрированный (совместимость)."""
+        Без префикса — в первый зарегистрированный (совместимость).
+        Всегда ловит исключения и отвечает пользователю."""
         q = update.callback_query
         data = q.data or ''
+
+        async def _safe_call(mod, action):
+            try:
+                return await mod.handle_callback(action, q, ctx)
+            except Exception as e:
+                log.exception('Module %s handle_callback(%r) failed: %s',
+                              mod.name, action, e)
+                try:
+                    await q.answer(
+                        f'❌ Ошибка: {type(e).__name__}',
+                        show_alert=True,
+                    )
+                except Exception:
+                    pass
 
         if ':' in data:
             prefix, rest = data.split(':', 1)
             mod = self._modules.get(prefix)
             if mod:
-                return await mod.handle_callback(rest, q, ctx)
+                return await _safe_call(mod, rest)
             # неизвестный префикс — в первый
             mod = self.first()
             if mod:
-                return await mod.handle_callback(data, q, ctx)
+                return await _safe_call(mod, data)
         else:
             mod = self.first()
             if mod:
-                return await mod.handle_callback(data, q, ctx)
+                return await _safe_call(mod, data)
 RB_CORE_ROUTER_PY_EOF
 
 echo "  → core/utils.py"
@@ -4914,6 +4929,8 @@ from datetime import datetime, timedelta
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
+from core.config import get as cfg
+
 log = logging.getLogger(__name__)
 
 
@@ -5322,58 +5339,179 @@ def build_system_card(upd=None):
 
 
 
-def start_firmware_update():
-    """Запускает `components commit` через pty в фоне."""
+def _ndmc_interactive_commit(timeout_total: int = 300,
+                             login: str = None, password: str = None):
+    """Открывает ndmc в интерактивной сессии (без -c),
+    логинится, отправляет `components commit` и держит сессию открытой,
+    пока не начнётся обновление / перезагрузка / таймаут.
+
+    Возвращает (ok: bool, log_tail: str).
+    Если login/password не переданы — берутся из config.env.
+    """
+    import pty
+    import select
+    import time
+
+    _login = login if login is not None else cfg('NDMC_LOGIN', 'admin')
+    _password = password if password is not None else cfg('NDMC_PASSWORD', '')
+
+    if not _password:
+        log.warning('ndmc interactive: NDMC_PASSWORD не задан')
+        return False, 'NDMC_PASSWORD не задан — не могу залогиниться в ndmc'
+
+    master, slave = pty.openpty()
+    proc = None
+    buf = b''
+    try:
+        proc = subprocess.Popen(
+            ['/bin/ndmc'],
+            stdin=slave,
+            stdout=slave,
+            stderr=slave,
+            close_fds=True,
+            start_new_session=True,
+        )
+        os.close(slave)
+        slave = -1
+
+        def _read_until(pattern, timeout=10):
+            nonlocal buf
+            start = time.time()
+            while time.time() - start < timeout:
+                r, _, _ = select.select([master], [], [], 0.3)
+                if r:
+                    try:
+                        data = os.read(master, 4096)
+                    except OSError:
+                        return False
+                    if not data:
+                        return False
+                    buf += data
+                    if isinstance(pattern, bytes):
+                        if pattern in buf:
+                            return True
+                    else:
+                        if pattern in buf.decode('utf-8', errors='replace').lower():
+                            return True
+            return False
+
+        # 1. Ждём "Login:"
+        if not _read_until(b'Login:', timeout=10):
+            log.warning('ndmc interactive: "Login:" not detected')
+            # всё равно пробуем
+        os.write(master, (_login + '\n').encode())
+        log.info('ndmc interactive: sent login')
+        time.sleep(0.3)
+
+        # 2. Ждём "Password:"
+        _read_until(b'Password:', timeout=5)
+        os.write(master, (_password + '\n').encode())
+        log.info('ndmc interactive: sent password')
+        time.sleep(0.5)
+
+        # 3. Ждём приглашение "(config)>" или ">"
+        if not _read_until(b'(config)>', timeout=10):
+            # пробуем любое приглашение с >
+            if b'>' not in buf:
+                log.warning('ndmc interactive: prompt not detected after login')
+                return False, 'Не удалось войти в ndmc (проверьте NDMC_PASSWORD)'
+
+        # 4. Отправляем commit
+        os.write(master, b'components commit\n')
+        log.info('ndmc interactive: sent "components commit"')
+
+        # 5. Читаем ответ до "progress" > 0 / "interrupted" / таймаут
+        start = time.time()
+        answered_yn = False
+        progress_seen = False
+        while time.time() - start < timeout_total:
+            r, _, _ = select.select([master], [], [], 0.5)
+            if r:
+                try:
+                    data = os.read(master, 4096)
+                except OSError:
+                    break
+                if not data:
+                    break
+                buf += data
+                low = buf.lower()
+
+                # подтверждение
+                if not answered_yn and (
+                    b'(y/n)' in low or b'[y/n]' in low
+                    or b'continue' in low or b'are you sure' in low
+                ):
+                    os.write(master, b'y\n')
+                    answered_yn = True
+                    log.info('ndmc interactive: answered y')
+
+                # признаки прогресса
+                if b'update task started' in low or b'progress,' in low:
+                    if not progress_seen:
+                        log.info('ndmc interactive: update task started, progress seen')
+                        progress_seen = True
+
+                # перезагрузка / прерывание / завершение
+                if (b'reboot' in low or b'restarting' in low
+                        or b'update interrupted' in low
+                        or b'update completed' in low):
+                    log.info('ndmc interactive: update finishing (%s)',
+                             'interrupted' if b'update interrupted' in low else 'ok')
+                    break
+
+                # если прогресс уже есть и он растёт — продолжаем читать,
+                # пока не появится "interrupted" или "reboot"
+
+            if proc and proc.poll() is not None:
+                # процесс завершился — дочитываем
+                try:
+                    while True:
+                        r, _, _ = select.select([master], [], [], 0.2)
+                        if not r:
+                            break
+                        data = os.read(master, 4096)
+                        if not data:
+                            break
+                        buf += data
+                except OSError:
+                    pass
+                break
+
+        return progress_seen, buf.decode('utf-8', errors='replace')[-3000:]
+    except Exception as e:
+        log.exception('ndmc interactive commit failed: %s', e)
+        return False, f'{type(e).__name__}: {e}'
+    finally:
+        try:
+            if slave != -1:
+                os.close(slave)
+        except Exception:
+            pass
+        try:
+            os.close(proc.stdin) if proc and proc.stdin else None
+        except Exception:
+            pass
+
+
+def start_firmware_update(login: str = None, password: str = None):
+    """Запускает `components commit` через интерактивную сессию ndmc."""
     import threading
     import time
-    import pty
-    import subprocess
 
     def _worker():
         try:
-            time.sleep(3)
-            master, slave = pty.openpty()
-            proc = subprocess.Popen(
-                ['/bin/ndmc', '-c', 'components commit'],
-                stdin=slave,
-                stdout=slave,
-                stderr=slave,
-                close_fds=True,
-                start_new_session=True,
-            )
-            os.close(slave)
-            # читаем, но не блокируемся навсегда
-            buf = b''
-            start = time.time()
-            while time.time() - start < 30:
-                try:
-                    data = os.read(master, 4096)
-                    if not data:
-                        break
-                    buf += data
-                except OSError:
-                    break
-                time.sleep(0.2)
-                # если видим приглашение — отправляем y
-                low = buf.lower()
-                if b'(y/n)' in low or b'[y/n]' in low or b'continue' in low:
-                    try:
-                        os.write(master, b'y\n')
-                    except OSError:
-                        pass
-                    buf = b''  # сбрасываем, чтобы не отправлять повторно
-                # если видим про перезагрузку — выходим
-                if b'reboot' in low or b'restarting' in low:
-                    break
-            try:
-                os.close(master)
-            except Exception:
-                pass
+            time.sleep(2)
+            ok, tail = _ndmc_interactive_commit(
+                timeout_total=300, login=login, password=password)
+            if ok:
+                log.info('Firmware update: commit sent. Tail:\n%s', tail)
+            else:
+                log.warning('Firmware update: failed. Tail:\n%s', tail)
         except Exception as e:
             log.exception('firmware update worker failed: %s', e)
 
     threading.Thread(target=_worker, daemon=True).start()
-    log.info('Firmware update scheduled')
+    log.info('Firmware update scheduled (interactive ndmc)')
 
 
 def _kb(update_available: bool = False):
@@ -5421,11 +5559,65 @@ class SystemModule:
         self.chat_id = str(chat_id)
         self._app = None
         self._update_task = None
+        self._fw_state = None      # None | 'login' | 'password'
+        self._fw_login = None
+        self._fw_password = None
+        self._fw_msg_id = None
 
     async def startup(self, app):
         self._app = app
+        from telegram.ext import MessageHandler, filters
+        app.add_handler(MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            self._handle_text,
+        ), group=10)  # отдельная группа, чтобы не пересечься с другими
         self._update_task = asyncio.create_task(self._update_watch_loop())
         log.info('System module started')
+
+    async def _handle_text(self, update, ctx):
+        if str(update.effective_chat.id) != self.chat_id:
+            return
+        if getattr(self, '_fw_state', None) != 'password':
+            return
+        log.info('system: caught potential password')
+        pwd = (update.message.text or '').strip()
+        # удаляем сообщение с паролем
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+        if not pwd:
+            try:
+                await ctx.bot.send_message(
+                    chat_id=self.chat_id,
+                    text='❌ Пустой пароль. Попробуйте снова: /sys',
+                )
+            except Exception:
+                pass
+            self._fw_state = None
+            return
+        self._fw_password = pwd
+        self._fw_state = 'save'
+        try:
+            await ctx.bot.send_message(
+                chat_id=self.chat_id,
+                text=(
+                    f'\U0001f510 Пароль получен.\n\n'
+                    f'Логин: <code>{self._fw_login}</code>\n\n'
+                    f'<b>Шаг 3/3.</b> Сохранить логин/пароль в config.env, '
+                    f'чтобы не вводить при следующем обновлении?\n'
+                    f'<i>Пароль хранится локально в файле с правами 600.</i>'
+                ),
+                parse_mode='HTML',
+                reply_markup=InlineKeyboardMarkup([
+                    [
+                        InlineKeyboardButton('✅ Сохранить', callback_data='system:fw_save:yes'),
+                        InlineKeyboardButton('❌ Не сохранять', callback_data='system:fw_save:no'),
+                    ],
+                ]),
+            )
+        except Exception as e:
+            log.exception('send save dialog failed: %s', e)
 
     async def on_leave(self):
         if getattr(self, '_update_task', None):
@@ -5530,6 +5722,115 @@ class SystemModule:
         )
 
     async def handle_callback(self, action, q, ctx):
+        # --- Обновление KeenOS: диалог логина/пароля (всегда первым) ---
+        if action == 'update_go':
+            log.info('update_go: triggered')
+            _cfg_login = cfg('NDMC_LOGIN', '')
+            _cfg_password = cfg('NDMC_PASSWORD', '')
+            log.info('update_go: login=%s, has_password=%s',
+                     _cfg_login or '(none)', bool(_cfg_password))
+
+            if _cfg_password:
+                await q.answer('Запускаю обновление...')
+                try:
+                    await q.edit_message_text(
+                        '\u2b06\ufe0f <b>Обновление запущено</b>\n\n'
+                        'Команда передана ядру KeeneticOS через ndmc.\n'
+                        'Роутер начнёт обновление и перезагрузится '
+                        'в течение 30–180 секунд.\n'
+                        'Не выключайте питание.\n\n'
+                        '<i>Если через 3 минуты роутер не перезагрузился — '
+                        'проверьте вручную: Система → Обновление ПО.</i>\n'
+                        '<i>После перезагрузки напишите /start.</i>',
+                        parse_mode='HTML',
+                    )
+                except Exception as e:
+                    log.warning('update_go edit failed: %s', e)
+                start_firmware_update(login=_cfg_login or 'admin',
+                                      password=_cfg_password)
+                return
+
+            # Нет кредов — показываем диалог
+            self._fw_login = None
+            self._fw_password = None
+            self._fw_state = 'login'
+            try:
+                await q.answer('Авторизация в ndmc')
+            except Exception as e:
+                log.warning('update_go answer failed: %s', e)
+
+            try:
+                await q.edit_message_text(
+                    '\U0001f510 <b>Авторизация в ndmc</b>',
+                    parse_mode='HTML',
+                    reply_markup=None,
+                )
+            except Exception as e:
+                log.warning('update_go edit (cleanup) failed: %s', e)
+
+            try:
+                await ctx.bot.send_message(
+                    chat_id=self.chat_id,
+                    text=(
+                        '\U0001f510 <b>Авторизация в ndmc</b>\n\n'
+                        'Для запуска обновления нужен логин/пароль '
+                        'веб-интерфейса Keenetic.\n\n'
+                        '<b>Шаг 1/3.</b> Введите логин или нажмите кнопку '
+                        '<code>admin</code>:'
+                    ),
+                    parse_mode='HTML',
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton('admin', callback_data='system:fw_login:admin')],
+                        [InlineKeyboardButton('\u274c Отмена', callback_data='system:refresh')],
+                    ]),
+                )
+                log.info('update_go: login dialog sent')
+            except Exception as e:
+                log.exception('update_go send login dialog FAILED: %s', e)
+            return
+
+        if action.startswith('fw_login:'):
+            try:
+                _login = action[len('fw_login:'):] or 'admin'
+                self._fw_login = _login
+                self._fw_state = 'password'
+                log.info('fw_login: selected login=%s, waiting for password', _login)
+
+                try:
+                    await q.answer(f'Логин: {_login}')
+                except Exception:
+                    pass
+
+                try:
+                    await q.edit_message_text(
+                        f'\U0001f510 Логин: <code>{_login}</code>',
+                        parse_mode='HTML',
+                        reply_markup=None,
+                    )
+                except Exception:
+                    pass
+
+                await ctx.bot.send_message(
+                    chat_id=self.chat_id,
+                    text=(
+                        f'\U0001f510 <b>Авторизация в ndmc</b>\n\n'
+                        f'Логин: <code>{_login}</code>\n\n'
+                        f'<b>Шаг 2/3.</b> Отправьте пароль следующим сообщением.\n'
+                        f'<i>Сообщение с паролем будет сразу удалено.</i>'
+                    ),
+                    parse_mode='HTML',
+                    reply_markup=InlineKeyboardMarkup([
+                        [InlineKeyboardButton('\u274c Отмена', callback_data='system:refresh')],
+                    ]),
+                )
+            except Exception as e:
+                log.exception('fw_login processing failed: %s', e)
+                try:
+                    await q.answer('Ошибка при выборе логина', show_alert=True)
+                except Exception:
+                    pass
+            return
+
         if action == 'update_later':
             await q.answer('Напомню через 7 дней')
             st = _load_update_state()
@@ -5583,19 +5884,55 @@ class SystemModule:
                     raise
             return
 
-        if action == 'update_go':
-            await q.answer('Запускаю обновление...')
+        if action == 'fw_save:yes':
             try:
-                await q.edit_message_text(
-                    '\u2b06\ufe0f <b>Обновление запущено</b>\n\n'
-                    'Роутер перезагрузится через 10–30 секунд.\n'
-                    'Не выключайте питание.\n\n'
-                    '<i>После перезагрузки напишите /start.</i>',
-                    parse_mode='HTML',
-                )
+                await q.answer('Сохраняю...')
             except Exception:
                 pass
-            start_firmware_update()
+            cfg_path = '/opt/router_bot/config.env'
+            try:
+                _upd_channel = cfg('UPDATE_CHANNEL', '')
+                lines = []
+                found_login = False
+                found_pass = False
+                if os.path.exists(cfg_path):
+                    with open(cfg_path) as f:
+                        for line in f:
+                            if line.startswith('NDMC_LOGIN='):
+                                lines.append(f"NDMC_LOGIN='{self._fw_login}'\n")
+                                found_login = True
+                            elif line.startswith('NDMC_PASSWORD='):
+                                lines.append(f"NDMC_PASSWORD='{self._fw_password}'\n")
+                                found_pass = True
+                            else:
+                                lines.append(line)
+                if not found_login:
+                    lines.append(f"\nNDMC_LOGIN='{self._fw_login}'\n")
+                if not found_pass:
+                    lines.append(f"NDMC_PASSWORD='{self._fw_password}'\n")
+                tmp = cfg_path + '.tmp'
+                with open(tmp, 'w') as f:
+                    f.writelines(lines)
+                os.replace(tmp, cfg_path)
+                try:
+                    import shutil
+                    shutil.copy(cfg_path, cfg_path + '.bak')
+                except Exception:
+                    pass
+                log.info('NDMC credentials saved to config.env')
+            except Exception as e:
+                log.warning('save ndmc creds failed: %s', e)
+            await self._fw_start(q, ctx, self._fw_login, self._fw_password,
+                                 save_msg='✅ Логин/пароль сохранены в config.env')
+            return
+
+        if action == 'fw_save:no':
+            try:
+                await q.answer()
+            except Exception:
+                pass
+            await self._fw_start(q, ctx, self._fw_login, self._fw_password,
+                                 save_msg='ℹ️ Логин/пароль не сохранены')
             return
 RB_MODULES_SYSTEM_MODULE_PY_EOF
 
@@ -14238,9 +14575,20 @@ if [ "$MODE" != "install" ]; then
     fi
 
     # --- 1. Маршрут к api.telegram.org ---
-    printf "→ Обновить маршрут к api.telegram.org? (y/N): "
-    read _ANS_R
-    _ANS_R=$(printf "%s" "$_ANS_R" | tr -cd '[:print:]')
+    _RETRY=0
+    _ANS_R=""
+    while [ "$_RETRY" -lt 3 ]; do
+        _RETRY=$((_RETRY+1))
+        printf "→ Обновить маршрут к api.telegram.org? (y/N): "
+        read _ANS_R
+        _ANS_R=$(printf "%s" "$_ANS_R" | sed 's/[^[:alnum:]]//g')
+        case "$_ANS_R" in
+            y|Y) break ;;
+            n|N) break ;;
+            "") ;;
+            *) echo "  Введите y или n" ;;
+        esac
+    done
     if [ "$_ANS_R" = "y" ] || [ "$_ANS_R" = "Y" ]; then
         echo ""
         _TUNABLES=$(ip -o link show 2>/dev/null \
@@ -14331,9 +14679,20 @@ if [ "$MODE" != "install" ]; then
     echo ""
 
     # --- 2. Токен ---
-    printf "→ Обновить токен бота? (y/N): "
-    read _ANS_T
-    _ANS_T=$(printf "%s" "$_ANS_T" | tr -cd '[:print:]')
+    _RETRY=0
+    _ANS_T=""
+    while [ "$_RETRY" -lt 3 ]; do
+        _RETRY=$((_RETRY+1))
+        printf "→ Обновить токен бота? (y/N): "
+        read _ANS_T
+        _ANS_T=$(printf "%s" "$_ANS_T" | sed 's/[^[:alnum:]]//g')
+        case "$_ANS_T" in
+            y|Y) break ;;
+            n|N) break ;;
+            "") ;;
+            *) echo "  Введите y или n" ;;
+        esac
+    done
     if [ "$_ANS_T" = "y" ] || [ "$_ANS_T" = "Y" ]; then
         while true; do
             printf "  Токен бота (от @BotFather): "
@@ -14379,9 +14738,20 @@ PYEOF
     echo ""
 
     # --- 3. Chat ID ---
-    printf "→ Обновить chat_id? (y/N): "
-    read _ANS_C
-    _ANS_C=$(printf "%s" "$_ANS_C" | tr -cd '[:print:]')
+    _RETRY=0
+    _ANS_C=""
+    while [ "$_RETRY" -lt 3 ]; do
+        _RETRY=$((_RETRY+1))
+        printf "→ Обновить chat_id? (y/N): "
+        read _ANS_C
+        _ANS_C=$(printf "%s" "$_ANS_C" | sed 's/[^[:alnum:]]//g')
+        case "$_ANS_C" in
+            y|Y) break ;;
+            n|N) break ;;
+            "") ;;
+            *) echo "  Введите y или n" ;;
+        esac
+    done
     if [ "$_ANS_C" = "y" ] || [ "$_ANS_C" = "Y" ]; then
         _cur_token=$(sed -n "s/^TG_BOT_TOKEN='\(.*\)'/\1/p" /opt/router_bot/config.env)
         while true; do
