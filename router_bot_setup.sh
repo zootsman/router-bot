@@ -1,7 +1,20 @@
 #!/bin/sh
 set -e
 
-SETUP_VERSION="0.0.7"
+# --- Защита от запуска через pipe (curl | sh) ---
+# Если stdin не терминал, а /dev/tty есть — переоткрываем stdin
+# на /dev/tty, чтобы "read" работали.
+# Если /dev/tty нет (cron, systemd, etc.) — работаем с дефолтами
+# (все "read" получат пустую строку).
+if [ ! -t 0 ]; then
+    if [ -e /dev/tty ] && [ -r /dev/tty ]; then
+        exec < /dev/tty
+    else
+        : # не интерактивно, работаем с дефолтами
+    fi
+fi
+
+SETUP_VERSION="0.0.8"
 VERSION_FILE="/opt/router_bot/VERSION"
 INSTALLED_VERSION=""
 if [ -f "$VERSION_FILE" ]; then
@@ -163,7 +176,7 @@ RB_MAIN_PY_EOF
 
 echo "  → VERSION"
 cat > /opt/router_bot/VERSION << 'RB_VERSION_EOF'
-0.0.7
+0.0.8
 RB_VERSION_EOF
 
 echo "  → core/__init__.py"
@@ -2236,14 +2249,23 @@ case "$1" in
         fi
         ;;
     update|u)
-        if [ -x /opt/router_bot_setup.sh ]; then
-            sh /opt/router_bot_setup.sh
-        elif [ -f /tmp/router_bot_setup.sh ]; then
-            sh /tmp/router_bot_setup.sh
+        URL="https://raw.githubusercontent.com/zootsman/router-bot/master/router_bot_setup.sh"
+        TMP="/tmp/router_bot_setup.sh"
+        echo "→ Скачиваю установщик с GitHub..."
+        if /opt/bin/curl -fsSL --max-time 30 "$URL" -o "$TMP"; then
+            if [ -s "$TMP" ] && head -1 "$TMP" | grep -q '^#!/bin/sh'; then
+                chmod +x "$TMP"
+                echo "  ✅ Скачано ($(wc -c < "$TMP") байт)"
+                echo ""
+                exec sh "$TMP"
+            else
+                echo "  ❌ Файл повреждён"
+                exit 1
+            fi
         else
-            echo "setup-файл не найден:"
-            echo "  /opt/router_bot_setup.sh"
-            echo "  /tmp/router_bot_setup.sh"
+            echo "  ❌ Не удалось скачать"
+            echo "  Проверьте интернет / доступ к GitHub"
+            exit 1
         fi
         ;;
     uninstall)
