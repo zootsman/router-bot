@@ -23,6 +23,11 @@
 
 ```bash
 sh router_bot_setup.sh
+
+opkg update && opkg install curl ca-certificates
+curl -fsSL https://raw.githubusercontent.com/zootsman/router-bot/master/router_bot_setup.sh -o /tmp/router_bot_setup.sh
+chmod +x /tmp/router_bot_setup.sh
+sh /tmp/router_bot_setup.sh
 ```
 
 ## Управление через командную строку (`rb`)
@@ -48,7 +53,7 @@ sh router_bot_setup.sh
 - `rb procs` — дерево процессов бота
 
 ### Обслуживание
-- `rb update` (или `u`) — обновить из setup-файла
+- `rb update` (или `u`) — обновить
 - `rb uninstall` — подсказка по удалению
 
 ---
