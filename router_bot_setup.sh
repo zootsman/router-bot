@@ -293,13 +293,22 @@ async def _show_category(q, ctx, cat_name: str):
 
     # Кто установлен — для проверки конфликтов
     installed = set()
+    running = set()
     for mod in mods:
         try:
-            fn = getattr(mod, 'get_installed', None)
-            if fn and fn():
+            fn_inst = getattr(mod, 'get_installed', None)
+            is_inst = bool(fn_inst and fn_inst())
+            if is_inst:
                 installed.add(mod.name)
+            fn_run = getattr(mod, 'is_running', None)
+            if is_inst:
+                if fn_run:
+                    if fn_run():
+                        running.add(mod.name)
+                else:
+                    running.add(mod.name)  # fallback: считаем запущенным
         except Exception as e:
-            log.debug('get_installed %s failed: %s', mod.name, e)
+            log.debug('get_installed/running %s failed: %s', mod.name, e)
 
     lines = [f'{cat_icon} <b>{cat_title}</b>', '']
     kb = []
@@ -320,23 +329,26 @@ async def _show_category(q, ctx, cat_name: str):
         else:
             lines.append(f'{status} {mod.icon} <b>{mod.title}</b>')
 
-        # Проверка конфликтов — формат dict{name: reason} или list[name]
+        # Проверка конфликтов — только если модуль УСТАНОВЛЕН
+        # (для не установленных — нечего конфликтовать)
         cw = getattr(mod, 'conflicts_with', None)
-        if cw:
+        if cw and mod.name in installed:
             items = cw.items() if isinstance(cw, dict) else [(n, '') for n in cw]
             for cname, reason in items:
                 if cname not in installed:
                     continue
                 other = router.get(cname)
                 other_title = other.title if other else cname
+                is_running = cname in running
+                suffix = '' if is_running else ' (не запущен)'
                 if reason:
                     lines.append(
-                        f'   \u26a0\ufe0f Конфликт с <b>{other_title}</b>: '
+                        f'   \u26a0\ufe0f Конфликт с <b>{other_title}</b>{suffix}: '
                         f'<i>{reason}</i>'
                     )
                 else:
                     lines.append(
-                        f'   \u26a0\ufe0f Конфликт с <b>{other_title}</b>'
+                        f'   \u26a0\ufe0f Конфликт с <b>{other_title}</b>{suffix}'
                     )
 
         kb.append([InlineKeyboardButton(
@@ -12808,7 +12820,6 @@ class NeoFitModule:
     category_icon = '\U0001f6e0'
     conflicts_with = {
         'xkeen': 'оба используют Xray/Sing-Box ядра',
-        'hydraroute': 'пересечение маршрутизации доменов',
     }
     commands = []
 
@@ -12885,10 +12896,8 @@ class NeoFitModule:
                 lines.append('')
                 lines.append('⚠️ <b>Конфликт с XKeen</b>')
                 lines.append('<i>Удалите XKeen перед установкой.</i>')
-            if os.path.isdir('/opt/etc/HydraRoute'):
-                lines.append('')
-                lines.append('⚠️ <b>Конфликт с HydraRoute</b>')
-                lines.append('<i>Удалите HydraRoute перед установкой.</i>')
+            # HydraRoute не конфликтует с NeoFit (разные механизмы)
+            pass
         lines.append('')
 
         if self._running:
