@@ -923,6 +923,31 @@ cat > /opt/router_bot/core/utils.py << 'RB_CORE_UTILS_PY_EOF'
 import json
 import os
 
+def get_router_ip() -> str:
+    """Локальный IP роутера (LAN)."""
+    import subprocess
+    import socket
+    try:
+        r = subprocess.run(
+            ['sh', '-c', "ip -4 addr show br0 2>/dev/null | grep -oE 'inet [0-9.]+' | head -1 | awk '{print $2}'"],
+            capture_output=True, text=True, timeout=3)
+        ip = (r.stdout or '').strip()
+        if ip and not ip.startswith('127.'):
+            return ip
+    except Exception:
+        pass
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        s.connect(('192.168.1.1', 80))
+        ip = s.getsockname()[0]
+        if not ip.startswith('127.'):
+            return ip
+    except Exception:
+        pass
+    finally:
+        s.close()
+    return '192.168.1.1'
+
 def load_json(path: str, default):
     if not os.path.exists(path):
         return default
@@ -5971,8 +5996,8 @@ from telegram.ext import MessageHandler, filters, ContextTypes
 from .actions import (
     ACTIONS, is_installed, is_running, get_installed_version,
     UNINSTALL_TARGETS, SCAN_PATTERNS,
-    get_hr_web_url, get_versions, check_updates,
-    load_last_seen, save_last_seen,
+    get_hr_web_url, get_router_ip, get_versions, check_updates,
+    load_last_seen, save_last_seen, get_update_status,
 )
 
 log = logging.getLogger(__name__)
@@ -6068,13 +6093,15 @@ class HydraRouteModule:
         self._kill()
 
     async def _update_watch_loop(self):
-        await asyncio.sleep(60)
+        # Даём кэшу opkg обновиться при старте
+        await asyncio.sleep(180)
         while True:
             try:
                 await self._check_and_notify()
             except Exception as e:
                 log.debug('hr update watch failed: %s', e)
-            await asyncio.sleep(12 * 3600)
+            # Проверка раз в 2 часа (было 12)
+            await asyncio.sleep(2 * 3600)
 
     async def _check_and_notify(self):
         if not is_installed():
@@ -6086,26 +6113,38 @@ class HydraRouteModule:
             d = info.get(pkg, {})
             ins = d.get('installed', '')
             lat = d.get('latest', '')
-            if ins and lat and ins != lat:
-                if last.get(pkg) != lat:
-                    newly[pkg] = {'installed': ins, 'latest': lat}
+            has_update = d.get('update', False)
+            # Ключ сравнения: latest если есть обновление, иначе installed
+            key = lat if has_update else ins
+            if has_update and key and last.get(pkg) != key:
+                newly[pkg] = {'installed': ins, 'latest': lat}
         if newly:
+            log.info('HR update notification: %s', list(newly.keys()))
             await self._send_update_notification(newly)
-        new_state = {pkg: d['latest']
-                     for pkg, d in info.items() if d.get('latest')}
+        # Не теряем старые ключи, обновляем только непустые
+        new_state = dict(last)
+        for pkg in ('hrneo', 'hrweb', 'hrdns'):
+            d = info.get(pkg, {})
+            ins = d.get('installed', '')
+            lat = d.get('latest', '')
+            key = lat if d.get('update') else ins
+            if key:
+                new_state[pkg] = key
         save_last_seen(new_state)
 
     async def _send_update_notification(self, newly):
-        lines = ['🆕 <b>Обновления HydraRoute</b>', '']
+        lines = ['🆕 <b>Доступны обновления HydraRoute</b>', '']
         for pkg, d in newly.items():
-            lines.append(f'🟢 <b>{pkg}</b>: '
+            lines.append(f'⬆️ <b>{pkg}</b>: '
                          f'<code>{d["installed"]}</code> → '
                          f'<code>{d["latest"]}</code>')
         lines.append('')
-        lines.append('Обновить сейчас?')
+        lines.append('<i>Обновить сейчас?</i>')
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton('✅ Да, обновить',
+            [InlineKeyboardButton('⬆️ Обновить сейчас',
                                   callback_data='hydraroute:go:update')],
+            [InlineKeyboardButton('📋 Открыть карточку',
+                                  callback_data='hydraroute:main')],
             [InlineKeyboardButton('⏭ Позже',
                                   callback_data='hydraroute:main')],
         ])
@@ -6164,7 +6203,14 @@ class HydraRouteModule:
             lines.append(f'📡 hrdns: <code>{dns}</code>')
             lines.append('Сервис: ' + ('🟢 работает' if running else '🔴 остановлен'))
             url = get_hr_web_url()
-            lines.append(f'🌐 Веб: <a href="{url}">{url}</a>')
+            lines.append(f'Web UI: <a href="{url}">{url}</a>')
+            _upd_st = get_update_status()
+            if _upd_st.get('has_updates'):
+                lines.append('')
+                lines.append('⬆️ <b>Доступно обновление:</b>')
+                for p, d in _upd_st.get('packages', {}).items():
+                    if d.get('update'):
+                        lines.append(f'  • {p}: <code>{d["installed"]}</code> → <code>{d["latest"]}</code>')
         else:
             lines.append('❌ Не установлен')
         if not installed:
@@ -6308,9 +6354,21 @@ class HydraRouteModule:
             if not a:
                 await q.answer('Неизвестное действие', show_alert=True)
                 return
+            desc = a['desc']
+            if key == 'install':
+                desc = desc.replace('&lt;router-ip&gt;', get_router_ip())
+                _xk_proc = False
+                try:
+                    import subprocess as _sp
+                    _r = _sp.run(['sh', '-c', 'ps w | grep -q "[x]keen" && echo yes'], capture_output=True, text=True, timeout=3)
+                    _xk_proc = 'yes' in (_r.stdout or '')
+                except Exception:
+                    pass
+                if _xk_proc:
+                    desc += '\n\n⚠️ <b>Внимание:</b> XKeen сейчас <b>запущен</b>. Они используют те же ядра/маршрутизацию. Установка может вызвать конфликт.'
             text = (
                 f'{a["icon"]} <b>{a["title"]}</b>\n\n'
-                f'{a["desc"]}\n\n'
+                f'{desc}\n\n'
                 f'Подтвердить?'
             )
             kb = InlineKeyboardMarkup([
@@ -6481,6 +6539,8 @@ class HydraRouteModule:
                 any_update = True
             else:
                 lines.append(f'🟢 <b>{pkg}</b>: <code>{ins}</code>')
+                if ins != lat and lat != '—':
+                    lines.append(f'   <i>(в репо: {lat})</i>')
         lines.append('')
         if any_update:
             lines.append('Доступны обновления.')
@@ -7260,7 +7320,8 @@ def get_hr_web_url() -> str:
 
 
 def get_versions() -> dict:
-    """Версии компонентов HR из opkg."""
+    """Версии компонентов HR: из opkg или из бинарников."""
+    import re
     v = {'neo': '', 'web': '', 'hrdns': ''}
     try:
         r = _sp.run(
@@ -7275,59 +7336,155 @@ def get_versions() -> dict:
                 elif parts[0] == 'hrdns': v['hrdns'] = parts[2]
     except Exception:
         pass
+    if not v['neo']:
+        try:
+            r = _sp.run(['/opt/bin/hrneo', '--version'], capture_output=True, text=True, timeout=3)
+            out = (r.stdout or '') + (r.stderr or '')
+            m = re.search(r'v?([0-9][0-9A-Za-z.\-]+)', out)
+            if m: v['neo'] = m.group(1)
+        except Exception: pass
+    if not v['web']:
+        try:
+            r = _sp.run(['/opt/bin/hrweb', '--version'], capture_output=True, text=True, timeout=3)
+            out = (r.stdout or '') + (r.stderr or '')
+            m = re.search(r'v?([0-9][0-9A-Za-z.\-]+)', out)
+            if m: v['web'] = m.group(1)
+            else:
+                r = _sp.run(['/opt/bin/hrweb'], capture_output=True, text=True, timeout=3)
+                out = (r.stdout or '') + (r.stderr or '')
+                m = re.search(r'v?([0-9][0-9A-Za-z.\-]+)', out)
+                if m: v['web'] = m.group(1)
+        except Exception: pass
+    if not v['hrdns']:
+        try:
+            r = _sp.run(['/opt/bin/hrdns', '--version'], capture_output=True, text=True, timeout=3)
+            out = (r.stdout or '') + (r.stderr or '')
+            m = re.search(r'v?([0-9][0-9A-Za-z.\-]+)', out)
+            if m: v['hrdns'] = m.group(1)
+            else:
+                r = _sp.run(['/opt/bin/hrdns'], capture_output=True, text=True, timeout=3)
+                out = (r.stdout or '') + (r.stderr or '')
+                m = re.search(r'v?([0-9][0-9A-Za-z.\-]+)', out)
+                if m: v['hrdns'] = m.group(1)
+        except Exception: pass
     return v
 
 
-def check_updates() -> dict:
-    """Проверка обновлений для hrneo/hrweb/hrdns.
+UPDATE_STATUS_FILE = '/opt/router_bot/data/hydraroute/update_status.json'
 
-    Возвращает:
-      {'hrneo': {'installed': '3.24.0-1', 'latest': '3.25.0-1', 'update': True},
-       ...}
-    """
+def get_update_status() -> dict:
+    import json, os
+    if os.path.exists(UPDATE_STATUS_FILE):
+        try:
+            with open(UPDATE_STATUS_FILE) as f:
+                data = json.load(f)
+            # Сверяем сохранённые installed-версии с реально установленными
+            # Если они изменились (пользователь обновился), пересчитываем статус
+            current_vers = get_versions()
+            pkgs = data.get('packages', {})
+            has_updates = False
+            for p, d in pkgs.items():
+                if p == 'hrneo': d['installed'] = current_vers['neo'] or d.get('installed', '')
+                elif p == 'hrweb': d['installed'] = current_vers['web'] or d.get('installed', '')
+                elif p == 'hrdns': d['installed'] = current_vers['hrdns'] or d.get('installed', '')
+                
+                ins = d.get('installed', '')
+                lat = d.get('latest', '')
+                if ins and lat and ins != lat:
+                    d['update'] = True
+                    has_updates = True
+                else:
+                    d['update'] = False
+            data['has_updates'] = has_updates
+            return data
+        except Exception:
+            pass
+    return {}
+
+def save_update_status(data: dict):
+    import json, os
+    os.makedirs(os.path.dirname(UPDATE_STATUS_FILE), exist_ok=True)
+    try:
+        with open(UPDATE_STATUS_FILE, 'w') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+def check_updates() -> dict:
+    """Проверка обновлений через локальный кэш opkg или прямой curl."""
+    import glob, os, subprocess, threading
     pkgs = ('hrneo', 'hrweb', 'hrdns')
-    result = {p: {'installed': '', 'latest': '', 'update': False}
-              for p in pkgs}
+    result = {p: {'installed': '', 'latest': '', 'update': False} for p in pkgs}
 
     # 1. Установленные версии
-    try:
-        r = _sp.run(['sh', '-c', 'opkg list-installed 2>/dev/null'],
-                    capture_output=True, text=True, timeout=10)
-        for line in (r.stdout or '').splitlines():
-            parts = line.split()
-            if len(parts) >= 3 and parts[0] in pkgs:
-                result[parts[0]]['installed'] = parts[2]
-    except Exception:
-        pass
+    vers = get_versions()
+    result['hrneo']['installed'] = vers['neo']
+    result['hrweb']['installed'] = vers['web']
+    result['hrdns']['installed'] = vers['hrdns']
 
-    # 2. Обновляем список пакетов из репо
-    try:
-        _sp.run(['sh', '-c', 'opkg update 2>&1'],
-                capture_output=True, text=True, timeout=60)
-    except Exception:
-        pass
+    # 2. Запускаем opkg update в фоне, чтобы кэш был свежим
+    def _bg_update():
+        try:
+            subprocess.run(['sh', '-c', 'opkg update >/dev/null 2>&1'], timeout=60)
+        except Exception:
+            pass
+    threading.Thread(target=_bg_update, daemon=True).start()
 
-    # 3. Последние версии из репо
-    try:
-        r = _sp.run(['sh', '-c', 'opkg list 2>/dev/null'],
-                    capture_output=True, text=True, timeout=10)
-        for line in (r.stdout or '').splitlines():
-            parts = line.split(' - ', 1)
-            if len(parts) == 2:
-                name, rest = parts[0].strip(), parts[1].strip()
-                if name in pkgs:
-                    ver = rest.split(' - ', 1)[0].strip().split()[0]
-                    result[name]['latest'] = ver
-    except Exception:
-        pass
+    # 3. Читаем локальный кэш opkg (моментально, без интернета)
+    pkg_data = {}
+    for fpath in glob.glob('/opt/var/opkg-lists/*ground-zerro*'):
+        try:
+            with open(fpath, 'r', errors='replace') as f:
+                current_pkg = None
+                for line in f:
+                    if line.startswith('Package: '):
+                        current_pkg = line[9:].strip()
+                    elif line.startswith('Version: ') and current_pkg:
+                        pkg_data[current_pkg] = line[9:].strip()
+                        current_pkg = None
+        except Exception:
+            pass
 
-    # 4. Сравнение
+    # 4. Если локальный кэш пуст, скачиваем через curl
+    if not pkg_data:
+        import gzip
+        try:
+            r = subprocess.run(
+                ['curl', '-sL', '--max-time', '15', 'https://git.zerrolabs.org/Ground-Zerro/release/pages/keenetic/mipselsf-k3.4/Packages.gz'],
+                capture_output=True
+            )
+            if r.returncode == 0 and r.stdout:
+                data = gzip.decompress(r.stdout).decode('utf-8', errors='replace')
+                current_pkg = None
+                for line in data.splitlines():
+                    if line.startswith('Package: '):
+                        current_pkg = line[9:].strip()
+                    elif line.startswith('Version: ') and current_pkg:
+                        pkg_data[current_pkg] = line[9:].strip()
+                        current_pkg = None
+        except Exception:
+            pass
+
+    # 5. Сопоставляем пакеты
+    for p in pkgs:
+        if p in pkg_data:
+            result[p]['latest'] = pkg_data[p]
+        else:
+            for k, v in pkg_data.items():
+                if k == p or k.startswith(p + '-') or k.startswith(p + '_'):
+                    result[p]['latest'] = v
+                    break
+
+    # 6. Сравнение версий
+    has_updates = False
     for p in pkgs:
         ins = result[p]['installed']
         lat = result[p]['latest']
         if ins and lat and ins != lat:
             result[p]['update'] = True
+            has_updates = True
 
+    save_update_status({'has_updates': has_updates, 'packages': result})
     return result
 
 
@@ -8651,8 +8808,12 @@ class XKeenModule:
         # Проверка конфликта с HydraRoute
         if not installed:
             try:
-                import os as _os
-                if _os.path.isdir('/opt/etc/HydraRoute'):
+                import subprocess as _sp
+                _hr_proc = False
+                _r = _sp.run(['sh', '-c', 'ps w | grep -q "[h]rneo" && echo yes'],
+                             capture_output=True, text=True, timeout=3)
+                _hr_proc = 'yes' in (_r.stdout or '')
+                if _hr_proc:
                     lines.append('\u26a0\ufe0f <b>Конфликт с HydraRoute!</b>')
                     lines.append('<i>Оба используют /opt/etc/xray и запускают демон xray.</i>')
                     lines.append('<i>Удалите HydraRoute перед установкой XKeen.</i>')
@@ -8882,9 +9043,22 @@ class XKeenModule:
             if not a:
                 await q.answer('Неизвестное действие', show_alert=True)
                 return
+            desc = a['desc']
+            if key == 'install':
+                import subprocess as _sp
+                def _proc_run(p):
+                    try:
+                        _r = _sp.run(['sh', '-c', f'ps w | grep -q "[{p[0]}]{p[1:]}" && echo yes'], capture_output=True, text=True, timeout=3)
+                        return 'yes' in (_r.stdout or '')
+                    except Exception: return False
+                warns = []
+                if _proc_run('xkeen'): warns.append('XKeen')
+                if _proc_run('hrneo'): warns.append('HydraRoute')
+                if warns:
+                    desc += f'\n\n⚠️ <b>Внимание:</b> сейчас запущен { " и ".join(warns) }. Они занимают маршрутизацию эксклюзивно.'
             text = (
                 f'{a["icon"]} <b>{a["title"]}</b>\n\n'
-                f'{a["desc"]}\n\n'
+                f'{desc}\n\n'
                 f'Подтвердить?'
             )
             kb = InlineKeyboardMarkup([
@@ -9821,12 +9995,17 @@ class BirdModule:
         rows = []
         # Предупреждения о конфликтах
         if not installed:
-            import os as _os
-            if _os.path.isdir('/opt/etc/HydraRoute'):
+            import subprocess as _sp
+            def _proc_running(pname):
+                try:
+                    _r = _sp.run(['sh', '-c', f'ps w | grep -q "[{pname[0]}]{pname[1:]}" && echo yes'], capture_output=True, text=True, timeout=3)
+                    return 'yes' in (_r.stdout or '')
+                except Exception: return False
+            if _proc_running('hrneo'):
                 lines.append('\u26a0\ufe0f <b>Конфликт с HydraRoute</b>')
                 lines.append('<i>Оба меняют системные маршруты через ndmc/iptables.</i>')
                 lines.append('')
-            if _os.path.isdir('/opt/sbin/.xkeen'):
+            if _proc_running('xkeen'):
                 lines.append('\u26a0\ufe0f <b>Конфликт с XKeen</b>')
                 lines.append('<i>Оба меняют системные маршруты через ndmc/iptables.</i>')
                 lines.append('')
@@ -9930,9 +10109,12 @@ class BirdModule:
             if not a:
                 await q.answer('Неизвестное действие', show_alert=True)
                 return
+            desc = a['desc']
+            if key == 'install':
+                desc = desc.replace('&lt;IP роутера&gt;', get_router_ip())
             text = (
                 f'{a["icon"]} <b>{a["title"]}</b>\n\n'
-                f'{a["desc"]}\n\n'
+                f'{desc}\n\n'
                 f'Подтвердить?'
             )
             kb = InlineKeyboardMarkup([
@@ -11927,16 +12109,24 @@ class KeenPbrModule:
             if cfg_path and os.path.exists(cfg_path):
                 lines.append(f'Конфиг: <code>{_esc(cfg_path)}</code>')
 
-            lines.append(f'Web UI: <code>{_esc(PBR_WEB)}</code>')
+            from core.utils import get_router_ip
+            _ip = get_router_ip()
+            _port = PBR_WEB.rsplit(':', 1)[-1]
+            _url = f'http://{_ip}:{_port}'
+            lines.append(f'Web UI: <a href="{_url}">{_url}</a>')
         else:
             lines.append('❌ Не установлен')
-            # проверка конфликтов
-            import os as _os
-            if _os.path.isdir('/opt/etc/xkeen'):
+            import subprocess as _sp
+            def _proc_running(pname):
+                try:
+                    _r = _sp.run(['sh', '-c', f'ps w | grep -q "[{pname[0]}]{pname[1:]}" && echo yes'], capture_output=True, text=True, timeout=3)
+                    return 'yes' in (_r.stdout or '')
+                except Exception: return False
+            if _proc_running('xkeen'):
                 lines.append('')
                 lines.append('⚠️ <b>Конфликт с XKeen</b>')
                 lines.append('<i>Удалите XKeen перед установкой.</i>')
-            if _os.path.isdir('/opt/etc/HydraRoute'):
+            if _proc_running('hrneo'):
                 lines.append('')
                 lines.append('⚠️ <b>Конфликт с HydraRoute</b>')
                 lines.append('<i>Удалите HydraRoute перед установкой.</i>')
@@ -12664,9 +12854,7 @@ ACTIONS = {
         'desc': (
             'Установит keen-pbr — policy-based routing для Keenetic.\n\n'
             'Скачивается официальный установщик с GitHub.\n'
-            'Использует nftables и sing-box/xray ядра.\n\n'
-            '⚠️ <b>Не совместим с XKeen и HydraRoute</b> — они '
-            'занимают маршрутизацию эксклюзивно.'
+            'Использует nftables и sing-box/xray ядра.'
         ),
         'cmd': INSTALL_CMD,
     },
@@ -12787,7 +12975,7 @@ from telegram.ext import ContextTypes
 
 from .actions import (
     ACTIONS, UNINSTALL_CMD, UNINSTALL_TARGETS, SCAN_PATTERNS,
-    get_neofit_web_url,
+    get_neofit_web_url, get_router_ip,
     is_installed, is_running, get_version, get_status_short,
 )
 from core.utils import (
@@ -12887,17 +13075,24 @@ class NeoFitModule:
             v = f' · <code>{version}</code>' if version else ''
             lines.append(f'✅ Установлен{v}')
             lines.append('Сервис: ' + ('🟢 работает' if running else '🔴 остановлен'))
-            lines.append(f'Web UI: <code>{_esc(get_neofit_web_url())}</code>')
+            _url = get_neofit_web_url()
+            lines.append(f'Web UI: <a href="{_url}">{_url}</a>')
             if os.path.exists('/opt/etc/neofit'):
                 lines.append('Конфиг: <code>/opt/etc/neofit/</code>')
         else:
             lines.append('❌ Не установлен')
-            if os.path.isdir('/opt/etc/xkeen'):
+            _xk_proc = False
+            try:
+                import subprocess as _sp
+                _r = _sp.run(['sh', '-c', 'ps w | grep -q "[x]keen" && echo yes'],
+                             capture_output=True, text=True, timeout=3)
+                _xk_proc = 'yes' in (_r.stdout or '')
+            except Exception:
+                pass
+            if _xk_proc:
                 lines.append('')
                 lines.append('⚠️ <b>Конфликт с XKeen</b>')
                 lines.append('<i>Удалите XKeen перед установкой.</i>')
-            # HydraRoute не конфликтует с NeoFit (разные механизмы)
-            pass
         lines.append('')
 
         if self._running:
@@ -12926,11 +13121,7 @@ class NeoFitModule:
                     '\u25b6\ufe0f Запустить', callback_data='neofit:ask:start')])
             rows.append([
                 InlineKeyboardButton('\U0001f4ca Статус', callback_data='neofit:ask:status'),
-                InlineKeyboardButton('\u2139\ufe0f Инфо', callback_data='neofit:ask:info'),
-            ])
-            rows.append([
                 InlineKeyboardButton('\U0001f4dc Логи', callback_data='neofit:ask:logs'),
-                InlineKeyboardButton('\U0001f4c4 Версия', callback_data='neofit:ask:version'),
             ])
             rows.append([InlineKeyboardButton(
                 '\U0001f5d1 Удалить NeoFit', callback_data='neofit:ask:uninstall')])
@@ -13046,6 +13237,7 @@ class NeoFitModule:
         if pid == 0:
             try:
                 os.environ['TERM'] = 'dumb'
+                os.environ['PATH'] = '/opt/sbin:/opt/bin:/usr/sbin:/usr/bin:/sbin:/bin'
                 os.execv('/bin/sh', ['sh', '-c', cmd])
             except Exception:
                 os._exit(1)
@@ -13373,8 +13565,17 @@ import subprocess
 # --- Установка / удаление ---
 INSTALL_CMD = (
     'opkg update && '
-    'opkg install curl && '
-    'curl -Ls "http://www.pegakmop.site/release/keenetic/opkg.sh" | sh && '
+    'opkg install curl wget-ssl ca-certificates && '
+    'ARCH=$(grep "^arch=" /opt/etc/entware_release | cut -d= -f2) && '
+    'case "$ARCH" in '
+    'aarch64) URL="aarch64-k3.10";; '
+    'mipsel) URL="mipselsf-k3.4";; '
+    'mips) URL="mipssf-k3.4";; '
+    '*) URL="mipselsf-k3.4";; '
+    'esac && '
+    'mkdir -p /opt/etc/opkg && '
+    'echo "src/gz neofit https://pegakmop.github.io/release/keenetic/$URL" > /opt/etc/opkg/neofit.conf && '
+    'opkg update && '
     'opkg install neofit'
 )
 
@@ -13383,16 +13584,18 @@ UNINSTALL_CMD = (
     '--autoremove neofit 2>&1 || true'
 )
 
-# --- Управление сервисом (nf {start|stop|restart|status}) ---
-SERVICE_START   = 'nf start   2>&1'
-SERVICE_STOP    = 'nf stop    2>&1'
-SERVICE_RESTART = 'nf restart 2>&1'
-SERVICE_STATUS  = 'nf status  2>&1'
+# --- Управление сервисом (через init-скрипт) ---
+NEOFIT_INIT     = '/opt/etc/init.d/S69neofit'
+# start-stop-daemon -b отвязывает демон от pty (делает setsid), иначе он падает по SIGHUP
+SERVICE_START   = f'/opt/sbin/start-stop-daemon -S -b -x {NEOFIT_INIT} -- start 2>&1; sleep 2; {NEOFIT_INIT} status 2>&1'
+SERVICE_STOP    = f'{NEOFIT_INIT} stop    2>&1'
+SERVICE_RESTART = f'{NEOFIT_INIT} stop 2>&1; sleep 1; /opt/sbin/start-stop-daemon -S -b -x {NEOFIT_INIT} -- start 2>&1; sleep 2; {NEOFIT_INIT} status 2>&1'
+SERVICE_STATUS  = f'{NEOFIT_INIT} status  2>&1'
 
 # --- Диагностика ---
 CMD_VERSION = 'neofit --version 2>&1 || nf --version 2>&1'
 CMD_INFO    = 'nf status 2>&1'
-CMD_LOGS    = 'tail -n 60 /opt/var/log/neofit.log 2>&1 || echo "лог не найден"'
+CMD_LOGS    = 'tail -n 60 /opt/var/log/neofit.log 2>/dev/null || tail -n 60 /opt/var/log/neofit/*.log 2>/dev/null || (ndmc -c "show log" 2>/dev/null | grep -i neofit | tail -n 60) || echo "Логи не найдены."'
 
 # Пути
 NEOFIT_BIN     = '/opt/sbin/neofit'
@@ -13432,12 +13635,12 @@ def get_neofit_web_url() -> str:
 
 
 def find_bin() -> str:
-    for p in (NEOFIT_BIN, NEOFIT_BIN_ALT):
+    for p in (NEOFIT_BIN, NEOFIT_BIN_ALT, '/opt/bin/nf', '/opt/sbin/nf'):
         if os.path.exists(p):
             return p
     try:
         r = subprocess.run(
-            ['sh', '-c', 'command -v neofit 2>/dev/null'],
+            ['sh', '-c', 'command -v neofit 2>/dev/null || command -v nf 2>/dev/null'],
             capture_output=True, text=True, timeout=3,
         )
         return (r.stdout or '').strip()
@@ -13455,10 +13658,18 @@ def is_installed() -> bool:
             return True
     except Exception:
         pass
-    return os.path.exists(NEOFIT_INIT) or bool(find_bin())
+    return os.path.exists('/opt/etc/init.d/S69neofit') or bool(find_bin())
 
 
 def is_running() -> bool:
+    # 1. Самый надежный способ — pidof
+    try:
+        r = subprocess.run(['pidof', 'neofit'], capture_output=True, timeout=3)
+        if r.returncode == 0:
+            return True
+    except Exception:
+        pass
+    # 2. Через процесс (fallback)
     try:
         r = subprocess.run(
             ['sh', '-c', 'ps w | grep -E "[n]eofit" | grep -v grep | wc -l'],
@@ -13508,8 +13719,6 @@ ACTIONS = {
             '(Xray/Sing-Box) на Keenetic.\n\n'
             'После установки веб-интерфейс: '
             '<code>http://&lt;router-ip&gt;:92</code>\n\n'
-            '⚠️ <b>Не совместим с XKeen и HydraRoute</b> — '
-            'они используют те же ядра/маршрутизацию.'
         ),
         'cmd': INSTALL_CMD,
     },
@@ -13547,18 +13756,6 @@ ACTIONS = {
         'icon': '\U0001f4ca',
         'desc': 'Команда: <code>nf status</code>',
         'cmd': SERVICE_STATUS,
-    },
-    'version': {
-        'title': 'Версия NeoFit',
-        'icon': '\U0001f4c4',
-        'desc': 'Команда: <code>neofit --version</code>',
-        'cmd': CMD_VERSION,
-    },
-    'info': {
-        'title': 'Информация',
-        'icon': '\u2139\ufe0f',
-        'desc': 'Общее состояние NeoFit',
-        'cmd': CMD_INFO,
     },
     'show_config': {
         'title': 'Показать конфиг',
@@ -13719,10 +13916,16 @@ class UsqueKeeneticModule:
                 lines.append(f'Конфиг: <code>{_esc(USQUE_CONF)}</code>')
         else:
             lines.append('❌ Не установлен')
-            for p, name in [('/opt/etc/keen-pbr', 'Keen-PBR'),
-                            ('/opt/etc/xkeen', 'XKeen'),
-                            ('/opt/etc/HydraRoute', 'HydraRoute')]:
-                if os.path.isdir(p):
+            import subprocess as _sp
+            def _proc_running(pname):
+                try:
+                    _r = _sp.run(['sh', '-c', f'ps w | grep -q "[{pname[0]}]{pname[1:]}" && echo yes'], capture_output=True, text=True, timeout=3)
+                    return 'yes' in (_r.stdout or '')
+                except Exception: return False
+            for proc, name in [('keen-pbr', 'Keen-PBR'),
+                               ('xkeen', 'XKeen'),
+                               ('hrneo', 'HydraRoute')]:
+                if _proc_running(proc):
                     lines.append('')
                     lines.append(f'⚠️ <b>Конфликт с {name}</b>')
                     lines.append(f'<i>Удалите {name} перед установкой.</i>')
@@ -13827,8 +14030,22 @@ class UsqueKeeneticModule:
             if not a:
                 await q.answer('Неизвестное действие', show_alert=True)
                 return
+            desc = a['desc']
+            if key == 'install':
+                import subprocess as _sp
+                def _proc_run(p):
+                    try:
+                        _r = _sp.run(['sh', '-c', f'ps w | grep -q "[{p[0]}]{p[1:]}" && echo yes'], capture_output=True, text=True, timeout=3)
+                        return 'yes' in (_r.stdout or '')
+                    except Exception: return False
+                warns = []
+                if _proc_run('keen-pbr'): warns.append('Keen-PBR')
+                if _proc_run('xkeen'): warns.append('XKeen')
+                if _proc_run('hrneo'): warns.append('HydraRoute')
+                if warns:
+                    desc += f'\n\n⚠️ <b>Внимание:</b> сейчас запущен { " и ".join(warns) }. Это может вызвать конфликт.'
             text = (f'{a["icon"]} <b>{a["title"]}</b>\n\n'
-                    f'{a["desc"]}\n\nПодтвердить?')
+                    f'{desc}\n\nПодтвердить?')
             kb = InlineKeyboardMarkup([
                 [InlineKeyboardButton('\u2705 Подтвердить',
                                       callback_data=f'usque_keenetic:go:{key}')],
@@ -14240,8 +14457,7 @@ ACTIONS = {
             'Установит Cloudflare WARP (MASQUE) клиент.\n\n'
             'Регистрируется opkg-репозиторий side-effect-tm, '
             'ставится пакет <code>usque-keenetic</code>.\n\n'
-            '⚠️ Требует Keenetic OS >= 5.0.\n'
-            '⚠️ Конфликтует с keen_pbr / XKeen / HydraRoute.'
+            '⚠️ Требует Keenetic OS >= 5.0.'
         ),
         'cmd': INSTALL_CMD,
     },
@@ -15562,7 +15778,7 @@ case "$1" in
     kill_all_routerbot
     rm -f "$PIDFILE"
     ;;
-  restart) $0 stop; sleep 3; $0 start ;;
+  restart) rm -f /var/run/routerbot.giveup; $0 stop; sleep 3; $0 start ;;
   reset)
     rm -f /var/run/routerbot.giveup
     echo "Giveup marker removed. Now run: $0 start"
