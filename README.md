@@ -23,7 +23,8 @@
 
 ```bash
 sh router_bot_setup.sh
-
+```
+```bash
 opkg update && opkg install curl ca-certificates
 curl -fsSL https://raw.githubusercontent.com/zootsman/router-bot/master/router_bot_setup.sh -o /tmp/router_bot_setup.sh
 chmod +x /tmp/router_bot_setup.sh
