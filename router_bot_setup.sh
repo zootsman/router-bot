@@ -203,16 +203,24 @@ import os
 import socket
 import subprocess
 
-# --- IPv4-патч: до импорта telegram, чтобы все соединения шли по IPv4 ---
-# ВНИМАНИЕ: глобально ограничивает getaddrinfo только IPv4.
-# Это сделано специально для Keenetic: IPv6 через VPN часто ломается,
-# а Telegram-боту IPv6 не нужен. Если понадобится IPv6 (например,
-# SSH Control к IPv6-хосту) — уберите этот блок или замените на
-# monkey-patch httpx (используется только PTB).
-_orig_getaddrinfo = socket.getaddrinfo
-def _ipv4_only(host, port, family=0, type=0, proto=0, flags=0):
-    return _orig_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
-socket.getaddrinfo = _ipv4_only
+def _read_config_value(key, default=''):
+    try:
+        with open('/opt/router_bot/config.env') as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith(key + '='):
+                    v = line.split('=', 1)[1].strip().strip('"').strip("'")
+                    return v
+    except Exception:
+        pass
+    return default
+
+_disable_ipv6 = _read_config_value('DISABLE_IPV6', 'yes').lower() in ('1', 'yes', 'on', 'true')
+if _disable_ipv6:
+    _orig_getaddrinfo = socket.getaddrinfo
+    def _ipv4_only(host, port, family=0, type=0, proto=0, flags=0):
+        return _orig_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
+    socket.getaddrinfo = _ipv4_only
 # -----------------------------------------------------------------------
 
 from telegram import (
@@ -1295,6 +1303,7 @@ show_help() {
     logs [N]         Последние N строк лога (по умолч. 40)
     follow, f        Лог в реальном времени (Ctrl+C — выход)
     version, v       Версия бота
+    ipv6 [on|off]    Вкл/выкл IPv6 (off = только IPv4)
     config, c        Конфиг: показать/править/восстановить
     modules, m       Включённые модули
     routes           Маршруты Telegram (table 16385)
@@ -2184,6 +2193,26 @@ case "$1" in
         ;;
     modules|m)
         do_modules
+        ;;
+    ipv6)
+        _v6="$2"
+        if [ "$_v6" = "on" ]; then
+            sed -i "s/^DISABLE_IPV6=.*/DISABLE_IPV6='no'/" "$CONF"
+            cp -p "$CONF" "$CONF.bak" 2>/dev/null || true
+            echo "✅ IPv6 включён. Перезапустите бота: rb restart"
+        elif [ "$_v6" = "off" ]; then
+            sed -i "s/^DISABLE_IPV6=.*/DISABLE_IPV6='yes'/" "$CONF"
+            cp -p "$CONF" "$CONF.bak" 2>/dev/null || true
+            echo "✅ IPv6 отключён (бот только на IPv4). Перезапустите бота: rb restart"
+        else
+            _cur=$(sed -n "s/^DISABLE_IPV6='\(.*\)'/\1/p" "$CONF" 2>/dev/null)
+            if [ "$_cur" = "no" ]; then
+                echo "IPv6: включён (бот использует IPv4 и IPv6)"
+            else
+                echo "IPv6: отключён (бот использует только IPv4)"
+            fi
+            echo "Использование: rb ipv6 [on|off]"
+        fi
         ;;
     routes)
         do_routes
@@ -15065,14 +15094,41 @@ echo ""
 
 # =================== продолжение в следующей части ===================
 
+# ---------- 3.5. IPv6 ----------
+echo "────────────────────────────────────────────"
+echo "  IPv6 (влияет на проверку Telegram)"
+echo "────────────────────────────────────────────"
+echo "  На некоторых провайдерах IPv6 вызывает зависание"
+echo "  при подключении к api.telegram.org."
+echo ""
+DISABLE_IPV6="yes"
+printf "Отключить IPv6 для бота? (Y/n): "
+read ANS_V6
+ANS_V6=$(printf "%s" "$ANS_V6" | sed 's/[^[:alnum:]]//g')
+case "$ANS_V6" in
+    n|N) DISABLE_IPV6="no" ;;
+    *)   DISABLE_IPV6="yes" ;;
+esac
+if [ "$DISABLE_IPV6" = "yes" ]; then
+    echo "  IPv6 отключён (бот только на IPv4)"
+else
+    echo "  IPv6 включён"
+fi
+echo ""
+
 # ---------- 4. Доступ к Telegram ----------
 echo "────────────────────────────────────────────"
 echo "  Доступ к Telegram"
 echo "────────────────────────────────────────────"
 echo ""
 
+_curl_opts="-sf --max-time 8"
+if [ "$DISABLE_IPV6" = "yes" ]; then
+    _curl_opts="$_curl_opts -4"
+fi
+
 printf "→ Проверяю доступность Telegram напрямую... "
-if /opt/bin/curl -sf --max-time 8 "https://api.telegram.org" >/dev/null 2>&1; then
+if /opt/bin/curl $_curl_opts "https://api.telegram.org" >/dev/null 2>&1; then
     echo "✅ доступен"
     echo "  VPN не нужен."
     USE_VPN="no"
@@ -15186,7 +15242,7 @@ else
     printf "→ Проверяю доступ к Telegram через $VPN_IF ($VPN_SRC)... "
     ip route add 149.154.166.110 dev "$VPN_IF" src "$VPN_SRC" table "$WAN_TABLE" 2>/dev/null
 
-    if /opt/bin/curl -sf --max-time 8 "https://api.telegram.org" >/dev/null 2>&1; then
+    if /opt/bin/curl $_curl_opts "https://api.telegram.org" >/dev/null 2>&1; then
         echo "✅ работает"
         USE_VPN="yes"
     else
@@ -15584,6 +15640,9 @@ ROUTE_TABLE='$WAN_TABLE'
 USE_VPN='$USE_VPN'
 VPN_IF='$VPN_IF'
 VPN_SRC='$VPN_SRC'
+
+# IPv6 (yes = отключён, только IPv4)
+DISABLE_IPV6='$DISABLE_IPV6'
 EOF
 chmod 600 "$BASE_DIR/config.env"
 cp -p "$BASE_DIR/config.env" "$BASE_DIR/config.env.bak"
@@ -15841,7 +15900,11 @@ fi
 
 # 3. Проверка связи с Telegram
 TG=$(sed -n "s/^TG_BOT_TOKEN='\(.*\)'/\1/p" /opt/router_bot/config.env)
-if /opt/bin/curl -sf --max-time 10 "https://api.telegram.org/bot${TG}/getMe" >/dev/null 2>&1; then
+_c4=""
+if [ "$DISABLE_IPV6" = "yes" ]; then
+    _c4="-4"
+fi
+if /opt/bin/curl $_c4 -sf --max-time 10 "https://api.telegram.org/bot${TG}/getMe" >/dev/null 2>&1; then
     rm -f "$STATE"
 else
     COUNT=$(cat "$STATE" 2>/dev/null || echo 0)
