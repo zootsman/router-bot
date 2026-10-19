@@ -10,7 +10,7 @@ set -e
 # и вернут дефолт. При интерактивном запуске работают как обычно.
 # Блок exec < /dev/tty УБРАН: при setsid() (Popen) /dev/tty не открывается.
 
-SETUP_VERSION="0.0.9-01"  # AUTO_DISCOVERY_PATCH_V1
+SETUP_VERSION="0.0.9-02"  # AUTO_DISCOVERY_PATCH_V1
 VERSION_FILE="/opt/router_bot/VERSION"
 INSTALLED_VERSION=""
 if [ -f "$VERSION_FILE" ]; then
@@ -187,7 +187,7 @@ RB_MAIN_PY_EOF
 
 echo "  → VERSION"
 cat > /opt/router_bot/VERSION << 'RB_VERSION_EOF'
-0.0.9-01
+0.0.9-02
 RB_VERSION_EOF
 
 echo "  → core/__init__.py"
@@ -611,8 +611,12 @@ async def _check_and_notify_self_update(app) -> bool:
                               callback_data='router:update_never')],
     ])
     try:
-        await app.bot.send_message(chat_id=chat_id, text=text,
+        msg = await app.bot.send_message(chat_id=chat_id, text=text,
                                    parse_mode='HTML', reply_markup=kb)
+        try:
+            from core.utils import notify_register
+            notify_register(chat_id, msg.message_id)
+        except Exception: pass
         st['last_notified_version'] = latest
         _save_update_state(st)
         log.info('self-update: notified %s -> %s', current, latest)
@@ -1539,7 +1543,7 @@ def main():
     async def _global_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         q = update.callback_query
         try:
-            await notify_cleanup(ctx.bot, update.effective_chat.id)
+            await notify_cleanup(ctx.bot, update.effective_chat.id, exclude_msg_id=q.message.message_id)
         except Exception:
             pass
         if q.data.startswith('router:cat:'):
@@ -2399,9 +2403,8 @@ def notify_register(chat_id, message_id):
     data[cid] = lst[-200:]
     _notif_save(data)
 
-async def notify_cleanup(bot, chat_id=None, older_than_hours=None):
-    """Удаляет уведомления Net Watch. Если chat_id=None — для всех.
-    Если older_than_hours=None — все. Иначе только старше N часов."""
+async def notify_cleanup(bot, chat_id=None, older_than_hours=None, exclude_msg_id=None):
+    """Удаляет уведомления. Если exclude_msg_id задан — не трогает это сообщение."""
     data = _notif_load()
     now = int(_time_notif.time())
     cutoff = now - int(older_than_hours * 3600) if older_than_hours else None
@@ -2413,6 +2416,9 @@ async def notify_cleanup(bot, chat_id=None, older_than_hours=None):
         remaining = []
         for item in lst:
             msg_id = item.get('id')
+            if exclude_msg_id and msg_id == exclude_msg_id:
+                remaining.append(item)
+                continue
             ts = item.get('ts', 0)
             if cutoff is not None and ts >= cutoff:
                 remaining.append(item)
@@ -8897,6 +8903,8 @@ from core.utils import (
     scan_leftovers, build_leftovers_message,
     ui_edit_q, ui_edit_or_send,
     show_card,
+    show_card,
+    ui_edit_q,
 )
 from core.utils import set_last_msg
 
@@ -9272,17 +9280,14 @@ class FlashkeenModule:
         self._running = True
         self._mode = 'action'
         self._last_action = 'cleanup'
-        msg = await ctx.bot.send_message(
-            chat_id=self.chat_id,
-            text='\U0001f5d1 <b>Удаление остатков Flashkeen</b>\n\n<pre>запуск...</pre>',
-            parse_mode='HTML',
-            reply_markup=InlineKeyboardMarkup([
+        self._status_msg_id = await ui_edit_q(
+                q,
+                '\U0001f5d1 <b>Удаление остатков Flashkeen</b>\n\n<pre>запуск...</pre>',
+                kb=InlineKeyboardMarkup([
                 [InlineKeyboardButton('\U0001f6d1 Отменить',
                                       callback_data='flashkeen:kill')],
             ]),
-        )
-        self._status_msg_id = msg.message_id
-        set_last_msg(self.chat_id, msg.message_id)
+            )
 
         pid, master = pty.fork()
         if pid == 0:
@@ -9335,17 +9340,14 @@ class FlashkeenModule:
             self._running = True
             self._mode = 'action'
             self._last_action = 'uninstall'
-            msg = await ctx.bot.send_message(
-                chat_id=self.chat_id,
-                text='\U0001f5d1 <b>Удаление Flashkeen</b>\n\n<pre>запуск...</pre>',
-                parse_mode='HTML',
-                reply_markup=InlineKeyboardMarkup([
+            self._status_msg_id = await ui_edit_q(
+                q,
+                '\U0001f5d1 <b>Удаление Flashkeen</b>\n\n<pre>запуск...</pre>',
+                kb=InlineKeyboardMarkup([
                     [InlineKeyboardButton('\U0001f6d1 Отменить',
                                           callback_data='flashkeen:kill')],
                 ]),
             )
-            self._status_msg_id = msg.message_id
-            set_last_msg(self.chat_id, msg.message_id)
 
             pid, master = pty.fork()
             if pid == 0:
@@ -9416,8 +9418,18 @@ class FlashkeenModule:
             log.warning('set nonblock failed: %s', e)
 
         idle_start = time.time()
+        start_time = time.time()
+        timeout_total = 180
         try:
             while True:
+                if time.time() - start_time > timeout_total:
+                    log.warning('Timeout %ss, killing process', timeout_total)
+                    try:
+                        os.kill(pid, 9)
+                    except Exception:
+                        pass
+                    self._buf += b'\n[!] Timeout: process killed\n'
+                    break
                 try:
                     wpid, _ws = os.waitpid(pid, os.WNOHANG)
                     if wpid == pid:
@@ -9952,6 +9964,8 @@ from core.utils import (
     scan_leftovers, build_leftovers_message,
     ui_edit_q, ui_edit_or_send,
     show_card,
+    show_card,
+    ui_edit_q,
 )
 from core.utils import set_last_msg
 
@@ -10644,8 +10658,18 @@ class XKeenModule:
             log.warning('nonblock set failed: %s', e)
 
         idle_start = time.time()
+        start_time = time.time()
+        timeout_total = 180
         try:
             while True:
+                if time.time() - start_time > timeout_total:
+                    log.warning('Timeout %ss, killing process', timeout_total)
+                    try:
+                        os.kill(pid, 9)
+                    except Exception:
+                        pass
+                    self._buf += b'\n[!] Timeout: process killed\n'
+                    break
                 try:
                     wpid, _ws = os.waitpid(pid, os.WNOHANG)
                     if wpid == pid:
@@ -11149,6 +11173,8 @@ from core.utils import (
     scan_leftovers, build_leftovers_message,
     ui_edit_q, ui_edit_or_send,
     show_card,
+    show_card,
+    ui_edit_q,
 )
 from core.utils import set_last_msg
 
@@ -11506,17 +11532,14 @@ class BirdModule:
         self._last_edit = 0.0
         self._running = True
         self._last_action = 'cleanup'
-        msg = await ctx.bot.send_message(
-            chat_id=self.chat_id,
-            text='\U0001f5d1 <b>Удаляю остатки...</b>\n\n<pre>запуск...</pre>',
-            parse_mode='HTML',
-            reply_markup=InlineKeyboardMarkup([
+        self._status_msg_id = await ui_edit_q(
+                q,
+                '\U0001f5d1 <b>Удаляю остатки...</b>\n\n<pre>запуск...</pre>',
+                kb=InlineKeyboardMarkup([
                 [InlineKeyboardButton('\U0001f6d1 Отменить',
                                       callback_data='bird:kill')],
             ]),
-        )
-        self._status_msg_id = msg.message_id
-        set_last_msg(self.chat_id, msg.message_id)
+            )
 
         pid, master = pty.fork()
         if pid == 0:
@@ -11568,17 +11591,14 @@ class BirdModule:
             self._last_edit = 0.0
             self._running = True
             self._last_action = 'uninstall'
-            msg = await ctx.bot.send_message(
-                chat_id=self.chat_id,
-                text='\U0001f5d1 <b>Удаление BIRD</b>\n\n<pre>запуск...</pre>',
-                parse_mode='HTML',
-                reply_markup=InlineKeyboardMarkup([
+            self._status_msg_id = await ui_edit_q(
+                q,
+                '\U0001f5d1 <b>Удаление BIRD</b>\n\n<pre>запуск...</pre>',
+                kb=InlineKeyboardMarkup([
                     [InlineKeyboardButton('\U0001f6d1 Отменить',
                                           callback_data='bird:kill')],
                 ]),
             )
-            self._status_msg_id = msg.message_id
-            set_last_msg(self.chat_id, msg.message_id)
 
             pid, master = pty.fork()
             if pid == 0:
@@ -12237,6 +12257,8 @@ from core.utils import (
     scan_leftovers, build_leftovers_message,
     ui_edit_q, ui_edit_or_send,
     show_card,
+    show_card,
+    ui_edit_q,
 )
 from core.utils import set_last_msg
 
@@ -12750,8 +12772,18 @@ class MTProxyModule:
             log.warning('nonblock failed: %s', e)
 
         idle_start = time.time()
+        start_time = time.time()
+        timeout_total = 180
         try:
             while True:
+                if time.time() - start_time > timeout_total:
+                    log.warning('Timeout %ss, killing process', timeout_total)
+                    try:
+                        os.kill(pid, 9)
+                    except Exception:
+                        pass
+                    self._buf += b'\n[!] Timeout: process killed\n'
+                    break
                 try:
                     wpid, _ws = os.waitpid(pid, os.WNOHANG)
                     if wpid == pid:
@@ -12964,17 +12996,14 @@ class MTProxyModule:
             self._last_edit = 0.0
             self._running = True
             self._last_action = 'uninstall'
-            msg = await ctx.bot.send_message(
-                chat_id=self.chat_id,
-                text='\U0001f5d1 <b>Удаление MTProxy</b>\n\n<pre>запуск...</pre>',
-                parse_mode='HTML',
-                reply_markup=InlineKeyboardMarkup([
+            self._status_msg_id = await ui_edit_q(
+                q,
+                '\U0001f5d1 <b>Удаление MTProxy</b>\n\n<pre>запуск...</pre>',
+                kb=InlineKeyboardMarkup([
                     [InlineKeyboardButton('\U0001f6d1 Отменить',
                                           callback_data='mtproxy:kill')],
                 ]),
             )
-            self._status_msg_id = msg.message_id
-            set_last_msg(self.chat_id, msg.message_id)
             pid, master = pty.fork()
             if pid == 0:
                 try:
@@ -13028,17 +13057,14 @@ class MTProxyModule:
         self._last_edit = 0.0
         self._running = True
         self._last_action = 'cleanup'
-        msg = await ctx.bot.send_message(
-            chat_id=self.chat_id,
-            text='\U0001f5d1 <b>Удаление остатков MTProxy</b>\n\n<pre>запуск...</pre>',
-            parse_mode='HTML',
-            reply_markup=InlineKeyboardMarkup([
+        self._status_msg_id = await ui_edit_q(
+                q,
+                '\U0001f5d1 <b>Удаление остатков MTProxy</b>\n\n<pre>запуск...</pre>',
+                kb=InlineKeyboardMarkup([
                 [InlineKeyboardButton('\U0001f6d1 Отменить',
                                       callback_data='mtproxy:kill')],
             ]),
-        )
-        self._status_msg_id = msg.message_id
-        set_last_msg(self.chat_id, msg.message_id)
+            )
         pid, master = pty.fork()
         if pid == 0:
             try:
@@ -13362,6 +13388,8 @@ from core.utils import (
     scan_leftovers, build_leftovers_message,
     ui_edit_q, ui_edit_or_send,
     show_card,
+    show_card,
+    ui_edit_q,
 )
 from core.utils import set_last_msg
 
@@ -13802,8 +13830,18 @@ class KeenPbrModule:
             log.warning('nonblock failed: %s', e)
 
         idle_start = time.time()
+        start_time = time.time()
+        timeout_total = 180
         try:
             while True:
+                if time.time() - start_time > timeout_total:
+                    log.warning('Timeout %ss, killing process', timeout_total)
+                    try:
+                        os.kill(pid, 9)
+                    except Exception:
+                        pass
+                    self._buf += b'\n[!] Timeout: process killed\n'
+                    break
                 try:
                     wpid, _ws = os.waitpid(pid, os.WNOHANG)
                     if wpid == pid:
@@ -14016,17 +14054,14 @@ class KeenPbrModule:
             self._last_edit = 0.0
             self._running = True
             self._last_action = 'uninstall'
-            msg = await ctx.bot.send_message(
-                chat_id=self.chat_id,
-                text='\U0001f5d1 <b>Удаление keen-pbr</b>\n\n<pre>запуск...</pre>',
-                parse_mode='HTML',
-                reply_markup=InlineKeyboardMarkup([
+            self._status_msg_id = await ui_edit_q(
+                q,
+                '\U0001f5d1 <b>Удаление keen-pbr</b>\n\n<pre>запуск...</pre>',
+                kb=InlineKeyboardMarkup([
                     [InlineKeyboardButton('\U0001f6d1 Отменить',
                                           callback_data='keen_pbr:kill')],
                 ]),
             )
-            self._status_msg_id = msg.message_id
-            set_last_msg(self.chat_id, msg.message_id)
             pid, master = pty.fork()
             if pid == 0:
                 try:
@@ -14080,17 +14115,14 @@ class KeenPbrModule:
         self._last_edit = 0.0
         self._running = True
         self._last_action = 'cleanup'
-        msg = await ctx.bot.send_message(
-            chat_id=self.chat_id,
-            text='\U0001f5d1 <b>Удаление остатков keen-pbr</b>\n\n<pre>запуск...</pre>',
-            parse_mode='HTML',
-            reply_markup=InlineKeyboardMarkup([
+        self._status_msg_id = await ui_edit_q(
+                q,
+                '\U0001f5d1 <b>Удаление остатков keen-pbr</b>\n\n<pre>запуск...</pre>',
+                kb=InlineKeyboardMarkup([
                 [InlineKeyboardButton('\U0001f6d1 Отменить',
                                       callback_data='keen_pbr:kill')],
             ]),
-        )
-        self._status_msg_id = msg.message_id
-        set_last_msg(self.chat_id, msg.message_id)
+            )
         pid, master = pty.fork()
         if pid == 0:
             try:
@@ -14374,6 +14406,8 @@ from core.utils import (
     existing_targets, sync_opts, build_uninstall_menu,
     collect_uninstall_cmd, toggle_opt, scan_leftovers, build_leftovers_message,
     show_card,
+    show_card,
+    ui_edit_q,
 )
 from core.utils import set_last_msg
 
@@ -14673,8 +14707,18 @@ class NeoFitModule:
             log.warning('nonblock failed: %s', e)
 
         idle_start = time.time()
+        start_time = time.time()
+        timeout_total = 180
         try:
             while True:
+                if time.time() - start_time > timeout_total:
+                    log.warning('Timeout %ss, killing process', timeout_total)
+                    try:
+                        os.kill(pid, 9)
+                    except Exception:
+                        pass
+                    self._buf += b'\n[!] Timeout: process killed\n'
+                    break
                 try:
                     wpid, _ws = os.waitpid(pid, os.WNOHANG)
                     if wpid == pid:
@@ -14886,16 +14930,13 @@ class NeoFitModule:
             self._last_edit = 0.0
             self._running = True
             self._last_action = 'uninstall'
-            msg = await ctx.bot.send_message(
-                chat_id=self.chat_id,
-                text='\U0001f5d1 <b>Удаление NeoFit</b>\n\n<pre>запуск...</pre>',
-                parse_mode='HTML',
-                reply_markup=InlineKeyboardMarkup([
+            self._status_msg_id = await ui_edit_q(
+                q,
+                '\U0001f5d1 <b>Удаление NeoFit</b>\n\n<pre>запуск...</pre>',
+                kb=InlineKeyboardMarkup([
                     [InlineKeyboardButton('\U0001f6d1 Отменить', callback_data='neofit:kill')],
                 ]),
             )
-            self._status_msg_id = msg.message_id
-            set_last_msg(self.chat_id, msg.message_id)
             pid, master = pty.fork()
             if pid == 0:
                 try:
@@ -14946,16 +14987,13 @@ class NeoFitModule:
         self._last_edit = 0.0
         self._running = True
         self._last_action = 'cleanup'
-        msg = await ctx.bot.send_message(
-            chat_id=self.chat_id,
-            text='\U0001f5d1 <b>Удаление остатков NeoFit</b>\n\n<pre>запуск...</pre>',
-            parse_mode='HTML',
-            reply_markup=InlineKeyboardMarkup([
+        self._status_msg_id = await ui_edit_q(
+                q,
+                '\U0001f5d1 <b>Удаление остатков NeoFit</b>\n\n<pre>запуск...</pre>',
+                kb=InlineKeyboardMarkup([
                 [InlineKeyboardButton('\U0001f6d1 Отменить', callback_data='neofit:kill')],
             ]),
-        )
-        self._status_msg_id = msg.message_id
-        set_last_msg(self.chat_id, msg.message_id)
+            )
         pid, master = pty.fork()
         if pid == 0:
             try:
@@ -15249,6 +15287,8 @@ from core.utils import (
     scan_leftovers, build_leftovers_message,
     ui_edit_q, ui_edit_or_send,
     show_card,
+    show_card,
+    ui_edit_q,
 )
 from core.utils import set_last_msg
 
@@ -15550,8 +15590,18 @@ class UsqueKeeneticModule:
             fcntl.fcntl(master, fcntl.F_SETFL, os.O_NONBLOCK)
         except Exception as e: log.warning('nonblock failed: %s', e)
         idle_start = time.time()
+        start_time = time.time()
+        timeout_total = 180
         try:
             while True:
+                if time.time() - start_time > timeout_total:
+                    log.warning('Timeout %ss, killing process', timeout_total)
+                    try:
+                        os.kill(pid, 9)
+                    except Exception:
+                        pass
+                    self._buf += b'\n[!] Timeout: process killed\n'
+                    break
                 try:
                     wpid, _ws = os.waitpid(pid, os.WNOHANG)
                     if wpid == pid:
@@ -15740,17 +15790,14 @@ class UsqueKeeneticModule:
             self._uninstall_opts = {}
             self._buf = b''; self._last_edit = 0.0
             self._running = True; self._last_action = 'uninstall'
-            msg = await ctx.bot.send_message(
-                chat_id=self.chat_id,
-                text='\U0001f5d1 <b>Удаление usque-keenetic</b>\n\n<pre>запуск...</pre>',
-                parse_mode='HTML',
-                reply_markup=InlineKeyboardMarkup([
+            self._status_msg_id = await ui_edit_q(
+                q,
+                '\U0001f5d1 <b>Удаление usque-keenetic</b>\n\n<pre>запуск...</pre>',
+                kb=InlineKeyboardMarkup([
                     [InlineKeyboardButton('\U0001f6d1 Отменить',
                                           callback_data='usque_keenetic:kill')],
                 ]),
             )
-            self._status_msg_id = msg.message_id
-            set_last_msg(self.chat_id, msg.message_id)
             pid, master = pty.fork()
             if pid == 0:
                 try:
@@ -15872,17 +15919,14 @@ class UsqueKeeneticModule:
         self._leftovers = []
         self._buf = b''; self._last_edit = 0.0
         self._running = True; self._last_action = 'cleanup'
-        msg = await ctx.bot.send_message(
-            chat_id=self.chat_id,
-            text='\U0001f5d1 <b>Удаление остатков usque</b>\n\n<pre>запуск...</pre>',
-            parse_mode='HTML',
-            reply_markup=InlineKeyboardMarkup([
+        self._status_msg_id = await ui_edit_q(
+                q,
+                '\U0001f5d1 <b>Удаление остатков usque</b>\n\n<pre>запуск...</pre>',
+                kb=InlineKeyboardMarkup([
                 [InlineKeyboardButton('\U0001f6d1 Отменить',
                                       callback_data='usque_keenetic:kill')],
             ]),
-        )
-        self._status_msg_id = msg.message_id
-        set_last_msg(self.chat_id, msg.message_id)
+            )
         pid, master = pty.fork()
         if pid == 0:
             try:
@@ -16483,18 +16527,16 @@ class AwgManagerModule:
 
         if not token:
             err_text = '❌ Токен пуст. Попробуйте снова: /awg → Задать токен'
-            edited = False
             if last_id:
                 try:
                     await ctx.bot.edit_message_text(
                         chat_id=self.chat_id, message_id=last_id,
                         text=err_text,
                     )
-                    edited = True
+                    raise ApplicationHandlerStop
                 except Exception:
                     pass
-            if not edited:
-                await ctx.bot.send_message(chat_id=self.chat_id, text=err_text)
+            await ctx.bot.send_message(chat_id=self.chat_id, text=err_text)
             raise ApplicationHandlerStop
 
         if save_mcp_token(token):
@@ -16504,7 +16546,7 @@ class AwgManagerModule:
 
         text, kb = self._build_card()
 
-        edited = False
+        # Пытаемся отредактировать окно ввода токена (чтобы не плодить сообщения)
         if last_id:
             try:
                 await ctx.bot.edit_message_text(
@@ -16514,19 +16556,17 @@ class AwgManagerModule:
                     parse_mode='HTML',
                     reply_markup=kb,
                 )
-                edited = True
+                raise ApplicationHandlerStop
             except Exception as e:
                 log.debug('edit token result failed: %s', e)
 
         # Fallback, если отредактировать не удалось
-        if not edited:
-            await ctx.bot.send_message(
-                chat_id=self.chat_id,
-                text=header + text,
-                parse_mode='HTML',
-                reply_markup=kb,
-            )
-        
+        await ctx.bot.send_message(
+            chat_id=self.chat_id,
+            text=header + text,
+            parse_mode='HTML',
+            reply_markup=kb,
+        )
         raise ApplicationHandlerStop
 
     @staticmethod
