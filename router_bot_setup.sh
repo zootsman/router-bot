@@ -14,7 +14,7 @@ if [ ! -t 0 ]; then
     fi
 fi
 
-SETUP_VERSION="0.0.8"
+SETUP_VERSION="0.0.8-2"
 VERSION_FILE="/opt/router_bot/VERSION"
 INSTALLED_VERSION=""
 if [ -f "$VERSION_FILE" ]; then
@@ -23,16 +23,29 @@ fi
 
 ver_cmp() {
     v1="$1"; v2="$2"
-    a1=$(echo "$v1" | cut -d. -f1); b1=$(echo "$v1" | cut -d. -f2); c1=$(echo "$v1" | cut -d. -f3)
-    a2=$(echo "$v2" | cut -d. -f1); b2=$(echo "$v2" | cut -d. -f2); c2=$(echo "$v2" | cut -d. -f3)
+    base1="${v1%%-*}"; suf1=""
+    case "$v1" in *-*) suf1="${v1#*-}" ;; esac
+    base2="${v2%%-*}"; suf2=""
+    case "$v2" in *-*) suf2="${v2#*-}" ;; esac
+
+    a1=$(echo "$base1" | cut -d. -f1); b1=$(echo "$base1" | cut -d. -f2); c1=$(echo "$base1" | cut -d. -f3)
+    a2=$(echo "$base2" | cut -d. -f1); b2=$(echo "$base2" | cut -d. -f2); c2=$(echo "$base2" | cut -d. -f3)
     a1=${a1:-0}; b1=${b1:-0}; c1=${c1:-0}
     a2=${a2:-0}; b2=${b2:-0}; c2=${c2:-0}
+
     if [ "$a1" -lt "$a2" ]; then echo -1; return; fi
     if [ "$a1" -gt "$a2" ]; then echo 1; return; fi
     if [ "$b1" -lt "$b2" ]; then echo -1; return; fi
     if [ "$b1" -gt "$b2" ]; then echo 1; return; fi
     if [ "$c1" -lt "$c2" ]; then echo -1; return; fi
     if [ "$c1" -gt "$c2" ]; then echo 1; return; fi
+
+    n1=0
+    if [ -n "$suf1" ]; then case "$suf1" in *[!0-9]*) n1=0 ;; *) n1="$suf1" ;; esac; fi
+    n2=0
+    if [ -n "$suf2" ]; then case "$suf2" in *[!0-9]*) n2=0 ;; *) n2="$suf2" ;; esac; fi
+    if [ "$n1" -lt "$n2" ]; then echo -1; return; fi
+    if [ "$n1" -gt "$n2" ]; then echo 1; return; fi
     echo 0
 }
 
@@ -176,7 +189,7 @@ RB_MAIN_PY_EOF
 
 echo "  → VERSION"
 cat > /opt/router_bot/VERSION << 'RB_VERSION_EOF'
-0.0.8
+0.0.8-2
 RB_VERSION_EOF
 
 echo "  → core/__init__.py"
@@ -211,10 +224,14 @@ echo "  → core/main.py"
 cat > /opt/router_bot/core/main.py << 'RB_CORE_MAIN_PY_EOF'
 """Точка входа фреймворка router_bot."""
 import asyncio
+import json
 import logging
 import os
 import socket
 import subprocess
+import urllib.error
+import urllib.request
+from datetime import datetime, timedelta
 
 def _read_config_value(key, default=''):
     try:
@@ -234,6 +251,216 @@ if _disable_ipv6:
     def _ipv4_only(host, port, family=0, type=0, proto=0, flags=0):
         return _orig_getaddrinfo(host, port, socket.AF_INET, type, proto, flags)
     socket.getaddrinfo = _ipv4_only
+
+# ============================================================================
+#  Self-update (проверка версии на GitHub, скачивание, запуск)
+# ============================================================================
+
+_SETUP_URL = 'https://raw.githubusercontent.com/zootsman/router-bot/master/router_bot_setup.sh'
+_UPDATE_STATE_FILE = '/opt/router_bot/data/system/self_update.json'
+_UPDATE_LOG = '/opt/var/log/self_update.log'
+_UPDATE_SCRIPT = '/tmp/router_bot_setup_selfupdate.sh'
+_UPDATE_CHECK_INTERVAL = 6 * 3600
+_UPDATE_SNOOZE_DAYS = 7
+
+
+def _ver_cmp(v1: str, v2: str) -> int:
+    """Сравнивает версии с поддержкой -N. -1/0/1."""
+    def _split(v):
+        base, _, suf = v.partition('-')
+        try:
+            parts = [int(x) for x in base.split('.')]
+        except ValueError:
+            parts = [0, 0, 0]
+        while len(parts) < 3:
+            parts.append(0)
+        try:
+            n = int(suf) if suf else 0
+        except ValueError:
+            n = 0
+        return parts[:3], n
+    p1, n1 = _split(v1)
+    p2, n2 = _split(v2)
+    if p1 < p2: return -1
+    if p1 > p2: return 1
+    if n1 < n2: return -1
+    if n1 > n2: return 1
+    return 0
+
+
+def _read_current_version() -> str:
+    try:
+        with open('/opt/router_bot/VERSION') as f:
+            return f.read().strip().split('\n')[0].strip()
+    except Exception:
+        return ''
+
+
+def _load_update_state() -> dict:
+    try:
+        with open(_UPDATE_STATE_FILE) as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_update_state(data: dict):
+    try:
+        os.makedirs(os.path.dirname(_UPDATE_STATE_FILE), exist_ok=True)
+        with open(_UPDATE_STATE_FILE, 'w') as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        log.warning('save self-update state failed: %s', e)
+
+
+def _fetch_latest_version(timeout=10) -> str:
+    """Первые 4КБ с GitHub → SETUP_VERSION."""
+    import re
+    req = urllib.request.Request(_SETUP_URL, headers={'User-Agent': 'RouterBot-selfupdate'})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        buf = r.read(4096).decode('utf-8', errors='replace')
+    m = re.search(r'^SETUP_VERSION="([^"]+)"', buf, re.MULTILINE)
+    if not m:
+        raise RuntimeError('SETUP_VERSION не найден в первых 4КБ')
+    return m.group(1)
+
+
+def _download_and_verify(timeout=60) -> str:
+    """Скачивает setup.sh в /tmp и проверяет. Возвращает путь."""
+    req = urllib.request.Request(_SETUP_URL, headers={'User-Agent': 'RouterBot-selfupdate'})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        data = r.read()
+    if len(data) < 100_000:
+        raise RuntimeError(f'слишком маленький: {len(data)} байт')
+
+    with open(_UPDATE_SCRIPT, 'wb') as f:
+        f.write(data)
+    os.chmod(_UPDATE_SCRIPT, 0o755)
+
+    checks = []
+    r1 = subprocess.run(['sh', '-n', _UPDATE_SCRIPT], capture_output=True, timeout=10)
+    if r1.returncode != 0:
+        checks.append(f'sh -n: {(r1.stderr or b"").decode(errors="replace")[:120]}')
+    try:
+        with open(_UPDATE_SCRIPT, 'rb') as f:
+            head = f.read(200).decode('utf-8', errors='replace')
+            f.seek(0)
+            body = f.read().decode('utf-8', errors='replace')
+        if not head.startswith('#!/bin/sh'):
+            checks.append('shebang не #!/bin/sh')
+        if 'SETUP_VERSION=' not in body[:4096]:
+            checks.append('SETUP_VERSION не найден')
+        if 'RB_MAIN_PY_EOF' not in body:
+            checks.append('RB_MAIN_PY_EOF не найден (не установщик?)')
+    except Exception as e:
+        checks.append(f'содержимое: {e}')
+
+    if checks:
+        try:
+            os.unlink(_UPDATE_SCRIPT)
+        except Exception:
+            pass
+        raise RuntimeError('; '.join(checks))
+    return _UPDATE_SCRIPT
+
+
+def _spawn_self_update():
+    """Запускает self-update в фоне (отвязан от бота)."""
+    log_fp = open(_UPDATE_LOG, 'a')
+    env = os.environ.copy()
+    env['RB_NONINTERACTIVE'] = '1'
+    subprocess.Popen(
+        ['sh', _UPDATE_SCRIPT],
+        stdin=subprocess.DEVNULL,
+        stdout=log_fp,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+        env=env,
+    )
+    log.info('self-update: spawned %s (log: %s)', _UPDATE_SCRIPT, _UPDATE_LOG)
+
+
+async def _check_and_notify_self_update(app) -> bool:
+    current = _read_current_version()
+    if not current:
+        return False
+    try:
+        latest = await asyncio.to_thread(_fetch_latest_version)
+    except Exception as e:
+        log.info('self-update: fetch failed: %s', e)
+        return False
+
+    st = _load_update_state()
+    st['last_check'] = datetime.now().isoformat(timespec='seconds')
+
+    if _ver_cmp(latest, current) <= 0:
+        st.pop('last_notified_version', None)
+        st.pop('snoozed_until', None)
+        st.pop('never_notify_version', None)
+        _save_update_state(st)
+        log.info('self-update: up to date (%s)', current)
+        return False
+
+    if st.get('never_notify_version') == latest:
+        _save_update_state(st)
+        log.info('self-update: silenced for %s', latest)
+        return False
+    if st.get('last_notified_version') == latest:
+        _save_update_state(st)
+        log.info('self-update: already notified %s', latest)
+        return False
+    su = st.get('snoozed_until', '')
+    if su:
+        try:
+            if datetime.now() < datetime.fromisoformat(su):
+                _save_update_state(st)
+                log.info('self-update: snoozed until %s', su)
+                return False
+        except Exception:
+            pass
+
+    chat_id = app.bot_data.get('chat_id') or cfg('TG_CHAT_ID')
+    if not chat_id:
+        log.warning('self-update: chat_id неизвестен')
+        return False
+
+    text = (
+        '\U0001f195 <b>Доступно обновление Router Bot</b>\n\n'
+        f'Сейчас: <code>{current}</code>\n'
+        f'Новое:  <code>{latest}</code>\n\n'
+        '<i>Обновление скачается с GitHub и установится автоматически. '
+        'Бот перезапустится через 5–10 секунд.</i>'
+    )
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton('\u2b06\ufe0f Обновить сейчас',
+                              callback_data='router:update_now')],
+        [InlineKeyboardButton('\u23f0 Позже (7 дней)',
+                              callback_data='router:update_later')],
+        [InlineKeyboardButton('\u274c Не напоминать про эту версию',
+                              callback_data='router:update_never')],
+    ])
+    try:
+        await app.bot.send_message(chat_id=chat_id, text=text,
+                                   parse_mode='HTML', reply_markup=kb)
+        st['last_notified_version'] = latest
+        _save_update_state(st)
+        log.info('self-update: notified %s -> %s', current, latest)
+        return True
+    except Exception as e:
+        log.warning('self-update: notify failed: %s', e)
+        return False
+
+
+async def _self_update_loop(app):
+    """Фоновый цикл: первая проверка через 2 мин, потом раз в 6 часов."""
+    await asyncio.sleep(120)
+    while True:
+        try:
+            await _check_and_notify_self_update(app)
+        except Exception as e:
+            log.debug('self-update check failed: %s', e)
+        await asyncio.sleep(_UPDATE_CHECK_INTERVAL)
+
 # -----------------------------------------------------------------------
 
 from telegram import (
@@ -507,6 +734,128 @@ async def _cmd_mirrors(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         pass
 
 
+async def _cmd_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    msg = await update.message.reply_text('\U0001f50d Проверяю версию на GitHub...')
+    current = _read_current_version()
+    try:
+        latest = await asyncio.to_thread(_fetch_latest_version)
+    except Exception as e:
+        try:
+            await msg.edit_text(
+                f'\u274c Не удалось проверить: <code>{e}</code>',
+                parse_mode='HTML')
+        except Exception:
+            pass
+        return
+    if _ver_cmp(latest, current) <= 0:
+        try:
+            await msg.edit_text(
+                f'\u2705 <b>Актуальная версия</b>\n\n'
+                f'Текущая: <code>{current}</code>\n'
+                f'На GitHub: <code>{latest}</code>',
+                parse_mode='HTML')
+        except Exception:
+            pass
+        return
+    text = (
+        f'\U0001f195 <b>Доступно обновление</b>\n\n'
+        f'Сейчас: <code>{current}</code>\n'
+        f'Новое:  <code>{latest}</code>\n\n'
+        f'Обновить?'
+    )
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton('\u2b06\ufe0f Обновить сейчас',
+                              callback_data='router:update_now')],
+        [InlineKeyboardButton('\u23f0 Позже',
+                              callback_data='router:update_later')],
+        [InlineKeyboardButton('\u274c Отмена',
+                              callback_data='router:main')],
+    ])
+    try:
+        await msg.edit_text(text, parse_mode='HTML', reply_markup=kb)
+    except Exception:
+        pass
+
+
+async def _on_self_update_now(q, ctx):
+    await q.answer('Скачиваю...')
+    try:
+        await q.edit_message_text(
+            '\U0001f4e5 <b>Скачиваю и проверяю обновление...</b>\n\n'
+            '<i>Занимает ~10 секунд.</i>',
+            parse_mode='HTML')
+    except Exception:
+        pass
+    try:
+        path = await asyncio.to_thread(_download_and_verify)
+        log.info('self-update: downloaded %s (%d байт)', path, os.path.getsize(path))
+    except Exception as e:
+        log.exception('self-update: download failed: %s', e)
+        try:
+            await q.edit_message_text(
+                f'\u274c <b>Не удалось скачать обновление</b>\n\n'
+                f'<code>{e}</code>\n\n'
+                f'Попробуйте позже: /update',
+                parse_mode='HTML')
+        except Exception:
+            pass
+        return
+    try:
+        await q.edit_message_text(
+            '\u2705 <b>Обновление скачано и проверено</b>\n\n'
+            'Запускаю установку. Бот перезапустится через 5–10 секунд.\n'
+            'Напишите /start после этого.',
+            parse_mode='HTML')
+    except Exception:
+        pass
+    try:
+        _spawn_self_update()
+    except Exception as e:
+        log.exception('spawn failed: %s', e)
+        try:
+            await ctx.bot.send_message(
+                chat_id=q.message.chat_id,
+                text=f'\u274c Не удалось запустить: {e}\n\n'
+                     f'Запустите вручную:\n'
+                     f'<code>sh /tmp/router_bot_setup_selfupdate.sh</code>',
+                parse_mode='HTML')
+        except Exception:
+            pass
+
+
+async def _on_self_update_later(q, ctx):
+    st = _load_update_state()
+    until = (datetime.now() + timedelta(days=_UPDATE_SNOOZE_DAYS)).isoformat(timespec='seconds')
+    st['snoozed_until'] = until
+    _save_update_state(st)
+    await q.answer(f'Напомню через {_UPDATE_SNOOZE_DAYS} дней')
+    try:
+        await q.edit_message_text(
+            f'\u23f0 <b>Напомню позже</b>\n\n'
+            f'До: <code>{until[:10]}</code>\n\n'
+            f'Проверить вручную: /update',
+            parse_mode='HTML')
+    except Exception:
+        pass
+
+
+async def _on_self_update_never(q, ctx):
+    st = _load_update_state()
+    latest = st.get('last_notified_version', '')
+    if latest:
+        st['never_notify_version'] = latest
+    _save_update_state(st)
+    await q.answer('Уведомления отключены для этой версии')
+    try:
+        await q.edit_message_text(
+            '\u274c <b>Уведомления отключены</b>\n\n'
+            '<i>При выходе следующей версии напоминание придёт снова.</i>\n'
+            'Проверить вручную: /update',
+            parse_mode='HTML')
+    except Exception:
+        pass
+
+
 async def _on_mirrors(q, ctx):
     """Callback router:mirrors — открывает карточку зеркал."""
     await q.answer('Проверяю зеркала...')
@@ -569,6 +918,7 @@ async def _cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     lines.append('/restart \u2014 перезапуск бота')
     lines.append('/reboot  \u2014 перезагрузка роутера')
     lines.append('/mirrors \u2014 проверка зеркал Entware')
+    lines.append('/update  \u2014 проверка обновления бота')
 
     mod_cmds = []
     if 'net_watch' in enabled:
@@ -595,6 +945,8 @@ async def _cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         mod_cmds.append('/nf      \u2014 NeoFit')
     if 'usque_keenetic' in enabled:
         mod_cmds.append('/usque   \u2014 Usque WARP')
+    if 'awg_manager' in enabled:
+        mod_cmds.append('/awg     \u2014 AWG Manager')
 
     if mod_cmds:
         lines.append('')
@@ -674,6 +1026,10 @@ async def _cmd_usque(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await _open_module_card(update, ctx, 'usque_keenetic', '\u2601\ufe0f', 'Usque WARP')
 
 
+async def _cmd_awg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    await _open_module_card(update, ctx, 'awg_manager', '\U0001f6e1', 'AWG Manager')
+
+
 async def _on_router_main(query, ctx):
     """Callback 'router:main' — возврат в главное меню."""
     await query.answer()
@@ -699,6 +1055,7 @@ async def post_init(app):
         BotCommand('restart', '\U0001f504 Перезапуск бота'),
         BotCommand('reboot',  '\U0001f504 Перезагрузка роутера'),
         BotCommand('mirrors', '\U0001f30d Проверка зеркал Entware'),
+        BotCommand('update',  '\U0001f195 Проверить обновление'),
     ]
     if 'net_watch' in enabled_names:
         cmds.append(BotCommand('net', '\U0001f4e1 Net Watch'))
@@ -722,6 +1079,8 @@ async def post_init(app):
         cmds.append(BotCommand('nf', '\U0001f500 NeoFit'))
     if 'usque_keenetic' in enabled_names:
         cmds.append(BotCommand('usque', '\u2601\ufe0f Usque WARP'))
+    if 'awg_manager' in enabled_names:
+        cmds.append(BotCommand('awg', '\U0001f6e1 AWG Manager'))
     for mod in router.all():
         for cmd, desc in getattr(mod, 'commands', []):
             cmds.append(BotCommand(cmd, desc))
@@ -739,6 +1098,11 @@ async def post_init(app):
         except Exception as e:
             log.exception('Module %s startup failed: %s', mod.name, e)
 
+    # 3. Фоновый цикл self-update
+    app.bot_data['chat_id'] = cfg('TG_CHAT_ID')
+    asyncio.create_task(_self_update_loop(app))
+    log.info('self-update loop started (interval %ss)', _UPDATE_CHECK_INTERVAL)
+
     log.info('Router bot started')
 
 
@@ -750,10 +1114,20 @@ def main():
             logging.FileHandler('/opt/var/log/router_bot.log'),
         ],
     )
-    for noisy in ('httpx', 'httpcore', 'telegram.ext.Updater', 'telegram.request'):
+    for noisy in ('httpx', 'httpcore'):
         logging.getLogger(noisy).setLevel(logging.CRITICAL)
+    for tlog in ('telegram.ext.Updater', 'telegram.request'):
+        logging.getLogger(tlog).setLevel(logging.WARNING)
 
     load_config()
+
+    # Проверка сети при старте
+    try:
+        import socket as _s
+        _s.create_connection(('149.154.166.110', 443), timeout=5).close()
+        log.info('Telegram API: доступен (IPv4)')
+    except Exception as _e:
+        log.warning('Telegram API: НЕДОСТУПЕН (%s)', _e)
 
     token = cfg('TG_BOT_TOKEN')
     chat_id = cfg('TG_CHAT_ID')
@@ -781,6 +1155,7 @@ def main():
         'keen_pbr': ('modules.keen_pbr.module', 'KeenPbrModule'),
         'neofit': ('modules.neofit.module', 'NeoFitModule'),
         'usque_keenetic': ('modules.usque_keenetic.module', 'UsqueKeeneticModule'),
+        'awg_manager': ('modules.awg_manager.module', 'AwgManagerModule'),
     }
     for _mname in enabled_set:
         if _mname not in _MODULES_MAP:
@@ -807,6 +1182,7 @@ def main():
     app.add_handler(CommandHandler('restart', _cmd_restart))
     app.add_handler(CommandHandler('reboot', _cmd_reboot))
     app.add_handler(CommandHandler('mirrors', _cmd_mirrors))
+    app.add_handler(CommandHandler('update', _cmd_update))
 
     enabled_names = {m.name for m in router.all()}
     if 'net_watch' in enabled_names:
@@ -831,6 +1207,8 @@ def main():
         app.add_handler(CommandHandler('nf', _cmd_nf))
     if 'usque_keenetic' in enabled_names:
         app.add_handler(CommandHandler('usque', _cmd_usque))
+    if 'awg_manager' in enabled_names:
+        app.add_handler(CommandHandler('awg', _cmd_awg))
 
     # Общий callback — обрабатывает router:main отдельно, остальное — в роутер
     async def _global_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1317,6 +1695,7 @@ show_help() {
     follow, f        Лог в реальном времени (Ctrl+C — выход)
     version, v       Версия бота
     ipv6 [on|off]    Вкл/выкл IPv6 (off = только IPv4)
+    tgtest           Диагностика сети Telegram
     config, c        Конфиг: показать/править/восстановить
     modules, m       Включённые модули
     routes           Маршруты Telegram (table 16385)
@@ -1432,7 +1811,7 @@ do_config_init() {
         echo ""
         printf "  Продолжить? (y/N): "
         read _r
-        _r=$(printf "%s" "$_r" | tr -cd '[:print:]')
+        _r=$(printf "%s" "$_r" | tr -cd '\040-\176')
         case "$_r" in
             y|Y) ;;
             *) echo ""; echo "  ⏹  Отменено — config.env не изменён"; return 1 ;;
@@ -1556,7 +1935,7 @@ PYEOF
     done
 
     # --- 3. Модули ---
-    _all_mods="net_watch,ssh_control,system,hydraroute,flashkeen,xkeen,bird,mtproxy,keen_pbr,neofit,usque_keenetic"
+    _all_mods="net_watch,ssh_control,system,hydraroute,flashkeen,xkeen,bird,mtproxy,keen_pbr,neofit,usque_keenetic,awg_manager"
     echo ""
     echo "  Доступные модули:"
     echo "    net_watch ssh_control system hydraroute flashkeen xkeen"
@@ -1774,7 +2153,7 @@ do_config_tun() {
 
     printf "  Перенастроить туннель? (y/N): "
     read _r
-    _r=$(printf "%s" "$_r" | tr -cd '[:print:]')
+    _r=$(printf "%s" "$_r" | tr -cd '\040-\176')
     case "$_r" in
         y|Y) ;;
         *) _abort; return 1 ;;
@@ -1862,7 +2241,7 @@ do_config_tun() {
         echo "  ⚠️  Туннель $_new_vpn_if в состоянии DOWN"
         printf "  Продолжить с ним? (y/N): "
         read _c
-        _c=$(printf "%s" "$_c" | tr -cd '[:print:]')
+        _c=$(printf "%s" "$_c" | tr -cd '\040-\176')
         if [ "$_c" != "y" ] && [ "$_c" != "Y" ]; then
             _abort; return 1
         fi
@@ -1872,7 +2251,7 @@ do_config_tun() {
     if [ -z "$_new_vpn_src" ]; then
         printf "  Введите IP туннеля %s: " "$_new_vpn_if"
         read _new_vpn_src
-        _new_vpn_src=$(printf "%s" "$_new_vpn_src" | tr -cd '[:print:]')
+        _new_vpn_src=$(printf "%s" "$_new_vpn_src" | tr -cd '\040-\176')
         if [ -z "$_new_vpn_src" ]; then
             _abort; return 1
         fi
@@ -1897,7 +2276,7 @@ do_config_tun() {
         echo "  ❌ Через $_new_vpn_if доступа нет"
         printf "  Сохранить выбор всё равно? (y/N): "
         read _c
-        _c=$(printf "%s" "$_c" | tr -cd '[:print:]')
+        _c=$(printf "%s" "$_c" | tr -cd '\040-\176')
         if [ "$_c" != "y" ] && [ "$_c" != "Y" ]; then
             _abort; return 1
         fi
@@ -2129,9 +2508,10 @@ do_modules() {
         echo "  Включённые модули (ENABLED_MODULES):"
         echo "    $ENABLED_MODULES"
         echo ""
-        echo "  Всего модулей в проекте: 11"
+        echo "  Всего модулей в проекте: 12"
         echo "    net_watch, ssh_control, system, hydraroute, flashkeen,"
-        echo "    xkeen, bird, mtproxy, keen_pbr, neofit, usque_keenetic"
+        echo "    xkeen, bird, mtproxy, keen_pbr, neofit, usque_keenetic,"
+        echo "    awg_manager"
     else
         echo "config.env не найден"
     fi
@@ -2207,6 +2587,34 @@ case "$1" in
     modules|m)
         do_modules
         ;;
+    tgtest)
+        echo ""
+        echo "  === Диагностика Telegram ==="
+        echo ""
+        printf "  1. DNS: "
+        if /opt/bin/python3 -c "import socket; print(socket.gethostbyname('api.telegram.org'))" 2>/dev/null; then
+            :
+        else
+            echo "ОШИБКА"
+        fi
+        printf "  2. TCP (443): "
+        if /opt/bin/python3 -c "import socket; s=socket.create_connection(('149.154.166.110',443),timeout=5); s.close()" 2>/dev/null; then
+            echo "OK"
+        else
+            echo "ОШИБКА"
+        fi
+        printf "  3. HTTP getMe: "
+        TOKEN=$(sed -n "s/^TG_BOT_TOKEN='\(.*\)'/\1/p" "$CONF")
+        CODE=$(/opt/bin/curl -s -o /dev/null -w "%{http_code}" --connect-timeout 5 --max-time 10 "https://api.telegram.org/bot${TOKEN}/getMe")
+        echo "HTTP $CODE"
+        printf "  4. Маршрут к TG: "
+        ip route get 149.154.166.110 2>/dev/null | head -1
+        echo ""
+        echo "  5. ip rule (table 16385):"
+        ip rule show | grep 16385 | sed 's/^/     /' || echo "     (пусто)"
+        echo ""
+        ;;
+
     ipv6)
         _v6="$2"
         if [ "$_v6" = "on" ]; then
@@ -6022,6 +6430,42 @@ class SystemModule:
             await self._fw_start(q, ctx, self._fw_login, self._fw_password,
                                  save_msg='ℹ️ Логин/пароль не сохранены')
             return
+
+    async def _fw_start(self, q, ctx, login, password, save_msg=''):
+        """Запускает обновление KeeneticOS через ndmc с переданными кредами.
+        Показывает пользователю сообщение о старте.
+        """
+        self._fw_state = None
+
+        header = (
+            '\u2b06\ufe0f <b>Обновление запущено</b>\n\n'
+            'Команда передана ядру KeeneticOS через ndmc.\n'
+            'Роутер начнёт обновление и перезагрузится '
+            'в течение 30–180 секунд.\n'
+            'Не выключайте питание.\n\n'
+        )
+        footer = (
+            '<i>Если через 3 минуты роутер не перезагрузился — '
+            'проверьте вручную: Система → Обновление ПО.</i>\n'
+            '<i>После перезагрузки напишите /start.</i>'
+        )
+        if save_msg:
+            text = header + save_msg + '\n\n' + footer
+        else:
+            text = header + footer
+
+        try:
+            await q.edit_message_text(text, parse_mode='HTML')
+        except Exception as e:
+            log.warning('_fw_start edit failed: %s', e)
+
+        try:
+            start_firmware_update(login=login or 'admin',
+                                  password=password or '')
+            log.info('_fw_start: firmware update scheduled (login=%s)',
+                     login or 'admin')
+        except Exception as e:
+            log.exception('_fw_start: start_firmware_update failed: %s', e)
 RB_MODULES_SYSTEM_MODULE_PY_EOF
 
 echo "  → modules/hydraroute/__init__.py"
@@ -6223,9 +6667,9 @@ class HydraRouteModule:
         self._running = False
         self._awaiting_answer = False
 
-    def send_card_message(self, update, ctx):
+    async def send_card_message(self, update, ctx):
         text, kb = self._build_card()
-        return update.message.reply_text(text, parse_mode='HTML', reply_markup=kb)
+        await update.message.reply_text(text, parse_mode='HTML', reply_markup=kb)
 
     conflicts_with = {
         'xkeen': 'оба используют /opt/etc/xray и запускают демон xray',
@@ -6397,6 +6841,10 @@ class HydraRouteModule:
                 if 'not modified' not in str(e).lower():
                     raise
             return
+
+        if action == 'ask:mcp_token':
+            await q.answer()
+            return await self._ask_mcp_token(q, ctx)
 
         if action.startswith('ask:'):
             key = action[4:]
@@ -10161,8 +10609,6 @@ class BirdModule:
                 await q.answer('Неизвестное действие', show_alert=True)
                 return
             desc = a['desc']
-            if key == 'install':
-                desc = desc.replace('&lt;IP роутера&gt;', get_router_ip())
             text = (
                 f'{a["icon"]} <b>{a["title"]}</b>\n\n'
                 f'{desc}\n\n'
@@ -11716,7 +12162,7 @@ class MTProxyModule:
         parts = []
         total = len(self._leftovers)
         for p in self._leftovers:
-            safe = p.replace("'", "'\\\\''")
+            safe = p.replace("'", "'\\''")
             parts.append(f"echo 'Удаляю: {safe}' ; rm -rf '{safe}'")
         parts.append(f"echo '' ; echo 'Готово: удалено {total} элементов'")
         cmd = ' ; '.join(parts)
@@ -12730,7 +13176,7 @@ class KeenPbrModule:
         parts = []
         total = len(self._leftovers)
         for p in self._leftovers:
-            safe = p.replace("'", "'\\\\''")
+            safe = p.replace("'", "'\\''")
             parts.append(f"echo 'Удаляю: {safe}' ; rm -rf '{safe}'")
         parts.append(f"echo '' ; echo 'Готово: удалено {total} элементов'")
         cmd = ' ; '.join(parts)
@@ -13022,7 +13468,7 @@ import re
 import time
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import ContextTypes
+from telegram.ext import ContextTypes, MessageHandler, filters, ApplicationHandlerStop
 
 from .actions import (
     ACTIONS, UNINSTALL_CMD, UNINSTALL_TARGETS, SCAN_PATTERNS,
@@ -13577,7 +14023,7 @@ class NeoFitModule:
         parts = []
         total = len(self._leftovers)
         for p in self._leftovers:
-            safe = p.replace("'", "'\\\\''")
+            safe = p.replace("'", "'\\''")
             parts.append(f"echo 'Удаляю: {safe}' ; rm -rf '{safe}'")
         parts.append(f"echo '' ; echo 'Готово: удалено {total} элементов'")
         cmd = ' ; '.join(parts)
@@ -13874,7 +14320,9 @@ cat > /opt/router_bot/modules/usque_keenetic/module.py << 'RB_MODULES_USQUE_KEEN
 """Модуль usque-keenetic — Cloudflare WARP (MASQUE) для Keenetic."""
 import asyncio, html, logging, os, pty, re, time
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import ContextTypes
+from telegram.ext import (
+    ContextTypes, MessageHandler, filters,
+)
 
 from .actions import (
     ACTIONS, UNINSTALL_CMD, UNINSTALL_TARGETS, SCAN_PATTERNS, USQUE_CONF,
@@ -13922,12 +14370,18 @@ class UsqueKeeneticModule:
         self._last_action = None
         self._uninstall_opts = {}
         self._leftovers = []
+        self._editing = False
 
     async def startup(self, app):
+        app.add_handler(MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            self._handle_text,
+        ))
         log.info('Usque-keenetic module started')
 
     async def on_leave(self):
         self._kill()
+        self._editing = False
 
     def _kill(self):
         import signal
@@ -14069,6 +14523,9 @@ class UsqueKeeneticModule:
         if action == 'show_config':
             await q.answer()
             return await self._show_config(q, ctx)
+        if action == 'edit_config':
+            await q.answer()
+            return await self._ask_new_config(q, ctx)
         if action == 'ask:uninstall':
             await q.answer()
             return await self._show_uninstall_menu(q, ctx)
@@ -14374,6 +14831,62 @@ class UsqueKeeneticModule:
             if 'not modified' not in str(e).lower():
                 raise
 
+
+    async def _ask_new_config(self, q, ctx):
+        self._editing = True
+        text = (
+            '\u270f\ufe0f <b>Пришлите новый конфиг</b>\n\n'
+            f'Следующим сообщением отправьте полный текст файла\n'
+            f'<code>{USQUE_CONF}</code>.\n\n'
+            '\u26a0\ufe0f Текущий конфиг будет сохранён в <code>.bak</code>.\n'
+            'После записи перезапустите сервис для применения.'
+        )
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton('\u274c Отмена',
+                                  callback_data='usque_keenetic:main')],
+        ])
+        try:
+            await q.edit_message_text(text, parse_mode='HTML', reply_markup=kb)
+        except Exception as e:
+            if 'not modified' not in str(e).lower():
+                raise
+
+    async def _handle_text(self, update, ctx):
+        if str(update.effective_chat.id) != self.chat_id:
+            return
+        if not self._editing:
+            return
+        text = update.message.text or ''
+        if not text.strip():
+            return
+        try:
+            import shutil
+            if os.path.exists(USQUE_CONF):
+                shutil.copy(USQUE_CONF, USQUE_CONF + '.bak')
+            os.makedirs(os.path.dirname(USQUE_CONF), exist_ok=True)
+            with open(USQUE_CONF, 'w') as f:
+                f.write(text)
+            self._editing = False
+            await update.message.reply_text(
+                f'\u2705 Конфиг сохранён.\n'
+                f'Резервная копия: <code>{USQUE_CONF}.bak</code>\n\n'
+                f'Перезапустите сервис для применения.',
+                parse_mode='HTML',
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton(
+                        '\U0001f504 Перезапустить',
+                        callback_data='usque_keenetic:ask:restart')],
+                    [InlineKeyboardButton(
+                        '\u2b05\ufe0f Назад',
+                        callback_data='usque_keenetic:main')],
+                ]),
+            )
+        except Exception as e:
+            self._editing = False
+            log.exception('save config failed: %s', e)
+            await update.message.reply_text(
+                f'\u274c Не удалось сохранить: {e}')
+
     async def _check_leftovers(self, ctx):
         try: leftovers = scan_leftovers(SCAN_PATTERNS)
         except Exception as e:
@@ -14392,7 +14905,7 @@ class UsqueKeeneticModule:
         parts = []
         total = len(self._leftovers)
         for p in self._leftovers:
-            safe = p.replace("'", "'\\\\''")
+            safe = p.replace("'", "'\\''")
             parts.append(f"echo 'Удаляю: {safe}' ; rm -rf '{safe}'")
         parts.append(f"echo '' ; echo 'Готово: удалено {total} элементов'")
         cmd = ' ; '.join(parts)
@@ -14571,10 +15084,676 @@ UNINSTALL_TARGETS = [
 SCAN_PATTERNS = ['*usque*', '*Usque*']
 RB_MODULES_USQUE_KEENETIC_ACTIONS_PY_EOF
 
+echo "  → modules/awg_manager/__init__.py"
+cat > /opt/router_bot/modules/awg_manager/__init__.py << 'RB_MODULES_AWG___INIT___PY_EOF'
+
+RB_MODULES_AWG___INIT___PY_EOF
+
+echo "  → modules/awg_manager/actions.py"
+cat > /opt/router_bot/modules/awg_manager/actions.py << 'RB_MODULES_AWG_ACTIONS_PY_EOF'
+"""Действия модуля AWG Manager (AmneziaWG / Sing-box)."""
+import json
+import os
+import subprocess
+
+MCP_URL = 'http://127.0.0.1:2222/mcp'
+WEB_PORT = 2222
+
+INIT_SCRIPT = '/opt/etc/init.d/S99awg-manager'
+BIN_PATH = '/opt/bin/awg-manager'
+CONF_DIR = '/opt/etc/awg-manager'
+LOG_FILE = '/opt/var/log/awg-manager.log'
+
+INSTALL_CMD = (
+    'opkg update && '
+    'opkg install awg-manager'
+)
+
+UNINSTALL_CMD = (
+    'opkg remove --force-removal-of-dependent-packages '
+    '--autoremove awg-manager 2>&1 || true'
+)
+
+SERVICE_START   = f'/opt/sbin/start-stop-daemon -S -b -x {INIT_SCRIPT} -- start 2>&1; sleep 2; {INIT_SCRIPT} status 2>&1'
+SERVICE_STOP    = f'{INIT_SCRIPT} stop 2>&1'
+SERVICE_RESTART = f'{INIT_SCRIPT} stop 2>&1; sleep 1; /opt/sbin/start-stop-daemon -S -b -x {INIT_SCRIPT} -- start 2>&1; sleep 2; {INIT_SCRIPT} status 2>&1'
+SERVICE_STATUS  = f'{INIT_SCRIPT} status 2>&1'
+
+CMD_VERSION = 'opkg list-installed 2>/dev/null | grep "^awg-manager "'
+CMD_LOGS = 'tail -n 60 /opt/var/log/awg-manager.log 2>/dev/null || (ndmc -c "show log" 2>/dev/null | grep -i awg-manager | tail -n 60) || echo "Логи пусты"'
+
+
+def is_installed() -> bool:
+    try:
+        r = subprocess.run(
+            ['sh', '-c', 'opkg list-installed 2>/dev/null | grep -q "^awg-manager "'],
+            timeout=5,
+        )
+        if r.returncode == 0:
+            return True
+    except Exception:
+        pass
+    return os.path.exists(INIT_SCRIPT) or os.path.exists(BIN_PATH)
+
+
+def is_running() -> bool:
+    try:
+        r = subprocess.run(
+            ['sh', '-c', 'ps w | grep -E "[a]wg-manager" | grep -v grep | wc -l'],
+            capture_output=True, text=True, timeout=5,
+        )
+        return int((r.stdout or '0').strip()) > 0
+    except Exception:
+        return False
+
+
+def get_version() -> str:
+    try:
+        r = subprocess.run(
+            ['sh', '-c', CMD_VERSION],
+            capture_output=True, text=True, timeout=5,
+        )
+        for line in (r.stdout or '').splitlines():
+            parts = line.split()
+            if len(parts) >= 3 and parts[0] == 'awg-manager':
+                return parts[2]
+    except Exception:
+        pass
+    return ''
+
+
+def get_status_short() -> str:
+    if not is_installed():
+        return '❌'
+    if is_running():
+        return '🟢'
+    return '🔴'
+
+
+def get_router_ip() -> str:
+    from core.utils import get_router_ip as _g
+    return _g()
+
+
+def get_awg_web_url() -> str:
+    return f'http://{get_router_ip()}:{WEB_PORT}'
+
+
+def get_mcp_token() -> str:
+    from core.config import get as cfg
+    return cfg('AWG_MCP_TOKEN', '')
+
+
+# --- Действия для UI ---
+ACTIONS = {
+    'install': {
+        'title': 'Установка AWG Manager',
+        'icon': '⬇️',
+        'desc': (
+            'Установит AWG Manager — веб-панель и MCP-сервер '
+            'для управления туннелями AmneziaWG и Sing-box.\n\n'
+            'Web UI: <code>http://&lt;router-ip&gt;:2222</code>'
+        ),
+        'cmd': INSTALL_CMD,
+    },
+    'uninstall': {
+        'title': 'Удаление AWG Manager',
+        'icon': '🗑',
+        'desc': (
+            'Будет удалён пакет <code>awg-manager</code>.\n\n'
+            '⚠️ Конфиги в <code>/opt/etc/awg-manager/</code> останутся.'
+        ),
+        'cmd': UNINSTALL_CMD,
+        'danger': True,
+    },
+    'start':    {'title': 'Запуск',    'icon': '▶️', 'desc': 'Команда: <code>S99awg-manager start</code>', 'cmd': SERVICE_START},
+    'stop':     {'title': 'Остановка', 'icon': '⏹', 'desc': 'Команда: <code>S99awg-manager stop</code>',  'cmd': SERVICE_STOP},
+    'restart':  {'title': 'Перезапуск', 'icon': '🔄', 'desc': 'Команда: <code>S99awg-manager restart</code>', 'cmd': SERVICE_RESTART},
+    'status':   {'title': 'Статус',    'icon': '📊', 'desc': 'Команда: <code>S99awg-manager status</code>', 'cmd': SERVICE_STATUS},
+    'version':  {'title': 'Версия',    'icon': '📄', 'desc': 'Версия пакета awg-manager', 'cmd': CMD_VERSION},
+    'logs':     {'title': 'Логи',      'icon': '📜', 'desc': 'Последние 60 строк лога', 'cmd': CMD_LOGS},
+}
+
+
+# ================= Описание целей удаления =================
+
+UNINSTALL_TARGETS = [
+    {
+        'key': 'bin',
+        'desc': 'Бинарник awg-manager',
+        'paths': ['/opt/bin/awg-manager', '/opt/sbin/awg-manager'],
+        'cmd': 'rm -f /opt/bin/awg-manager /opt/sbin/awg-manager',
+    },
+    {
+        'key': 'init',
+        'desc': 'Init-скрипт S99awg-manager',
+        'paths': ['/opt/etc/init.d/S99awg-manager'],
+        'cmd': 'rm -f /opt/etc/init.d/S99awg-manager',
+    },
+    {
+        'key': 'configs',
+        'desc': 'Конфиги /opt/etc/awg-manager',
+        'paths': ['/opt/etc/awg-manager'],
+        'cmd': 'rm -rf /opt/etc/awg-manager',
+    },
+    {
+        'key': 'logs',
+        'desc': 'Логи и runtime',
+        'paths': ['/opt/var/log/awg-manager*', '/opt/var/run/awg-manager*'],
+        'cmd': 'rm -rf /opt/var/log/awg-manager* /opt/var/run/awg-manager*',
+    },
+    {
+        'key': 'opkg',
+        'desc': 'Метаданные opkg',
+        'paths': ['/opt/lib/opkg/info/awg-manager*'],
+        'cmd': 'rm -rf /opt/lib/opkg/info/awg-manager*',
+    },
+]
+
+SCAN_PATTERNS = ['*awg-manager*', '*awg_manager*']
+
+CONFIG_PATH = '/opt/router_bot/config.env'
+
+def save_mcp_token(token: str) -> bool:
+    """Сохраняет MCP-токен в config.env и обновляет os.environ."""
+    import os
+    try:
+        lines = []
+        found = False
+        if os.path.exists(CONFIG_PATH):
+            with open(CONFIG_PATH) as f:
+                for line in f:
+                    if line.startswith('AWG_MCP_TOKEN='):
+                        lines.append(f"AWG_MCP_TOKEN='{token}'\n")
+                        found = True
+                    else:
+                        lines.append(line)
+        if not found:
+            lines.append(f"\n# AWG Manager MCP-токен\nAWG_MCP_TOKEN='{token}'\n")
+        tmp = CONFIG_PATH + '.tmp'
+        with open(tmp, 'w') as f:
+            f.writelines(lines)
+        os.replace(tmp, CONFIG_PATH)
+        os.environ['AWG_MCP_TOKEN'] = token
+        return True
+    except Exception as e:
+        import logging
+        logging.getLogger(__name__).warning('save_mcp_token failed: %s', e)
+        return False
+
+RB_MODULES_AWG_ACTIONS_PY_EOF
+
+echo "  → modules/awg_manager/module.py"
+cat > /opt/router_bot/modules/awg_manager/module.py << 'RB_MODULES_AWG_MODULE_PY_EOF'
+"""Модуль AWG Manager — управление AmneziaWG / Sing-box."""
+import logging
+
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.ext import (
+    ContextTypes, MessageHandler, filters, ApplicationHandlerStop,
+)
+
+from core.utils import (
+    existing_targets, sync_opts, build_uninstall_menu,
+    collect_uninstall_cmd, toggle_opt,
+    scan_leftovers, build_leftovers_message,
+)
+
+from .actions import (
+    ACTIONS, INSTALL_CMD, UNINSTALL_CMD,
+    UNINSTALL_TARGETS, SCAN_PATTERNS,
+    is_installed, is_running, get_version, get_status_short,
+    get_awg_web_url, get_mcp_token,
+    SERVICE_START, SERVICE_STOP, SERVICE_RESTART, SERVICE_STATUS, CMD_LOGS,
+    MCP_URL, save_mcp_token,
+)
+
+log = logging.getLogger(__name__)
+
+
+class AwgManagerModule:
+    name = 'awg_manager'
+    title = 'AWG Manager'
+    icon = '🛡'
+    description = 'AmneziaWG / Sing-box управление'
+    category = 'services'
+    category_title = 'Сервис'
+    category_icon = '🛠'
+    conflicts_with = {
+        'xkeen': 'оба занимают маршрутизацию и nftables-метки',
+        'hydraroute': 'оба используют nftables/iptables для маршрутизации',
+        'keen_pbr': 'оба занимают policy-routing и nftables',
+        'usque_keenetic': 'оба занимают туннели/маршрутизацию',
+    }
+    commands = []
+
+    def __init__(self, chat_id):
+        self.chat_id = str(chat_id)
+        self._awaiting_token = False
+        self._uninstall_opts = {}
+        self._leftovers = []
+        self._status_msg_id = None
+        self._running = False
+
+    async def startup(self, app):
+        app.add_handler(MessageHandler(
+            filters.TEXT & ~filters.COMMAND,
+            self._handle_text,
+        ), group=-3)
+        log.info('AWG Manager module started')
+
+    async def on_leave(self):
+        self._uninstall_opts = {}
+        self._leftovers = []
+
+    def get_installed(self) -> bool:
+        return is_installed()
+
+    def get_status_short(self) -> str:
+        return get_status_short()
+
+    # ================= UI =================
+
+    def _build_card(self):
+        installed = is_installed()
+        running = is_running()
+        version = get_version() if installed else ''
+
+        lines = [f'{self.icon} <b>{self.title}</b>', '']
+        if installed:
+            v = f' · <code>{version}</code>' if version else ''
+            lines.append(f'✅ Установлен{v}')
+            lines.append('Сервис: ' + ('🟢 работает' if running else '🔴 остановлен'))
+            url = get_awg_web_url()
+            lines.append(f'Web UI: <a href="{url}">{url}</a>')
+            if get_mcp_token():
+                lines.append('MCP: <code>токен задан</code>')
+            else:
+                lines.append('MCP: <i>токен не задан</i>')
+        else:
+            lines.append('❌ Не установлен')
+            warns = []
+            if self._proc_check('xray'): warns.append('XKeen/HR (xray)')
+            if self._proc_check('keen-pbr'): warns.append('Keen-PBR')
+            if self._proc_check('usque'): warns.append('Usque WARP')
+            if warns:
+                lines.append('')
+                lines.append('⚠️ <b>Активные конфликты:</b>')
+                for w in warns:
+                    lines.append(f'  • {w}')
+        lines.append('')
+
+        rows = []
+        if not installed:
+            rows.append([InlineKeyboardButton(
+                '⬇️ Установить AWG Manager',
+                callback_data='awg_manager:ask:install')])
+        else:
+            if running:
+                rows.append([
+                    InlineKeyboardButton('⏹ Остановить', callback_data='awg_manager:ask:stop'),
+                    InlineKeyboardButton('🔄 Перезапустить', callback_data='awg_manager:ask:restart'),
+                ])
+            else:
+                rows.append([InlineKeyboardButton(
+                    '▶️ Запустить', callback_data='awg_manager:ask:start')])
+            rows.append([
+                InlineKeyboardButton('📊 Статус', callback_data='awg_manager:ask:status'),
+                InlineKeyboardButton('📜 Логи', callback_data='awg_manager:ask:logs'),
+            ])
+            if get_mcp_token():
+                rows.append([InlineKeyboardButton('🔑 Изменить MCP токен', callback_data='awg_manager:ask:mcp_token')])
+            else:
+                rows.append([InlineKeyboardButton('🔑 Задать MCP токен', callback_data='awg_manager:ask:mcp_token')])
+            rows.append([InlineKeyboardButton(
+                '🗑 Удалить AWG Manager',
+                callback_data='awg_manager:ask:uninstall')])
+        rows.append([InlineKeyboardButton(
+            '🔄 Обновить карточку', callback_data='awg_manager:main')])
+        rows.append([
+            InlineKeyboardButton('⬅️ Назад', callback_data='router:cat:services'),
+            InlineKeyboardButton('🏠 Модули', callback_data='router:main'),
+        ])
+        return '\n'.join(lines), InlineKeyboardMarkup(rows)
+
+    async def _ask_mcp_token(self, q, ctx):
+        self._awaiting_token = True
+        text = (
+            '🔑 <b>Ввод MCP-токена</b>\n\n'
+            'Отправьте токен следующим сообщением.\n'
+            '<i>Сообщение с токеном будет сразу удалено.</i>\n\n'
+            'Получить токен: веб-интерфейс AWG Manager → Настройки → MCP-сервер.'
+        )
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton('❌ Отмена', callback_data='awg_manager:main')]
+        ])
+        try:
+            await q.edit_message_text(text, parse_mode='HTML', reply_markup=kb)
+        except Exception as e:
+            if 'not modified' not in str(e).lower():
+                log.debug('ask_mcp_token edit failed: %s', e)
+
+    async def _handle_text(self, update, ctx):
+        if str(update.effective_chat.id) != self.chat_id:
+            return
+        if not self._awaiting_token:
+            return
+
+        token = (update.message.text or '').strip()
+        try:
+            await update.message.delete()
+        except Exception:
+            pass
+
+        if not token:
+            self._awaiting_token = False
+            await ctx.bot.send_message(
+                chat_id=self.chat_id,
+                text='❌ Токен пуст. Попробуйте снова: /awg → Задать токен',
+            )
+            raise ApplicationHandlerStop
+
+        self._awaiting_token = False
+        if save_mcp_token(token):
+            await ctx.bot.send_message(
+                chat_id=self.chat_id,
+                text='✅ <b>MCP-токен сохранён</b>',
+                parse_mode='HTML',
+            )
+        else:
+            await ctx.bot.send_message(
+                chat_id=self.chat_id,
+                text='❌ <b>Ошибка сохранения токена</b>',
+                parse_mode='HTML',
+            )
+
+        # Перерисовываем карточку с новым статусом
+        text, kb = await self._build_card()
+        await ctx.bot.send_message(
+            chat_id=self.chat_id,
+            text=text,
+            parse_mode='HTML',
+            reply_markup=kb,
+        )
+        raise ApplicationHandlerStop
+
+    @staticmethod
+    def _proc_check(pname: str) -> bool:
+        import subprocess
+        try:
+            r = subprocess.run(
+                ['sh', '-c', f'ps w | grep -q "[{pname[0]}]{pname[1:]}" && echo yes'],
+                capture_output=True, text=True, timeout=3,
+            )
+            return 'yes' in (r.stdout or '')
+        except Exception:
+            return False
+
+    async def send_card_message(self, update, ctx):
+        text, kb = self._build_card()
+        await update.message.reply_text(text, parse_mode='HTML', reply_markup=kb)
+
+    # ================= Callbacks =================
+
+    async def handle_callback(self, action, q, ctx):
+        if action == 'main':
+            await q.answer()
+            text, kb = self._build_card()
+            try:
+                await q.edit_message_text(text, parse_mode='HTML', reply_markup=kb)
+            except Exception as e:
+                if 'not modified' not in str(e).lower():
+                    raise
+            return
+
+        if action == 'cleanup:all':
+            await q.answer()
+            return await self._do_cleanup(q, ctx)
+
+        if action == 'ask:uninstall':
+            await q.answer()
+            return await self._show_uninstall_menu(q, ctx)
+
+        if action.startswith('opt:'):
+            return await self._handle_opt(q, ctx, action[4:])
+
+        if action.startswith('ask:'):
+            key = action[4:]
+            await q.answer()
+            a = ACTIONS.get(key)
+            if not a:
+                await q.answer('Неизвестное действие', show_alert=True)
+                return
+            desc = a['desc']
+            if key == 'install':
+                desc = desc.replace('&lt;router-ip&gt;', get_awg_web_url().split('//')[1].split(':')[0])
+                warns = []
+                if self._proc_check('xray'): warns.append('XKeen/HydraRoute')
+                if self._proc_check('keen-pbr'): warns.append('Keen-PBR')
+                if self._proc_check('usque'): warns.append('Usque WARP')
+                if warns:
+                    desc += f'\n\n⚠️ <b>Внимание:</b> сейчас запущен {", ".join(warns)}. Это может вызвать конфликт.'
+            text = (
+                f'{a["icon"]} <b>{a["title"]}</b>\n\n'
+                f'{desc}\n\n'
+                f'Подтвердить?'
+            )
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton('✅ Подтвердить', callback_data=f'awg_manager:go:{key}')],
+                [InlineKeyboardButton('❌ Отмена', callback_data='awg_manager:main')],
+            ])
+            try:
+                await q.edit_message_text(text, parse_mode='HTML', reply_markup=kb)
+            except Exception as e:
+                if 'not modified' not in str(e).lower():
+                    raise
+            return
+
+        if action.startswith('go:'):
+            key = action[3:]
+            await q.answer()
+            a = ACTIONS.get(key)
+            if not a:
+                return
+            await self._run_action(q, ctx, key, a)
+            return
+
+        await q.answer()
+
+    # ================= Выполнение =================
+
+    async def _run_action(self, q, ctx, key, action):
+        import asyncio, os, pty, select, time, subprocess
+        self._running = True
+        msg = await ctx.bot.send_message(
+            chat_id=self.chat_id,
+            text=f'{action["icon"]} <b>{action["title"]}</b>\n\n<pre>запуск...</pre>',
+            parse_mode='HTML',
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton('🛑 Отменить', callback_data='awg_manager:main')],
+            ]),
+        )
+        self._status_msg_id = msg.message_id
+
+        cmd = action['cmd']
+
+        def _exec():
+            master, slave = pty.openpty()
+            try:
+                proc = subprocess.Popen(
+                    ['sh', '-c', cmd],
+                    stdin=slave, stdout=slave, stderr=slave,
+                    close_fds=True, start_new_session=True,
+                    env={**os.environ, 'TERM': 'dumb'},
+                )
+                os.close(slave)
+                buf = b''
+                start = time.time()
+                while True:
+                    try:
+                        wpid, _ = os.waitpid(proc.pid, os.WNOHANG)
+                        if wpid == proc.pid:
+                            while True:
+                                r, _, _ = select.select([master], [], [], 0.2)
+                                if not r:
+                                    break
+                                try:
+                                    data = os.read(master, 4096)
+                                except OSError:
+                                    break
+                                if not data:
+                                    break
+                                buf += data
+                            break
+                    except ChildProcessError:
+                        break
+                    except Exception:
+                        pass
+                    try:
+                        r, _, _ = select.select([master], [], [], 0.3)
+                        if r:
+                            try:
+                                data = os.read(master, 4096)
+                                if data:
+                                    buf += data
+                            except OSError:
+                                break
+                    except Exception:
+                        pass
+                    if time.time() - start > 300:
+                        proc.kill()
+                        break
+                try:
+                    _, status = os.waitpid(proc.pid, 0)
+                    rc = os.waitstatus_to_exitcode(status)
+                except Exception:
+                    rc = -1
+                os.close(master)
+                return buf.decode('utf-8', errors='replace'), rc
+            except Exception as e:
+                try:
+                    os.close(master)
+                except Exception:
+                    pass
+                return str(e), -1
+
+        out, rc = await asyncio.to_thread(_exec)
+        self._running = False
+        self._status_msg_id = None
+
+        icon = '✅' if rc == 0 else '❌'
+        tail = out[-3000:] if len(out) > 3000 else out
+        text = (
+            f'{icon} <b>{action["title"]} завершено</b>\n'
+            f'<i>exit code: {rc}</i>\n\n'
+            f'<pre>{tail}</pre>'
+        )
+        try:
+            await ctx.bot.edit_message_text(
+                chat_id=self.chat_id,
+                message_id=msg.message_id,
+                text=text,
+                parse_mode='HTML',
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton('⬅️ Назад', callback_data='awg_manager:main')],
+                ]),
+            )
+        except Exception:
+            pass
+
+        if rc == 0 and key == 'uninstall':
+            await self._check_leftovers(ctx)
+
+    # ================= Удаление с чекбоксами =================
+
+    async def _show_uninstall_menu(self, q, ctx):
+        targets = existing_targets(UNINSTALL_TARGETS)
+        self._uninstall_opts = sync_opts(targets, self._uninstall_opts)
+        text, kb = build_uninstall_menu(
+            targets,
+            self._uninstall_opts,
+            title='Удаление AWG Manager',
+            always_msg='Пакет <code>awg-manager</code> удаляется всегда.',
+            prefix='awg_manager',
+        )
+        try:
+            await q.edit_message_text(text, parse_mode='HTML', reply_markup=kb)
+        except Exception as e:
+            if 'not modified' not in str(e).lower():
+                raise
+
+    async def _handle_opt(self, q, ctx, key):
+        if key in self._uninstall_opts:
+            toggle_opt(self._uninstall_opts, key)
+            state = 'вкл' if self._uninstall_opts[key] else 'выкл'
+            await q.answer(f'{state}: {key}')
+            await self._show_uninstall_menu(q, ctx)
+            return
+        if key == 'go':
+            await q.answer()
+            targets = existing_targets(UNINSTALL_TARGETS)
+            cmd = collect_uninstall_cmd(targets, self._uninstall_opts, UNINSTALL_CMD)
+            self._uninstall_opts = {}
+            action = {
+                'icon': '🗑',
+                'title': 'Удаление AWG Manager',
+                'cmd': cmd,
+            }
+            await self._run_action(q, ctx, 'uninstall', action)
+            return
+        await q.answer()
+
+    async def _check_leftovers(self, ctx):
+        try:
+            leftovers = scan_leftovers(SCAN_PATTERNS)
+        except Exception as e:
+            log.debug('scan_leftovers failed: %s', e)
+            return
+        if not leftovers:
+            return
+        self._leftovers = leftovers
+        text, kb = build_leftovers_message(leftovers, prefix='awg_manager')
+        try:
+            await ctx.bot.send_message(
+                chat_id=self.chat_id,
+                text=text,
+                parse_mode='HTML',
+                reply_markup=kb,
+            )
+        except Exception as e:
+            log.warning('send leftovers failed: %s', e)
+
+    async def _do_cleanup(self, q, ctx):
+        if not getattr(self, '_leftovers', None):
+            await q.answer('Нечего удалять', show_alert=True)
+            return
+        parts = []
+        total = len(self._leftovers)
+        for p in self._leftovers:
+            safe = p.replace("'", "'\\''")
+            parts.append(f"echo 'Удаляю: {safe}' ; rm -rf '{safe}'")
+        parts.append(f"echo '' ; echo 'Готово: удалено {total} элементов'")
+        cmd = ' ; '.join(parts)
+        self._leftovers = []
+        action = {
+            'icon': '🗑',
+            'title': 'Удаление остатков',
+            'cmd': cmd,
+        }
+        await self._run_action(q, ctx, 'cleanup', action)
+
+RB_MODULES_AWG_MODULE_PY_EOF
+
 echo "  → install.sh"
 cat > /opt/router_bot/install.sh << 'RB_INSTALL_SH_EOF'
 #!/bin/sh
 set -e
+
+# ---- Неинтерактивный режим (self-update из Telegram) ----
+# При RB_NONINTERACTIVE=1 все read получат EOF и вернут дефолт
+if [ "${RB_NONINTERACTIVE:-}" = "1" ]; then
+    exec < /dev/null
+fi
 
 BASE_DIR="/opt/router_bot"
 LOG_DIR="/opt/var/log"
@@ -14761,6 +15940,9 @@ $BASE_DIR/modules/neofit/actions.py
 $BASE_DIR/modules/usque_keenetic/__init__.py
 $BASE_DIR/modules/usque_keenetic/module.py
 $BASE_DIR/modules/usque_keenetic/actions.py
+$BASE_DIR/modules/awg_manager/__init__.py
+$BASE_DIR/modules/awg_manager/module.py
+$BASE_DIR/modules/awg_manager/actions.py
 "
 MISSING_FILES=""
 for f in $REQUIRED; do
@@ -15081,6 +16263,9 @@ PYEOF
     echo "  ✅ Обновление завершено"
     echo "════════════════════════════════════════════"
     echo ""
+    echo "→ Обновляю init-скрипты..."
+    sh /opt/router_bot/ensure_init.sh
+    echo ""
     echo "  Логи:  tail -f $LOG_DIR/router_bot.log"
     echo ""
     exit 0
@@ -15249,7 +16434,7 @@ else
             echo "  ВНИМАНИЕ: туннель $VPN_IF в состоянии DOWN."
             printf "  Продолжить с ним? (y/N): "
             read _C
-            _C=$(printf "%s" "$_C" | tr -cd '[:print:]')
+            _C=$(printf "%s" "$_C" | tr -cd '\040-\176')
             [ "$_C" = "y" ] || [ "$_C" = "Y" ] || exit 1
         fi
     fi
@@ -15262,7 +16447,9 @@ else
 
     echo ""
     printf "→ Проверяю доступ к Telegram через $VPN_IF ($VPN_SRC)... "
-    ip route add 149.154.166.110 dev "$VPN_IF" src "$VPN_SRC" table "$WAN_TABLE" 2>/dev/null
+    ip route add 149.154.166.110 dev "$VPN_IF" src "$VPN_SRC" table "$WAN_TABLE" 2>/dev/null || true
+    ip rule add to 149.154.166.110 lookup "$WAN_TABLE" priority 1099 2>/dev/null || true
+    ip rule add from "$WAN_SRC" lookup "$WAN_TABLE" priority 1152 2>/dev/null || true
 
     if /opt/bin/curl $_curl_opts "https://api.telegram.org" >/dev/null 2>&1; then
         echo "✅ работает"
@@ -15665,6 +16852,9 @@ VPN_SRC='$VPN_SRC'
 
 # IPv6 (yes = отключён, только IPv4)
 DISABLE_IPV6='$DISABLE_IPV6'
+
+# AWG Manager MCP-токен (получить в веб-интерфейсе AWG Manager)
+AWG_MCP_TOKEN=''
 EOF
 chmod 600 "$BASE_DIR/config.env"
 cp -p "$BASE_DIR/config.env" "$BASE_DIR/config.env.bak"
@@ -15926,13 +17116,17 @@ _c4=""
 if [ "$DISABLE_IPV6" = "yes" ]; then
     _c4="-4"
 fi
-if /opt/bin/curl $_c4 -sf --max-time 10 "https://api.telegram.org/bot${TG}/getMe" >/dev/null 2>&1; then
+
+# Проверяем именно HTTP-код (любой ответ = сеть жива)
+_http_code=$(/opt/bin/curl $_c4 -s -o /dev/null -w "%{http_code}" --connect-timeout 5 --max-time 10 "https://api.telegram.org/bot${TG}/getMe")
+
+if [ "$_http_code" -ge 200 ] && [ "$_http_code" -lt 500 ]; then
     rm -f "$STATE"
 else
     COUNT=$(cat "$STATE" 2>/dev/null || echo 0)
     COUNT=$((COUNT + 1))
     echo "$COUNT" > "$STATE"
-    echo "Telegram unreachable (failure $COUNT)"
+    echo "Telegram unreachable (HTTP code: $_http_code, failure $COUNT)"
     if [ "$COUNT" -ge 3 ]; then
         rm -f "$STATE"
         /opt/etc/init.d/S98routerbot restart
@@ -15968,6 +17162,9 @@ $LOG_DIR/router_bot.log {
 EOF
 echo "✅ logrotate"
 
+# ---------- 13b. ensure_init (перезапись с case status) ----------
+sh /opt/router_bot/ensure_init.sh
+
 # ---------- 13. cron ----------
 CRON_FILE="/opt/etc/crontab"
 if [ -f "$CRON_FILE" ]; then
@@ -15985,13 +17182,16 @@ if [ "$USE_VPN" = "yes" ]; then
     /opt/etc/init.d/S97tgroutes start >/dev/null 2>&1 || true
 fi
 
-/opt/etc/init.d/S98routerbot start
+_RB_START_RC=0; /opt/etc/init.d/S98routerbot start || _RB_START_RC=$?
 sleep 5
 if [ -f /var/run/routerbot.pid ] && kill -0 "$(cat /var/run/routerbot.pid)" 2>/dev/null; then
     echo "✅ Router Bot запущен (PID $(cat /var/run/routerbot.pid))"
 else
     echo "⚠️  Router Bot не запустился. Проверьте:"
     echo "     tail -50 $LOG_DIR/router_bot.log"
+    if [ "$_RB_START_RC" -ne 0 ]; then
+        echo "     (S98routerbot start вернул код $_RB_START_RC)"
+    fi
 fi
 
 # ---------- 16. Итог ----------
@@ -16051,6 +17251,24 @@ done
 # чистим осиротевшие flashkeen
 for p in $(ps w | grep "flashkeen" | grep -v grep | awk '{print $1}'); do
     kill -9 "$p" 2>/dev/null
+done
+sleep 1
+
+# ---------- 2b. Остановка сервисов модулей ----------
+echo "→ Останавливаю сервисы модулей..."
+for svc in S51usque S69neofit S70bird S99awg-manager S99keen-pbr \
+           S99hrneo S99hrweb S99xkeen S99tg-ws-proxy; do
+    if [ -x "$INIT_DIR/$svc" ]; then
+        "$INIT_DIR/$svc" stop 2>/dev/null || true
+    fi
+done
+sleep 1
+# Fallback: kill по имени процесса для модулей без надёжного init
+for proc in "[h]rneo" "[h]rweb" "[t]g-ws-proxy" "[n]eofit" \
+            "[a]wg-manager" "[u]sque" "[k]een-pbr"; do
+    for _p in $(ps w | grep -E "$proc" | grep -v grep | awk '{print $1}'); do
+        kill -9 "$_p" 2>/dev/null || true
+    done
 done
 sleep 1
 
@@ -16124,9 +17342,12 @@ rm -f /opt/var/log/tg-ws-proxy.log
 rm -rf /opt/var/run/tg-ws-proxy*
 
 # Данные модулей
-rm -rf "$BASE_DIR/data/xkeen" "$BASE_DIR/data/bird" "$BASE_DIR/data/mtproxy"
+rm -rf "$BASE_DIR/data/xkeen" "$BASE_DIR/data/bird" "$BASE_DIR/data/mtproxy" \
+       "$BASE_DIR/data/awg_manager" "$BASE_DIR/data/keen_pbr" \
+       "$BASE_DIR/data/neofit" "$BASE_DIR/data/usque_keenetic" \
+       "$BASE_DIR/data/hydraroute"
 
-echo "✅ Модули BIRD и XKeen очищены"
+echo "✅ Модули BIRD, XKeen, MTProxy очищены"
 echo ""
 
 echo ""
@@ -16146,6 +17367,40 @@ if [ "$ANS" = "y" ] || [ "$ANS" = "Y" ]; then
     echo "✅ Данные и логи удалены"
 else
     echo "⚠️  Данные сохранены: $BASE_DIR"
+fi
+
+# ---------- 7b. Опциональное удаление /opt/etc/<module> ----------
+_etc_mods=""
+for d in /opt/etc/HydraRoute /opt/etc/awg-manager /opt/etc/usque \
+         /opt/etc/keen-pbr /opt/etc/neofit /opt/etc/xkeen \
+         /opt/etc/tg-ws-proxy; do
+    [ -d "$d" ] && _etc_mods="$_etc_mods $d"
+done
+
+if [ -n "$_etc_mods" ]; then
+    echo ""
+    echo "────────────────────────────────────────────"
+    echo "  Конфиги модулей"
+    echo "────────────────────────────────────────────"
+    echo ""
+    echo "Найдены каталоги с настройками:"
+    for _d in $_etc_mods; do
+        echo "  • $_d"
+    done
+    echo ""
+    echo "⚠️  Это ваши личные настройки (правила, прокси, токены)."
+    echo "    Удаляйте только если уверены, что не будете переустанавливать модули."
+    echo ""
+    printf "Удалить эти конфиги? (y/N): "
+    read DEL_ETC
+    if [ "$DEL_ETC" = "y" ] || [ "$DEL_ETC" = "Y" ]; then
+        for _d in $_etc_mods; do
+            rm -rf "$_d"
+            echo "  ✓ удалён $_d"
+        done
+    else
+        echo "  Конфиги модулей сохранены."
+    fi
 fi
 
 # =================== продолжение в следующей части ===================
@@ -16381,6 +17636,292 @@ if [ "$RESTORE_ANY" = "0" ]; then
     echo "  ✅ Все init-скрипты на месте"
 fi
 RB_RESTORE_INIT_EOF
+
+echo "  → ensure_init.sh"
+cat > /opt/router_bot/ensure_init.sh << 'RB_ENSURE_INIT_SH_EOF'
+#!/bin/sh
+# Идемпотентно создаёт init-скрипты, logrotate, cron.
+# Вызывается из install.sh в обоих режимах (install и reinstall).
+
+INIT_DIR=/opt/etc/init.d
+BOT_INIT=/opt/router_bot/init
+LOG_DIR=/opt/var/log
+
+mkdir -p "$INIT_DIR" "$BOT_INIT" "$LOG_DIR"
+
+# ============ S97tgroutes ============
+cat > "$INIT_DIR/S97tgroutes" << 'EOF97'
+#!/bin/sh
+# Маршруты Telegram через VPN-туннель.
+# WAN_IF и WAN_SRC определяются автоматически.
+. /opt/router_bot/config.env
+
+[ "$USE_VPN" = "yes" ] || exit 0
+[ -n "$VPN_IF" ] || exit 0
+[ -n "$VPN_SRC" ] || exit 0
+[ -n "$ROUTE_TABLE" ] || ROUTE_TABLE="16385"
+WAN_IF_CFG="${WAN_IF:-}"
+
+TG_NETS="149.154.160.0/20 91.108.4.0/22"
+
+get_wan_if() {
+    if [ -n "$WAN_IF_CFG" ] && \
+       ip link show "$WAN_IF_CFG" >/dev/null 2>&1 && \
+       ip -4 -o addr show dev "$WAN_IF_CFG" 2>/dev/null | grep -q ' inet '; then
+        echo "$WAN_IF_CFG"
+        return 0
+    fi
+    local ifc
+    ifc=$(ip route show default 2>/dev/null \
+        | awk '/^default/ {for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}')
+    if [ -n "$ifc" ] && [ "$ifc" != "$VPN_IF" ] \
+       && ! echo "$ifc" | grep -qE '^(opkgtun|nwg|wg|tun)'; then
+        echo "$ifc"
+        return 0
+    fi
+    ifc=$(ip route get 1.1.1.1 2>/dev/null \
+        | awk '{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}')
+    if [ -n "$ifc" ] && [ "$ifc" != "$VPN_IF" ] \
+       && ! echo "$ifc" | grep -qE '^(opkgtun|nwg|wg|tun)'; then
+        echo "$ifc"
+        return 0
+    fi
+    return 1
+}
+
+get_wan_src() {
+    local iface="$1"
+    [ -n "$iface" ] || return 1
+    ip -4 -o addr show dev "$iface" 2>/dev/null \
+        | awk '{print $4}' | cut -d/ -f1 | head -1
+}
+
+rebuild_rules() {
+    local WAN_IF_NOW WAN_SRC_NOW
+    WAN_IF_NOW=$(get_wan_if) || return 1
+    WAN_SRC_NOW=$(get_wan_src "$WAN_IF_NOW")
+    [ -n "$WAN_SRC_NOW" ] || return 1
+
+    if [ "$WAN_IF_NOW" != "$WAN_IF_CFG" ] || [ "$WAN_SRC_NOW" != "$WAN_SRC" ]; then
+        sed -i "s|^WAN_IF=.*|WAN_IF='$WAN_IF_NOW'|" /opt/router_bot/config.env 2>/dev/null || true
+        sed -i "s|^WAN_SRC=.*|WAN_SRC='$WAN_SRC_NOW'|" /opt/router_bot/config.env 2>/dev/null || true
+        echo "WAN detected: $WAN_IF_NOW ($WAN_SRC_NOW)"
+    fi
+
+    for src in $(ip rule show | awk -v tbl="$ROUTE_TABLE" '$0 ~ "lookup " tbl " " {for(i=1;i<=NF;i++) if($i=="from") print $(i+1)}'); do
+        case "$src" in
+            [0-9]*) ip rule del from "$src" lookup "$ROUTE_TABLE" 2>/dev/null || true ;;
+        esac
+    done
+    for net in $TG_NETS; do
+        ip rule del to "$net" lookup "$ROUTE_TABLE" 2>/dev/null || true
+        ip route del "$net" table "$ROUTE_TABLE" 2>/dev/null || true
+    done
+
+    ip rule add from "$WAN_SRC_NOW" lookup "$ROUTE_TABLE" priority 1152 2>/dev/null || true
+    p=1100
+    for net in $TG_NETS; do
+        ip rule add to "$net" lookup "$ROUTE_TABLE" priority $p 2>/dev/null || true
+        p=$((p+1))
+    done
+    for net in $TG_NETS; do
+        ip route add "$net" dev "$VPN_IF" src "$VPN_SRC" table "$ROUTE_TABLE" 2>/dev/null || true
+    done
+}
+
+case "$1" in
+  start)   sleep 20; rebuild_rules || exit 0 ;;
+  stop)
+    for net in $TG_NETS; do
+        ip rule del to "$net" lookup "$ROUTE_TABLE" 2>/dev/null || true
+        ip route del "$net" table "$ROUTE_TABLE" 2>/dev/null || true
+    done
+    for src in $(ip rule show | awk -v tbl="$ROUTE_TABLE" '$0 ~ "lookup " tbl " " {for(i=1;i<=NF;i++) if($i=="from") print $(i+1)}'); do
+        case "$src" in
+            [0-9]*) ip rule del from "$src" lookup "$ROUTE_TABLE" 2>/dev/null || true ;;
+        esac
+    done
+    ;;
+  rebuild) rebuild_rules ;;
+  *) echo "Usage: $0 {start|stop|rebuild}"; exit 1 ;;
+esac
+EOF97
+chmod +x "$INIT_DIR/S97tgroutes"
+cp -f "$INIT_DIR/S97tgroutes" "$BOT_INIT/S97tgroutes"
+
+# ============ S98routerbot (с case status) ============
+cat > "$INIT_DIR/S98routerbot" << 'EOF98'
+#!/bin/sh
+PROG=/opt/bin/routerbot_wrapper.sh
+ARGS=""
+PIDFILE=/var/run/routerbot.pid
+
+kill_all_routerbot() {
+    PIDS=$(ps w | grep -E "routerbot_wrapper|router_bot/main.py" | grep -v grep | awk '{print $1}')
+    for p in $PIDS; do kill "$p" 2>/dev/null; done
+    sleep 1
+    PIDS=$(ps w | grep "router_bot/main.py" | grep -v grep | awk '{print $1}')
+    for p in $PIDS; do kill -9 "$p" 2>/dev/null; done
+    PIDS=$(ps w | grep "/opt/bin/sh /opt/bin/flashkeen" | grep -v grep | awk '{print $1}')
+    for p in $PIDS; do kill -9 "$p" 2>/dev/null; done
+    PIDS=$(ps w | grep "flashkeen" | grep -v grep | grep -v "S98routerbot" | awk '{print $1}')
+    for p in $PIDS; do kill -9 "$p" 2>/dev/null; done
+}
+
+if [ -f /opt/router_bot/core/wrapper.sh ] && [ -x /opt/bin/routerbot_wrapper.sh ]; then
+    if [ /opt/router_bot/core/wrapper.sh -nt /opt/bin/routerbot_wrapper.sh ]; then
+        cp -f /opt/router_bot/core/wrapper.sh /opt/bin/routerbot_wrapper.sh
+        chmod +x /opt/bin/routerbot_wrapper.sh
+        echo "wrapper.sh updated from /opt/router_bot/core/"
+    fi
+fi
+
+case "$1" in
+  start)
+    if [ -f /var/run/routerbot.giveup ]; then
+      echo "Router Bot is in GIVEUP state (too many failures)."
+      echo "  Reset: rm /var/run/routerbot.giveup && $0 restart"
+      exit 1
+    fi
+    if [ -f "$PIDFILE" ] && kill -0 "$(cat $PIDFILE)" 2>/dev/null; then
+      echo "Already running (PID $(cat $PIDFILE))"; exit 0
+    fi
+    kill_all_routerbot
+    sleep 1
+    echo "Starting Router Bot..."
+    start-stop-daemon -S -b -m -p "$PIDFILE" -x "$PROG" -- $ARGS
+    ;;
+  stop)
+    echo "Stopping Router Bot..."
+    start-stop-daemon -K -p "$PIDFILE" 2>/dev/null
+    kill_all_routerbot
+    rm -f "$PIDFILE"
+    ;;
+  restart) rm -f /var/run/routerbot.giveup; $0 stop; sleep 3; $0 start ;;
+  reset)
+    rm -f /var/run/routerbot.giveup
+    echo "Giveup marker removed. Now run: $0 start"
+    ;;
+  status)
+    if [ -f /var/run/routerbot.giveup ]; then
+        echo "Router Bot is in GIVEUP state (too many failures)"
+        echo "  Reset: rm /var/run/routerbot.giveup && $0 restart"
+        exit 1
+    fi
+    if [ -f "$PIDFILE" ] && kill -0 "$(cat $PIDFILE)" 2>/dev/null; then
+        echo "Router Bot is running (PID $(cat $PIDFILE))"
+        exit 0
+    else
+        echo "Router Bot is stopped"
+        exit 3
+    fi
+    ;;
+  *) echo "Usage: $0 {start|stop|restart|reset|status}"; exit 1 ;;
+esac
+EOF98
+chmod +x "$INIT_DIR/S98routerbot"
+cp -f "$INIT_DIR/S98routerbot" "$BOT_INIT/S98routerbot"
+
+# ============ S99routerbot_health ============
+cat > "$INIT_DIR/S99routerbot_health" << 'EOF99'
+#!/bin/sh
+. /opt/router_bot/config.env
+
+[ -f /var/run/routerbot.giveup ] && exit 0
+
+PIDFILE=/var/run/routerbot.pid
+STATE=/var/run/routerbot.fail
+
+# 0. Автодетект WAN IP
+if [ "$USE_VPN" = "yes" ] && [ -n "$VPN_IF" ]; then
+    WAN_IF_NOW=""
+    if [ -n "$WAN_IF" ] && ip -4 -o addr show dev "$WAN_IF" 2>/dev/null | grep -q ' inet '; then
+        WAN_IF_NOW="$WAN_IF"
+    else
+        WAN_IF_NOW=$(ip route show default 2>/dev/null \
+            | awk '/^default/ {for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}')
+        [ -n "$WAN_IF_NOW" ] && [ "$WAN_IF_NOW" = "$VPN_IF" ] && WAN_IF_NOW=""
+        echo "$WAN_IF_NOW" | grep -qE '^(opkgtun|nwg|wg|tun)' && WAN_IF_NOW=""
+    fi
+    WAN_SRC_NOW=""
+    [ -n "$WAN_IF_NOW" ] && WAN_SRC_NOW=$(ip -4 -o addr show dev "$WAN_IF_NOW" 2>/dev/null \
+        | awk '{print $4}' | cut -d/ -f1 | head -1)
+    if [ -n "$WAN_SRC_NOW" ] && [ "$WAN_SRC_NOW" != "$WAN_SRC" ]; then
+        echo "WAN IP changed: $WAN_SRC -> $WAN_SRC_NOW"
+        sed -i "s|^WAN_SRC=.*|WAN_SRC='$WAN_SRC_NOW'|" /opt/router_bot/config.env 2>/dev/null || true
+        sed -i "s|^WAN_IF=.*|WAN_IF='$WAN_IF_NOW'|" /opt/router_bot/config.env 2>/dev/null || true
+        WAN_SRC="$WAN_SRC_NOW"
+        /opt/etc/init.d/S97tgroutes rebuild >/dev/null 2>&1 || true
+    fi
+fi
+
+# 1. Маршруты Telegram
+if [ "$USE_VPN" = "yes" ] && [ -n "$VPN_IF" ] && [ -n "$WAN_SRC" ]; then
+    if ! ip route get 149.154.166.110 from "$WAN_SRC" 2>/dev/null | grep -q "$VPN_IF"; then
+        echo "Restoring Telegram routes via $VPN_IF..."
+        /opt/etc/init.d/S97tgroutes rebuild >/dev/null 2>&1 || true
+    fi
+fi
+
+# 2. resolv.conf
+if ! grep -q nameserver /etc/resolv.conf 2>/dev/null; then
+    printf 'nameserver 127.0.0.1\nnameserver 8.8.8.8\noptions timeout:1 attempts:1 rotate\n' > /etc/resolv.conf
+fi
+
+# 3. Проверка связи с Telegram
+TG=$(sed -n "s/^TG_BOT_TOKEN='\(.*\)'/\1/p" /opt/router_bot/config.env)
+_c4=""
+if [ "$DISABLE_IPV6" = "yes" ]; then
+    _c4="-4"
+fi
+_http_code=$(/opt/bin/curl $_c4 -s -o /dev/null -w "%{http_code}" --connect-timeout 5 --max-time 10 "https://api.telegram.org/bot${TG}/getMe")
+
+if [ "$_http_code" -ge 200 ] && [ "$_http_code" -lt 500 ]; then
+    rm -f "$STATE"
+else
+    COUNT=$(cat "$STATE" 2>/dev/null || echo 0)
+    COUNT=$((COUNT + 1))
+    echo "$COUNT" > "$STATE"
+    echo "Telegram unreachable (HTTP code: $_http_code, failure $COUNT)"
+    if [ "$COUNT" -ge 3 ]; then
+        rm -f "$STATE"
+        /opt/etc/init.d/S98routerbot restart
+    fi
+    exit 0
+fi
+
+if [ -f "$PIDFILE" ] && kill -0 "$(cat $PIDFILE)" 2>/dev/null; then
+    exit 0
+fi
+
+echo "Bot process is dead, restarting..."
+/opt/etc/init.d/S98routerbot restart
+EOF99
+chmod +x "$INIT_DIR/S99routerbot_health"
+cp -f "$INIT_DIR/S99routerbot_health" "$BOT_INIT/S99routerbot_health"
+
+# ============ logrotate ============
+mkdir -p /opt/etc/logrotate.d
+cat > /opt/etc/logrotate.d/router_bot << 'LREOF'
+/opt/var/log/router_bot.log {
+    weekly
+    rotate 4
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}
+LREOF
+
+# ============ cron healthcheck ============
+if [ -f /opt/etc/crontab ] && ! grep -q "S99routerbot_health" /opt/etc/crontab; then
+    echo "*/1 * * * * /opt/etc/init.d/S99routerbot_health" >> /opt/etc/crontab
+fi
+
+echo "  ✅ ensure_init.sh: init-скрипты, logrotate, cron обновлены"
+RB_ENSURE_INIT_SH_EOF
+chmod +x /opt/router_bot/ensure_init.sh
 chmod +x /opt/router_bot/restore_init.sh
 
 chmod +x /opt/router_bot/install.sh
