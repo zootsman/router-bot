@@ -17976,4 +17976,27 @@ sleep 1
 
 echo "→ Запускаю установщик..."
 echo ""
-exec /opt/router_bot/install.sh
+sh /opt/router_bot/install.sh
+_RC=$?
+
+# ---------- Генерация манифеста (heredoc-based setup.sh) ----------
+if [ "$_RC" = "0" ] && command -v sha256sum >/dev/null 2>&1; then
+    : > /opt/router_bot/.manifest
+    find /opt/router_bot -type f \
+        ! -path '*/data/*' \
+        ! -path '*/.user_backup/*' \
+        ! -path '*/__pycache__/*' \
+        ! -path '*/backup/*' \
+        ! -name '*.pyc' \
+        ! -name '*.pyo' \
+        ! -name '.manifest' \
+        ! -name 'VERSION' \
+        ! -name 'config.env*' \
+        2>/dev/null | while IFS= read -r _f; do
+            sha256sum "$_f" 2>/dev/null
+        done > /opt/router_bot/.manifest
+    _cnt=$(wc -l < /opt/router_bot/.manifest 2>/dev/null | tr -d ' ')
+    [ -z "$_cnt" ] && _cnt=0
+    echo ""
+    echo "  → Манифест: $_cnt файлов"
+fi
