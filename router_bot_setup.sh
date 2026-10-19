@@ -10,7 +10,7 @@ set -e
 # и вернут дефолт. При интерактивном запуске работают как обычно.
 # Блок exec < /dev/tty УБРАН: при setsid() (Popen) /dev/tty не открывается.
 
-SETUP_VERSION="0.0.9"  # AUTO_DISCOVERY_PATCH_V1
+SETUP_VERSION="0.0.9-01"  # AUTO_DISCOVERY_PATCH_V1
 VERSION_FILE="/opt/router_bot/VERSION"
 INSTALLED_VERSION=""
 if [ -f "$VERSION_FILE" ]; then
@@ -187,7 +187,7 @@ RB_MAIN_PY_EOF
 
 echo "  → VERSION"
 cat > /opt/router_bot/VERSION << 'RB_VERSION_EOF'
-0.0.9
+0.0.9-01
 RB_VERSION_EOF
 
 echo "  → core/__init__.py"
@@ -646,7 +646,7 @@ from core.config import load_config, get as cfg
 from core.utils import (
     check_mirrors, get_current_mirror, apply_mirror,
     build_mirrors_text, build_mirrors_kb, ENTWARE_MIRRORS,
-    set_last_msg, get_last_msg, show_card,
+    set_last_msg, get_last_msg, show_card, notify_cleanup,
 )
 from core.router import ModuleRouter
 
@@ -1460,6 +1460,17 @@ async def post_init(app):
     log.info('Router bot started')
 
 
+
+
+async def _notif_cleanup_loop(app):
+    await asyncio.sleep(300)
+    while True:
+        try:
+            await notify_cleanup(app.bot, older_than_hours=24)
+        except Exception as e:
+            log.debug('notif cleanup loop failed: %s', e)
+        await asyncio.sleep(3600)
+
 def main():
     logging.basicConfig(
         format='%(asctime)s [%(levelname)s] %(message)s',
@@ -1527,6 +1538,10 @@ def main():
     # Общий callback — обрабатывает router:main отдельно, остальное — в роутер
     async def _global_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         q = update.callback_query
+        try:
+            await notify_cleanup(ctx.bot, update.effective_chat.id)
+        except Exception:
+            pass
         if q.data.startswith('router:cat:'):
             cat_name = q.data[len('router:cat:'):]
             return await _show_category(q, ctx, cat_name)
@@ -1596,8 +1611,6 @@ def main():
     from telegram.ext import MessageHandler as _MH, filters as _f
 
     async def _force_del_user_msg(update, ctx):
-        # Удаляем ТОЛЬКО входящие текстовые сообщения и команды.
-        # НЕ трогаем колбэки (кнопки), иначе удалим саму карточку.
         if update.message:
             try:
                 await ctx.bot.delete_message(
@@ -1609,6 +1622,10 @@ def main():
                 logging.getLogger(__name__).debug(
                     'force_del_user_msg failed: %s', e
                 )
+            try:
+                await notify_cleanup(ctx.bot, update.effective_chat.id)
+            except Exception:
+                pass
 
     app.add_handler(_MH(_f.TEXT | _f.COMMAND, _force_del_user_msg), group=-999)
 
@@ -1797,10 +1814,9 @@ def build_uninstall_menu(targets, opts, title, always_msg, prefix):
             callback_data=f'{prefix}:opt:{k}',
         )])
 
-    if targets:
-        kb_rows.append([InlineKeyboardButton(
-            '\u2705 Удалить с этими настройками',
-            callback_data=f'{prefix}:opt:go')])
+    kb_rows.append([InlineKeyboardButton(
+        '\U0001f5d1 Удалить',
+        callback_data=f'{prefix}:opt:go')])
 
     kb_rows.append([InlineKeyboardButton(
         '\u274c Отмена',
@@ -2353,6 +2369,66 @@ async def show_card(update, ctx, text, kb=None, parse_mode='HTML'):
     )
     set_last_msg(chat_id, msg.message_id)
     return msg.message_id
+
+
+# ================== Уведомления Net Watch ==================
+
+import time as _time_notif
+NOTIF_FILE = '/opt/router_bot/data/net_watch/notifications.json'
+
+def _notif_load():
+    try:
+        with open(NOTIF_FILE) as f:
+            return _json_lm.load(f)
+    except Exception:
+        return {}
+
+def _notif_save(data):
+    try:
+        os.makedirs(os.path.dirname(NOTIF_FILE), exist_ok=True)
+        with open(NOTIF_FILE, 'w') as f:
+            _json_lm.dump(data, f)
+    except Exception:
+        pass
+
+def notify_register(chat_id, message_id):
+    data = _notif_load()
+    cid = str(chat_id)
+    lst = data.setdefault(cid, [])
+    lst.append({"id": int(message_id), "ts": int(_time_notif.time())})
+    data[cid] = lst[-200:]
+    _notif_save(data)
+
+async def notify_cleanup(bot, chat_id=None, older_than_hours=None):
+    """Удаляет уведомления Net Watch. Если chat_id=None — для всех.
+    Если older_than_hours=None — все. Иначе только старше N часов."""
+    data = _notif_load()
+    now = int(_time_notif.time())
+    cutoff = now - int(older_than_hours * 3600) if older_than_hours else None
+    changed = False
+    for cid in list(data.keys()):
+        if chat_id is not None and str(chat_id) != cid:
+            continue
+        lst = data[cid]
+        remaining = []
+        for item in lst:
+            msg_id = item.get('id')
+            ts = item.get('ts', 0)
+            if cutoff is not None and ts >= cutoff:
+                remaining.append(item)
+                continue
+            try:
+                await bot.delete_message(chat_id=int(cid), message_id=msg_id)
+            except Exception:
+                pass
+        if len(remaining) != len(lst):
+            changed = True
+        if remaining:
+            data[cid] = remaining
+        else:
+            del data[cid]
+    if changed:
+        _notif_save(data)
 RB_CORE_UTILS_PY_EOF
 
 echo "  → core/rb"
@@ -3825,10 +3901,15 @@ def device_keyboard(mac: str, blocked: bool):
 
 async def send(bot, text: str, markup=None):
     try:
-        await bot.send_message(
+        msg = await bot.send_message(
             chat_id=CHAT_ID, text=text,
             parse_mode='HTML', reply_markup=markup,
         )
+        try:
+            from core.utils import notify_register
+            notify_register(CHAT_ID, msg.message_id)
+        except Exception as e:
+            log.debug('notify_register failed: %s', e)
     except Exception as e:
         log.error('Telegram send error: %s', e)
 
@@ -4230,6 +4311,11 @@ async def poll_loop(app):
                         parse_mode='HTML',
                         reply_markup=device_keyboard(mac, mac in blocked),
                     )
+                    try:
+                        from core.utils import notify_register
+                        notify_register(CHAT_ID, msg.message_id)
+                    except Exception as e:
+                        log.debug('notify_register failed: %s', e)
                     state.notice_msgs[mac] = msg.message_id
                     append_event(mac, 'connect')
                     log.info('New device: %s (%s), msg_id=%s',
@@ -12138,6 +12224,7 @@ from telegram import (
 from telegram.ext import MessageHandler, filters, ContextTypes
 
 from .actions import (
+    is_broken,
     ACTIONS, UNINSTALL_CMD, UNINSTALL_TARGETS, SCAN_PATTERNS,
     PROXY_CONF, PROXY_SECRET,
     is_installed, is_running, get_version, get_status_short,
@@ -12291,23 +12378,36 @@ class MTProxyModule:
     def _build_card(self):
         installed = is_installed()
         running = is_running()
+        broken = is_broken()
         version = get_version() if installed else ''
 
         lines = [f'{self.icon} <b>{self.title}</b>', '']
+    
+        if broken:
+            lines.append('⚠️ <b>Установка повреждена</b>')
+            lines.append('<i>Пакет есть в opkg, но файлы отсутствуют.</i>')
+            lines.append('')
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton('🔧 Переустановить',
+                                      callback_data='mtproxy:ask:reinstall')],
+                [InlineKeyboardButton('🗑 Удалить и почистить',
+                                      callback_data='mtproxy:ask:uninstall')],
+                [InlineKeyboardButton('⬅️ Назад', callback_data='router:cat:services'),
+                 InlineKeyboardButton('🏠 Модули', callback_data='router:main')],
+            ])
+            return '\n'.join(lines), kb
+
         if installed:
             v = f' · <code>{version}</code>' if version else ''
             lines.append(f'✅ Установлен{v}')
             lines.append('Сервис: ' + ('🟢 работает' if running else '🔴 остановлен'))
-
             cfg = get_config()
             if cfg:
                 port = cfg.get('PORT', '?')
                 host = cfg.get('HOST', '')
-                # 0.0.0.0 = «слушать на всех интерфейсах» — не показываем как адрес
                 if host and host not in ('0.0.0.0', '::', '127.0.0.1', 'localhost'):
                     lines.append(f'Хост: <code>{_esc(host)}</code>')
                 lines.append(f'Порт: <code>{port}</code>')
-
             secret = get_secret()
             if secret:
                 lines.append(f'Секрет: <code>{secret[:8]}…</code>')
@@ -12319,10 +12419,8 @@ class MTProxyModule:
             lines.append('⏳ <b>Выполняется операция...</b>')
             kb = InlineKeyboardMarkup([
                 [InlineKeyboardButton('\U0001f6d1 Отменить', callback_data='mtproxy:kill')],
-                [
-                    InlineKeyboardButton('\u2b05\ufe0f Назад', callback_data='router:cat:services'),
-                    InlineKeyboardButton('\U0001f3e0 Модули', callback_data='router:main'),
-                ],
+                [InlineKeyboardButton('\u2b05\ufe0f Назад', callback_data='router:cat:services'),
+                 InlineKeyboardButton('\U0001f3e0 Модули', callback_data='router:main')],
             ])
             return '\n'.join(lines), kb
 
@@ -12345,11 +12443,10 @@ class MTProxyModule:
             rows.append([InlineKeyboardButton(
                 '\U0001f517 Показать ссылку', callback_data='mtproxy:show_link')])
             rows.append([InlineKeyboardButton(
-                '✏️ Редактировать конфиг',
-                callback_data='mtproxy:edit_config')])
+                '✏️ Редактировать конфиг', callback_data='mtproxy:edit_config')])
             rows.append([InlineKeyboardButton(
-                '\U0001f5d1 Удалить MTProxy',
-                callback_data='mtproxy:ask:uninstall')])
+                '\U0001f5d1 Удалить MTProxy', callback_data='mtproxy:ask:uninstall')])
+    
         rows.append([InlineKeyboardButton(
             '\U0001f504 Обновить карточку', callback_data='mtproxy:main')])
         rows.append([
@@ -12996,11 +13093,27 @@ def is_installed() -> bool:
             ['sh', '-c', 'opkg list-installed 2>/dev/null | grep -q "^tg-ws-proxy "'],
             timeout=5,
         )
-        if r.returncode == 0:
-            return True
+        has_pkg = (r.returncode == 0)
     except Exception:
-        pass
-    return os.path.exists(PROXY_INIT)
+        has_pkg = False
+    has_bin = os.path.exists(PROXY_BIN)
+    has_init = os.path.exists(PROXY_INIT)
+    return has_pkg and has_bin and has_init
+
+
+def is_broken() -> bool:
+    """Пакет в opkg есть, но бинарник или init отсутствуют."""
+    try:
+        r = subprocess.run(
+            ['sh', '-c', 'opkg list-installed 2>/dev/null | grep -q "^tg-ws-proxy "'],
+            timeout=5,
+        )
+        has_pkg = (r.returncode == 0)
+    except Exception:
+        has_pkg = False
+    has_bin = os.path.exists(PROXY_BIN)
+    has_init = os.path.exists(PROXY_INIT)
+    return has_pkg and not (has_bin and has_init)
 
 
 def is_running() -> bool:
@@ -13126,6 +13239,15 @@ ACTIONS = {
             'Ссылка подключения появится в логе после запуска.'
         ),
         'cmd': INSTALL_CMD,
+    },
+    'reinstall': {
+        'title': 'Переустановка MTProxy',
+        'icon': '🔧',
+        'desc': 'Удаление повреждённых файлов и установка пакета заново.',
+        'cmd': 'opkg remove --force-removal-of-dependent-packages --autoremove tg-ws-proxy 2>&1 || true ; '
+               'rm -f /opt/bin/tg-ws-proxy /opt/etc/init.d/S99tg-ws-proxy ; '
+               'curl -fsSL https://raw.githubusercontent.com/spatiumstas/feedly/main/add-repo.sh | sh && '
+               'opkg update && opkg install tg-ws-proxy'
     },
     'uninstall': {
         'title': 'Удаление MTProxy',
@@ -16150,7 +16272,7 @@ from core.utils import (
     collect_uninstall_cmd, toggle_opt,
     scan_leftovers, build_leftovers_message,
     ui_edit_q, ui_edit_or_send,
-    show_card,
+    show_card, get_last_msg,
 )
 
 from .actions import (
@@ -16356,36 +16478,55 @@ class AwgManagerModule:
         except Exception:
             pass
 
+        self._awaiting_token = False
+        last_id = get_last_msg(self.chat_id)
+
         if not token:
-            self._awaiting_token = False
-            await ctx.bot.send_message(
-                chat_id=self.chat_id,
-                text='❌ Токен пуст. Попробуйте снова: /awg → Задать токен',
-            )
+            err_text = '❌ Токен пуст. Попробуйте снова: /awg → Задать токен'
+            edited = False
+            if last_id:
+                try:
+                    await ctx.bot.edit_message_text(
+                        chat_id=self.chat_id, message_id=last_id,
+                        text=err_text,
+                    )
+                    edited = True
+                except Exception:
+                    pass
+            if not edited:
+                await ctx.bot.send_message(chat_id=self.chat_id, text=err_text)
             raise ApplicationHandlerStop
 
-        self._awaiting_token = False
         if save_mcp_token(token):
-            await ctx.bot.send_message(
-                chat_id=self.chat_id,
-                text='✅ <b>MCP-токен сохранён</b>',
-                parse_mode='HTML',
-            )
+            header = '✅ <b>MCP-токен сохранён</b>\n\n'
         else:
+            header = '❌ <b>Ошибка сохранения токена</b>\n\n'
+
+        text, kb = self._build_card()
+
+        edited = False
+        if last_id:
+            try:
+                await ctx.bot.edit_message_text(
+                    chat_id=self.chat_id,
+                    message_id=last_id,
+                    text=header + text,
+                    parse_mode='HTML',
+                    reply_markup=kb,
+                )
+                edited = True
+            except Exception as e:
+                log.debug('edit token result failed: %s', e)
+
+        # Fallback, если отредактировать не удалось
+        if not edited:
             await ctx.bot.send_message(
                 chat_id=self.chat_id,
-                text='❌ <b>Ошибка сохранения токена</b>',
+                text=header + text,
                 parse_mode='HTML',
+                reply_markup=kb,
             )
-
-        # Перерисовываем карточку с новым статусом
-        text, kb = self._build_card()
-        await ctx.bot.send_message(
-            chat_id=self.chat_id,
-            text=text,
-            parse_mode='HTML',
-            reply_markup=kb,
-        )
+        
         raise ApplicationHandlerStop
 
     @staticmethod
