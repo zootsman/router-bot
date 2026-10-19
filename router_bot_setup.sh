@@ -10,7 +10,7 @@ set -e
 # и вернут дефолт. При интерактивном запуске работают как обычно.
 # Блок exec < /dev/tty УБРАН: при setsid() (Popen) /dev/tty не открывается.
 
-SETUP_VERSION="0.0.8-4"
+SETUP_VERSION="0.0.8-5"
 VERSION_FILE="/opt/router_bot/VERSION"
 INSTALLED_VERSION=""
 if [ -f "$VERSION_FILE" ]; then
@@ -158,6 +158,8 @@ mkdir -p /opt/router_bot/modules/bird
 mkdir -p /opt/router_bot/modules/mtproxy
 mkdir -p /opt/router_bot/modules/keen_pbr
 mkdir -p /opt/router_bot/modules/neofit
+mkdir -p /opt/router_bot/modules/awg_manager
+mkdir -p /opt/router_bot/data/awg_manager
 mkdir -p /opt/router_bot/modules/usque_keenetic
 mkdir -p /opt/router_bot/data/net_watch
 mkdir -p /opt/router_bot/data/ssh_control
@@ -185,7 +187,7 @@ RB_MAIN_PY_EOF
 
 echo "  → VERSION"
 cat > /opt/router_bot/VERSION << 'RB_VERSION_EOF'
-0.0.8-4
+0.0.8-5
 RB_VERSION_EOF
 
 echo "  → core/__init__.py"
@@ -252,7 +254,12 @@ if _disable_ipv6:
 #  Self-update (проверка версии на GitHub, скачивание, запуск)
 # ============================================================================
 
-_SETUP_URL = 'https://raw.githubusercontent.com/zootsman/router-bot/master/router_bot_setup.sh'
+_UPDATE_URLS = [
+    'https://raw.githubusercontent.com/zootsman/router-bot/master/router_bot_setup.sh',
+    'https://cdn.jsdelivr.net/gh/zootsman/router-bot@master/router_bot_setup.sh',
+    'https://raw.gitmirror.com/zootsman/router-bot/master/router_bot_setup.sh',
+    'https://ghproxy.net/https://raw.githubusercontent.com/zootsman/router-bot/master/router_bot_setup.sh',
+]
 _UPDATE_STATE_FILE = '/opt/router_bot/data/system/self_update.json'
 _UPDATE_LOG = '/opt/var/log/self_update.log'
 _UPDATE_SCRIPT = '/tmp/router_bot_setup_selfupdate.sh'
@@ -310,22 +317,44 @@ def _save_update_state(data: dict):
 
 
 def _fetch_latest_version(timeout=10) -> str:
-    """Первые 4КБ с GitHub → SETUP_VERSION."""
+    """Первые 4КБ с GitHub (с fallback на зеркала) → SETUP_VERSION."""
     import re
-    req = urllib.request.Request(_SETUP_URL, headers={'User-Agent': 'RouterBot-selfupdate'})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        buf = r.read(4096).decode('utf-8', errors='replace')
-    m = re.search(r'^SETUP_VERSION="([^"]+)"', buf, re.MULTILINE)
-    if not m:
-        raise RuntimeError('SETUP_VERSION не найден в первых 4КБ')
-    return m.group(1)
+    last_err = None
+    for url in _UPDATE_URLS:
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': 'RouterBot-selfupdate'})
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                buf = r.read(4096).decode('utf-8', errors='replace')
+            m = re.search(r'^SETUP_VERSION="([^"]+)"', buf, re.MULTILINE)
+            if m:
+                log.debug('fetch version OK via %s', url)
+                return m.group(1)
+        except Exception as e:
+            last_err = e
+            log.debug('fetch version failed via %s: %s', url, e)
+            continue
+    raise RuntimeError(f'Все зеркала недоступны. Последняя ошибка: {last_err}')
 
 
 def _download_and_verify(timeout=60) -> str:
     """Скачивает setup.sh в /tmp и проверяет. Возвращает путь."""
-    req = urllib.request.Request(_SETUP_URL, headers={'User-Agent': 'RouterBot-selfupdate'})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        data = r.read()
+    data = None
+    last_err = None
+    for url in _UPDATE_URLS:
+        try:
+            req = urllib.request.Request(url, headers={'User-Agent': 'RouterBot-selfupdate'})
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                data = r.read()
+            if len(data) > 100_000:
+                log.debug('download OK via %s', url)
+                break
+        except Exception as e:
+            last_err = e
+            log.debug('download failed via %s: %s', url, e)
+            data = None
+            continue
+    if not data:
+        raise RuntimeError(f'Все зеркала недоступны. Последняя ошибка: {last_err}')
     if len(data) < 100_000:
         raise RuntimeError(f'слишком маленький: {len(data)} байт')
 
@@ -2670,22 +2699,32 @@ case "$1" in
         fi
         ;;
     update|u)
-        URL="https://raw.githubusercontent.com/zootsman/router-bot/master/router_bot_setup.sh"
         TMP="/tmp/router_bot_setup.sh"
-        echo "→ Скачиваю установщик с GitHub..."
-        if /opt/bin/curl -fsSL --max-time 30 "$URL" -o "$TMP"; then
-            if [ -s "$TMP" ] && head -1 "$TMP" | grep -q '^#!/bin/sh'; then
-                chmod +x "$TMP"
-                echo "  ✅ Скачано ($(wc -c < "$TMP") байт)"
-                echo ""
-                exec sh "$TMP"
-            else
-                echo "  ❌ Файл повреждён"
-                exit 1
+        echo "→ Скачиваю установщик с GitHub (с fallback на зеркала)..."
+        OK=0
+        for URL in \
+          "https://raw.githubusercontent.com/zootsman/router-bot/master/router_bot_setup.sh" \
+          "https://cdn.jsdelivr.net/gh/zootsman/router-bot@master/router_bot_setup.sh" \
+          "https://raw.gitmirror.com/zootsman/router-bot/master/router_bot_setup.sh" \
+          "https://ghproxy.net/https://raw.githubusercontent.com/zootsman/router-bot/master/router_bot_setup.sh"; do
+            echo "  Пробую: $URL"
+            if /opt/bin/curl -fsSL --max-time 20 "$URL" -o "$TMP"; then
+                if [ -s "$TMP" ] && head -1 "$TMP" | grep -q '^#!/bin/sh'; then
+                    OK=1
+                    echo "  ✅ Скачано ($(wc -c < "$TMP") байт)"
+                    break
+                fi
             fi
+        done
+        if [ "$OK" = "1" ]; then
+            chmod +x "$TMP"
+            echo ""
+            exec sh "$TMP"
         else
-            echo "  ❌ Не удалось скачать"
-            echo "  Проверьте интернет / доступ к GitHub"
+            echo "  ❌ Не удалось скачать ни с одного зеркала"
+            echo "  Скачайте вручную и закиньте через scp/FTP:"
+            echo "    scp router_bot_setup.sh root@192.168.1.1:/tmp/"
+            echo "    sh /tmp/router_bot_setup.sh"
             exit 1
         fi
         ;;
@@ -15093,6 +15132,7 @@ UNINSTALL_TARGETS = [
 SCAN_PATTERNS = ['*usque*', '*Usque*']
 RB_MODULES_USQUE_KEENETIC_ACTIONS_PY_EOF
 
+mkdir -p /opt/router_bot/modules/awg_manager /opt/router_bot/data/awg_manager
 echo "  → modules/awg_manager/__init__.py"
 cat > /opt/router_bot/modules/awg_manager/__init__.py << 'RB_MODULES_AWG___INIT___PY_EOF'
 
