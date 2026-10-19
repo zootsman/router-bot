@@ -10,7 +10,7 @@ set -e
 # и вернут дефолт. При интерактивном запуске работают как обычно.
 # Блок exec < /dev/tty УБРАН: при setsid() (Popen) /dev/tty не открывается.
 
-SETUP_VERSION="0.0.8-9"  # AUTO_DISCOVERY_PATCH_V1
+SETUP_VERSION="0.0.9"  # AUTO_DISCOVERY_PATCH_V1
 VERSION_FILE="/opt/router_bot/VERSION"
 INSTALLED_VERSION=""
 if [ -f "$VERSION_FILE" ]; then
@@ -187,7 +187,7 @@ RB_MAIN_PY_EOF
 
 echo "  → VERSION"
 cat > /opt/router_bot/VERSION << 'RB_VERSION_EOF'
-0.0.8-9
+0.0.9
 RB_VERSION_EOF
 
 echo "  → core/__init__.py"
@@ -646,6 +646,7 @@ from core.config import load_config, get as cfg
 from core.utils import (
     check_mirrors, get_current_mirror, apply_mirror,
     build_mirrors_text, build_mirrors_kb, ENTWARE_MIRRORS,
+    set_last_msg, get_last_msg, show_card,
 )
 from core.router import ModuleRouter
 
@@ -694,6 +695,13 @@ async def _build_main_menu(router):
             lines.append(f'{cat_icon} <b>{cat_title}</b> \u2014 {titles}')
             kb.append([InlineKeyboardButton(
                 f'{cat_icon} {cat_title}', callback_data=f'router:cat:{cat_name}')])
+
+    # Кнопка управления модулями
+    _enabled_now = {m.name for m in router.all()}
+    kb.append([InlineKeyboardButton(
+        f'\U0001f9e9 Модули ({len(_enabled_now)} из {len(_ALL_MODULE_META)})',
+        callback_data='router:modules',
+    )])
 
     return '\n'.join(lines), InlineKeyboardMarkup(kb)
 
@@ -787,20 +795,293 @@ async def _show_category(q, ctx, cat_name: str):
 
 
 
-    await update.message.reply_text(
+    await show_card(update, ctx,
         f'{icon} <b>{title}</b>\n\nНажмите кнопку ниже, чтобы открыть модуль.',
-        parse_mode='HTML',
-        reply_markup=InlineKeyboardMarkup([[
+        InlineKeyboardMarkup([[
             InlineKeyboardButton(f'{icon} Открыть {title}',
                                  callback_data=f'{mod_name}:main'),
         ]]),
     )
 
 
-async def _cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+# ============================================================================
+#  Управление модулями через inline-кнопки
+# ============================================================================
+
+_ALL_MODULE_META = (
+    ('net_watch',      '\U0001f4e1', 'Net Watch',      'мониторинг сетевых клиентов'),
+    ('ssh_control',    '\U0001f4bb', 'SSH Control',    'управление по SSH'),
+    ('system',         '\U0001f5a5', 'System',         'состояние роутера'),
+    ('hydraroute',     '\U0001f40d', 'HydraRoute',     'установка/управление HR'),
+    ('flashkeen',      '\U0001f4be', 'Flashkeen',      'менеджер дисков'),
+    ('xkeen',          '\U0001f43e', 'XKeen',          'Xray/Mihomo'),
+    ('bird',           '\U0001f426', 'BIRD',           'BGP/OSPF'),
+    ('mtproxy',        '\U0001f310', 'MTProxy',        'MTProto-прокси'),
+    ('keen_pbr',       '\U0001f6e4', 'Keen-PBR',       'policy-based routing'),
+    ('neofit',         '\U0001f500', 'NeoFit',         'веб-панель Xray/Sing-Box'),
+    ('usque_keenetic', '\u2601\ufe0f', 'Usque WARP',   'Cloudflare MASQUE'),
+    ('awg_manager',    '\U0001f6e1', 'AWG Manager',    'AmneziaWG/Sing-box'),
+)
+
+_MODULE_CONFLICTS = {
+    'hydraroute':     ['xkeen'],
+    'xkeen':          ['hydraroute'],
+    'bird':           ['hydraroute', 'xkeen'],
+    'keen_pbr':       ['xkeen', 'hydraroute'],
+    'usque_keenetic': ['keen_pbr', 'xkeen', 'hydraroute'],
+    'awg_manager':    ['xkeen', 'hydraroute', 'keen_pbr', 'usque_keenetic'],
+}
+
+_MODULE_PKG_DEPS = {
+    'ssh_control': ['openssh-client', 'openssh-keygen'],
+}
+
+
+def _read_enabled_modules() -> set:
+    try:
+        with open('/opt/router_bot/config.env') as f:
+            for line in f:
+                if line.startswith('ENABLED_MODULES='):
+                    v = line.split('=', 1)[1].strip().strip('"').strip("'")
+                    return {m.strip() for m in v.split(',') if m.strip()}
+    except Exception:
+        pass
+    return set()
+
+
+def _save_enabled_modules(mods: set):
+    cfg_path = '/opt/router_bot/config.env'
+    enabled_str = ','.join(sorted(mods))
+    with open(cfg_path) as f:
+        lines = f.readlines()
+    found = False
+    for i, line in enumerate(lines):
+        if line.startswith('ENABLED_MODULES='):
+            lines[i] = f"ENABLED_MODULES='{enabled_str}'\n"
+            found = True
+            break
+    if not found:
+        lines.append(f"ENABLED_MODULES='{enabled_str}'\n")
+    with open(cfg_path, 'w') as f:
+        f.writelines(lines)
+    subprocess.run(['cp', '-p', cfg_path, cfg_path + '.bak'],
+                   capture_output=True, timeout=5)
+
+
+def _build_modules_menu(pending: set):
+    lines = [
+        '\U0001f9e9 <b>Модули</b>',
+        '',
+        '<i>Нажмите на модуль, чтобы включить/выключить. '
+        'Затем нажмите «Применить».</i>',
+        '',
+    ]
+    rows = []
+    for name, icon, title, desc in _ALL_MODULE_META:
+        mark = '\u2705' if name in pending else '\u2b1c'
+        suffix = ''
+        if name in pending:
+            for c in _MODULE_CONFLICTS.get(name, []):
+                if c in pending:
+                    suffix = ' \u26a0\ufe0f'
+                    break
+        rows.append([InlineKeyboardButton(
+            f'{mark} {icon} {title}{suffix}',
+            callback_data=f'router:mod:t:{name}',
+        )])
+
+    n_on = sum(1 for m, _, _, _ in _ALL_MODULE_META if m in pending)
+    lines.append(f'<i>Включено: {n_on} из {len(_ALL_MODULE_META)}</i>')
+
+    routed = [m for m in ('hydraroute', 'xkeen', 'keen_pbr',
+                           'usque_keenetic', 'awg_manager', 'bird')
+              if m in pending]
+    if len(routed) > 1:
+        lines.append(
+            '\u26a0\ufe0f <i>Внимание: включено несколько '
+            'конфликтующих модулей. Одновременно будет работать '
+            'только один.</i>'
+        )
+
+    rows.append([
+        InlineKeyboardButton('\u2705 Все', callback_data='router:mod:all'),
+        InlineKeyboardButton('\u2b1c Ничего', callback_data='router:mod:none'),
+    ])
+    rows.append([
+        InlineKeyboardButton('\u2705 Применить', callback_data='router:mod:apply'),
+        InlineKeyboardButton('\u274c Отмена', callback_data='router:mod:cancel'),
+    ])
+    return '\n'.join(lines), InlineKeyboardMarkup(rows)
+
+
+async def _on_modules_menu(q, ctx):
+    await q.answer()
+    actual = _read_enabled_modules()
+    ctx.application.bot_data['pending_modules'] = set(actual)
+    text, kb = _build_modules_menu(actual)
+    try:
+        await q.edit_message_text(text, parse_mode='HTML', reply_markup=kb)
+    except Exception as e:
+        if 'not modified' not in str(e).lower():
+            raise
+
+
+async def _on_module_toggle(q, ctx, name):
+    await q.answer()
+    pending = ctx.application.bot_data.get('pending_modules')
+    if pending is None:
+        pending = _read_enabled_modules()
+    if name in pending:
+        if len(pending) <= 1:
+            await q.answer('Нужен хотя бы один модуль', show_alert=True)
+            return
+        pending.discard(name)
+    else:
+        pending.add(name)
+    ctx.application.bot_data['pending_modules'] = pending
+    text, kb = _build_modules_menu(pending)
+    try:
+        await q.edit_message_text(text, parse_mode='HTML', reply_markup=kb)
+    except Exception as e:
+        if 'not modified' not in str(e).lower():
+            raise
+
+
+async def _on_module_bulk(q, ctx, mode):
+    await q.answer()
+    if mode == 'all':
+        ctx.application.bot_data['pending_modules'] = {
+            m for m, _, _, _ in _ALL_MODULE_META
+        }
+    else:
+        ctx.application.bot_data['pending_modules'] = {'net_watch'}
+    pending = ctx.application.bot_data['pending_modules']
+    text, kb = _build_modules_menu(pending)
+    try:
+        await q.edit_message_text(text, parse_mode='HTML', reply_markup=kb)
+    except Exception as e:
+        if 'not modified' not in str(e).lower():
+            raise
+
+
+async def _on_modules_apply(q, ctx):
+    pending = ctx.application.bot_data.get('pending_modules')
+    if not pending:
+        await q.answer('Нечего применять', show_alert=True)
+        return
+    actual = _read_enabled_modules()
+    added = pending - actual
+    removed = actual - pending
+    if not added and not removed:
+        await q.answer('Изменений нет', show_alert=False)
+        return
+
+    await q.answer('Применяю...')
+    try:
+        await q.edit_message_text(
+            '\u23f3 <b>Применяю изменения...</b>\n\n'
+            f'Добавляю: {len(added)}, убираю: {len(removed)}\n'
+            '<i>Проверяю зависимости...</i>',
+            parse_mode='HTML',
+        )
+    except Exception:
+        pass
+
+    deps_to_install = []
+    for m in added:
+        for pkg in _MODULE_PKG_DEPS.get(m, []):
+            r = subprocess.run(
+                ['sh', '-c',
+                 f'opkg list-installed 2>/dev/null | grep -q "^{pkg} "'],
+                timeout=5,
+            )
+            if r.returncode != 0:
+                deps_to_install.append(pkg)
+
+    if deps_to_install:
+        try:
+            await q.edit_message_text(
+                '\u23f3 <b>Применяю изменения...</b>\n\n'
+                f'\U0001f4e6 Устанавливаю: '
+                f'<code>{" ".join(deps_to_install)}</code>\n'
+                '<i>Это займёт 10–30 сек...</i>',
+                parse_mode='HTML',
+            )
+        except Exception:
+            pass
+        try:
+            await asyncio.to_thread(
+                subprocess.run,
+                ['opkg', 'install'] + deps_to_install,
+                capture_output=True,
+                timeout=120,
+            )
+        except Exception as e:
+            log.warning('opkg install failed: %s', e)
+
+    try:
+        _save_enabled_modules(pending)
+    except Exception as e:
+        log.exception('save enabled modules failed: %s', e)
+        try:
+            await q.edit_message_text(
+                f'\u274c <b>Ошибка записи</b>\n\n<code>{e}</code>',
+                parse_mode='HTML',
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton('\u2b05\ufe0f Назад',
+                                          callback_data='router:modules'),
+                ]]),
+            )
+        except Exception:
+            pass
+        return
+
+    ctx.application.bot_data.pop('pending_modules', None)
+
+    enabled_str = ','.join(sorted(pending))
+    try:
+        await q.edit_message_text(
+            '\u2705 <b>Модули сохранены</b>\n\n'
+            f'Включено: <b>{len(pending)}</b> из {len(_ALL_MODULE_META)}\n'
+            f'<code>{enabled_str}</code>\n\n'
+            '\U0001f504 <i>Бот перезапустится через 3 секунды. '
+            'Когда вернётся — напишите /start.</i>',
+            parse_mode='HTML',
+        )
+    except Exception:
+        pass
+
+    subprocess.Popen(
+        ['sh', '-c', 'sleep 3 && /opt/etc/init.d/S98routerbot restart'],
+        start_new_session=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    log.info('modules applied: %s', enabled_str)
+
+
+async def _on_modules_cancel(q, ctx):
+    await q.answer()
+    ctx.application.bot_data.pop('pending_modules', None)
     router = ctx.application.bot_data['router']
     text, kb = await _build_main_menu(router)
-    await update.message.reply_text(text, parse_mode='HTML', reply_markup=kb)
+    try:
+        await q.edit_message_text(text, parse_mode='HTML', reply_markup=kb)
+    except Exception as e:
+        if 'not modified' not in str(e).lower():
+            raise
+
+
+async def _cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    router = ctx.application.bot_data['router']
+    for mod in router.all():
+        if hasattr(mod, 'on_leave'):
+            try:
+                await mod.on_leave()
+            except Exception as e:
+                log.warning('on_leave %s failed: %s', mod.name, e)
+    text, kb = await _build_main_menu(router)
+    await show_card(update, ctx, text, kb)
 
 
 async def _cmd_restart(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -877,41 +1158,45 @@ async def _do_restart_confirm(q, ctx):
 
 
 async def _cmd_mirrors(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    msg = await update.message.reply_text(
-        '\U0001f30d Проверяю зеркала Entware... (5-10 сек)',
-    )
+    await show_card(update, ctx, '\U0001f30d Проверяю зеркала Entware... (5-10 сек)')
     results = await check_mirrors()
     current = get_current_mirror()
     text = build_mirrors_text(results, current)
     kb = build_mirrors_kb(results)
-    try:
-        await msg.edit_text(text, parse_mode='HTML', reply_markup=kb)
-    except Exception:
-        pass
+    last_id = get_last_msg(update.effective_chat.id)
+    if last_id:
+        try:
+            await ctx.bot.edit_message_text(
+                chat_id=update.effective_chat.id, message_id=last_id,
+                text=text, parse_mode='HTML', reply_markup=kb,
+            )
+        except Exception:
+            pass
 
 
 async def _cmd_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    msg = await update.message.reply_text('\U0001f50d Проверяю версию на GitHub...')
+    await show_card(update, ctx, '\U0001f50d Проверяю версию на GitHub...')
+    last_id = get_last_msg(update.effective_chat.id)
+    async def _edit(text, kb=None):
+        if last_id:
+            try:
+                await ctx.bot.edit_message_text(
+                    chat_id=update.effective_chat.id, message_id=last_id,
+                    text=text, parse_mode='HTML', reply_markup=kb,
+                )
+            except Exception:
+                pass
     current = _read_current_version()
     try:
         latest = await asyncio.to_thread(_fetch_latest_version)
     except Exception as e:
-        try:
-            await msg.edit_text(
-                f'\u274c Не удалось проверить: <code>{e}</code>',
-                parse_mode='HTML')
-        except Exception:
-            pass
+        await _edit(f'\u274c Не удалось проверить: <code>{e}</code>')
         return
     if _ver_cmp(latest, current) <= 0:
-        try:
-            await msg.edit_text(
-                f'\u2705 <b>Актуальная версия</b>\n\n'
-                f'Текущая: <code>{current}</code>\n'
-                f'На GitHub: <code>{latest}</code>',
-                parse_mode='HTML')
-        except Exception:
-            pass
+        await _edit(
+            f'\u2705 <b>Актуальная версия</b>\n\n'
+            f'Текущая: <code>{current}</code>\n'
+            f'На GitHub: <code>{latest}</code>')
         return
     text = (
         f'\U0001f195 <b>Доступно обновление</b>\n\n'
@@ -927,10 +1212,7 @@ async def _cmd_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         [InlineKeyboardButton('\u274c Отмена',
                               callback_data='router:main')],
     ])
-    try:
-        await msg.edit_text(text, parse_mode='HTML', reply_markup=kb)
-    except Exception:
-        pass
+    await _edit(text, kb)
 
 
 async def _on_self_update_now(q, ctx):
@@ -1077,6 +1359,12 @@ async def _on_mirror_apply(q, ctx, idx):
 
 async def _cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     router = ctx.application.bot_data['router']
+    for mod in router.all():
+        if hasattr(mod, 'on_leave'):
+            try:
+                await mod.on_leave()
+            except Exception as e:
+                log.warning('on_leave %s failed: %s', mod.name, e)
     lines = ['\U0001f916 <b>Router Bot</b>', '', '<b>Основные команды:</b>',
              '/start   \u2014 главное меню',
              '/help    \u2014 эта справка',
@@ -1103,14 +1391,13 @@ async def _cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton('\U0001f680 Открыть главное меню', callback_data='router:main')],
     ])
-    await update.message.reply_text(
-        '\n'.join(lines), parse_mode='HTML', reply_markup=kb,
-    )
+    await show_card(update, ctx, '\n'.join(lines), kb)
 
 
 async def _on_router_main(query, ctx):
     """Callback 'router:main' — возврат в главное меню."""
     await query.answer()
+    ctx.application.bot_data.pop('pending_modules', None)
     router = ctx.application.bot_data['router']
     text, kb = await _build_main_menu(router)
     try:
@@ -1265,6 +1552,18 @@ def main():
             return await _do_restart_confirm(q, ctx)
         if q.data == 'router:reboot_confirm':
             return await _do_reboot_confirm(q, ctx)
+        if q.data == 'router:modules':
+            return await _on_modules_menu(q, ctx)
+        if q.data.startswith('router:mod:t:'):
+            return await _on_module_toggle(q, ctx, q.data[len('router:mod:t:'):])
+        if q.data == 'router:mod:all':
+            return await _on_module_bulk(q, ctx, 'all')
+        if q.data == 'router:mod:none':
+            return await _on_module_bulk(q, ctx, 'none')
+        if q.data == 'router:mod:apply':
+            return await _on_modules_apply(q, ctx)
+        if q.data == 'router:mod:cancel':
+            return await _on_modules_cancel(q, ctx)
         if q.data == 'router:main':
             # сбрасываем состояние всех модулей
             for mod in router.all():
@@ -1278,9 +1577,43 @@ def main():
 
     app.add_handler(CallbackQueryHandler(_global_callback))
 
+    # --- авто-удаление сообщений пользователя ---
+    from telegram.ext import MessageHandler as _MH, filters as _f
+    async def _del_user_msg(update, ctx):
+        try:
+            if update.message:
+                await ctx.bot.delete_message(
+                    chat_id=update.effective_chat.id, 
+                    message_id=update.message.message_id
+                )
+        except Exception as e:
+            log.debug('auto-delete failed: %s', e)
+            
+    app.add_handler(_MH(_f.COMMAND, _del_user_msg), group=-101)
+    app.add_handler(_MH(_f.TEXT & ~_f.COMMAND, _del_user_msg), group=-100)
+
+    # --- авто-удаление сообщений пользователя (только текст и команды) ---
+    from telegram.ext import MessageHandler as _MH, filters as _f
+
+    async def _force_del_user_msg(update, ctx):
+        # Удаляем ТОЛЬКО входящие текстовые сообщения и команды.
+        # НЕ трогаем колбэки (кнопки), иначе удалим саму карточку.
+        if update.message:
+            try:
+                await ctx.bot.delete_message(
+                    chat_id=update.effective_chat.id,
+                    message_id=update.message.message_id
+                )
+            except Exception as e:
+                import logging
+                logging.getLogger(__name__).debug(
+                    'force_del_user_msg failed: %s', e
+                )
+
+    app.add_handler(_MH(_f.TEXT | _f.COMMAND, _force_del_user_msg), group=-999)
+
     log.info('Starting router bot...')
     app.run_polling(drop_pending_updates=True)
-
 RB_CORE_MAIN_PY_EOF
 
 echo "  → core/router.py"
@@ -1908,6 +2241,118 @@ def build_mirrors_kb(results):
         '\u2b05\ufe0f Назад', callback_data='router:main')])
     return InlineKeyboardMarkup(rows)
 
+
+
+# ================== Универсальный edit-or-send ==================
+
+async def ui_edit_or_send(bot, chat_id, message_id, text, kb=None,
+                          parse_mode='HTML'):
+    """Редактирует сообщение, если message_id задан и edit удался.
+    Иначе шлёт новое. Возвращает message_id актуального сообщения.
+
+    Использование:
+        self._status_msg_id = await ui_edit_or_send(
+            ctx.bot, self.chat_id, self._status_msg_id,
+            text='⏳ Выполняется...', kb=kill_kb,
+        )
+    """
+    import logging as _log
+    _l = _log.getLogger(__name__)
+
+    if message_id:
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id, message_id=message_id,
+                text=text, parse_mode=parse_mode, reply_markup=kb,
+            )
+            return message_id
+        except Exception as e:
+            err = str(e).lower()
+            if 'not modified' in err:
+                return message_id
+            if 'message to edit not found' in err or 'message_id_invalid' in err:
+                _l.debug('ui_edit_or_send: message gone, sending new')
+            else:
+                _l.debug('ui_edit_or_send: edit failed: %s', e)
+
+    msg = await bot.send_message(
+        chat_id=chat_id, text=text,
+        parse_mode=parse_mode, reply_markup=kb,
+    )
+    return msg.message_id
+
+
+async def ui_edit_q(q, text, kb=None, parse_mode='HTML'):
+    """Edit через callback_query. Возвращает message_id или None.
+
+    Использование:
+        await ui_edit_q(q, '⏳ Выполняется...', kb=kill_kb)
+    """
+    try:
+        await q.edit_message_text(text, parse_mode=parse_mode, reply_markup=kb)
+        set_last_msg(q.message.chat_id, q.message.message_id)
+        return q.message.message_id
+    except Exception as e:
+        if 'not modified' in str(e).lower():
+            return q.message.message_id
+        raise
+
+
+# ================== Одно окно: last_msg + show_card ==================
+
+import json as _json_lm
+LAST_MSG_FILE = '/opt/router_bot/data/system/last_msg.json'
+
+def _lm_load():
+    try:
+        with open(LAST_MSG_FILE) as f: return _json_lm.load(f)
+    except Exception: return {}
+
+def _lm_save(d):
+    try:
+        os.makedirs(os.path.dirname(LAST_MSG_FILE), exist_ok=True)
+        with open(LAST_MSG_FILE, 'w') as f: _json_lm.dump(d, f)
+    except Exception: pass
+
+def set_last_msg(chat_id, msg_id):
+    d = _lm_load()
+    d[str(chat_id)] = int(msg_id)
+    _lm_save(d)
+
+def get_last_msg(chat_id):
+    return _lm_load().get(str(chat_id))
+
+async def show_card(update, ctx, text, kb=None, parse_mode='HTML'):
+    """Удаляет сообщение пользователя; редактирует последнее сообщение бота
+    (или отправляет новое, если предыдущего нет)."""
+    import logging
+    log = logging.getLogger(__name__)
+    chat_id = update.effective_chat.id
+    try:
+        if update.message:
+            await ctx.bot.delete_message(
+                chat_id=chat_id, 
+                message_id=update.message.message_id
+            )
+    except Exception as e:
+        log.debug('show_card delete failed: %s', e)
+        
+    last_id = get_last_msg(chat_id)
+    if last_id:
+        try:
+            await ctx.bot.edit_message_text(
+                chat_id=chat_id, message_id=last_id,
+                text=text, parse_mode=parse_mode, reply_markup=kb,
+            )
+            return last_id
+        except Exception as e:
+            if 'not modified' in str(e).lower():
+                return last_id
+    msg = await ctx.bot.send_message(
+        chat_id=chat_id, text=text, parse_mode=parse_mode, reply_markup=kb,
+    )
+    set_last_msg(chat_id, msg.message_id)
+    return msg.message_id
 RB_CORE_UTILS_PY_EOF
 
 echo "  → core/rb"
@@ -2979,6 +3424,7 @@ from telegram.ext import (
     ApplicationBuilder, CommandHandler, CallbackQueryHandler,
     MessageHandler, filters, ContextTypes,
 )
+from core.utils import show_card
 
 
 
@@ -3919,7 +4365,7 @@ class NetWatchModule:
             [InlineKeyboardButton('\U0001f4ca Статистика', callback_data='net_watch:stats')],
             [InlineKeyboardButton('\U0001f3e0 Модули', callback_data='router:main')],
         ])
-        await update.message.reply_text(text, parse_mode='HTML', reply_markup=kb)
+        await show_card(update, ctx, text, kb=kb)
 
     async def handle_callback(self, action: str, query, ctx):
         await query.answer()
@@ -4347,7 +4793,6 @@ async def sync_known_hosts_from_router():
         save_json(KNOWN_NAMES_FILE, local)
     log.info('known hosts sync: %d added (total %d)', added, len(local))
     return added
-
 RB_MODULES_NET_WATCH_MODULE_PY_EOF
 
 echo "  → modules/ssh_control/__init__.py"
@@ -4376,6 +4821,7 @@ from .ssh_client import (
 from .storage import (
     load_hosts, add_host, remove_host, get_host,
 )
+
 
 log = logging.getLogger(__name__)
 
@@ -4418,6 +4864,7 @@ def _is_script(text: str) -> bool:
     return '\n' in text.strip()
 
 import re as _re
+from core.utils import show_card, set_last_msg, get_last_msg
 
 def _filter_ssh_noise(err: str) -> str:
     if not err:
@@ -4457,11 +4904,12 @@ class SSHControlModule:
         self.current_script_proc = None
 
     async def startup(self, app):
+        log.info('SSH Control: registering MessageHandler (group=50)')
         app.add_handler(MessageHandler(
             filters.TEXT & ~filters.COMMAND,
             self._handle_text,
-        ))
-        log.info('SSH Control module started')
+        ), group=50)
+        log.info('SSH Control module started (group=50)')
 
     async def send_card_message(self, update, ctx):
         hosts = load_hosts()
@@ -4476,7 +4924,7 @@ class SSHControlModule:
             [InlineKeyboardButton('📋 Список хостов', callback_data='ssh_control:hosts')],
             [InlineKeyboardButton('🏠 Модули', callback_data='router:main')],
         ])
-        await update.message.reply_text(text, parse_mode='HTML', reply_markup=kb)
+        await show_card(update, ctx, text, kb=kb)
 
     async def on_leave(self):
         if self.interactive:
@@ -4625,6 +5073,7 @@ class SSHControlModule:
         await self._show_hosts(q, ctx)
 
     async def _start_wizard(self, q, ctx):
+        log.info('ssh_control _start_wizard: set state=wizard:ip')
         self.state = 'wizard:ip'
         self.temp = {}
         text = (
@@ -4678,14 +5127,14 @@ class SSHControlModule:
         await self._edit(q, text, kb)
 
     async def _handle_text(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        if str(update.effective_chat.id) != self.chat_id:
+        log.info('ssh_control _handle_text CALLED: state=%s', self.state)
+        if not update.message:
+            log.info('ssh_control _handle_text: no update.message')
             return
         text = (update.message.text or '').strip()
         if not text:
             return
-        if self.state == 'idle':
-            return
-
+        log.info('ssh_control _handle_text: text=%r, state=%s', text, self.state)
         if self.state == 'wizard:ip':
             return await self._wizard_ip(update, ctx, text)
         if self.state == 'wizard:port':
@@ -4697,6 +5146,7 @@ class SSHControlModule:
         if self.state.startswith('exec:'):
             hid = self.state[5:]
             return await self._exec_command(update, ctx, hid, text)
+        log.info('ssh_control _handle_text: state %s ignored', self.state)
 
     async def _wizard_ip(self, update, ctx, text):
         self.temp['ip'] = text
@@ -4705,10 +5155,9 @@ class SSHControlModule:
             [InlineKeyboardButton('✅ Порт 22 (по умолчанию)', callback_data='ssh_control:port_default')],
             [InlineKeyboardButton('❌ Отмена', callback_data='ssh_control:cancel')],
         ])
-        await update.message.reply_text(
+        await show_card(update, ctx,
             f"<b>Шаг 2/4.</b> Отправьте порт SSH или нажмите кнопку ниже:",
-            parse_mode='HTML', reply_markup=kb,
-        )
+            kb)
 
     async def _wizard_port(self, update, ctx, text):
         try:
@@ -4716,52 +5165,40 @@ class SSHControlModule:
             if not (1 <= port <= 65535):
                 raise ValueError
         except ValueError:
-            await update.message.reply_text('❌ Порт должен быть числом 1–65535. Попробуйте снова.')
+            await show_card(update, ctx, '❌ Порт должен быть числом 1–65535. Попробуйте снова.')
             return
         self.temp['port'] = port
         self.state = 'wizard:user'
-        await update.message.reply_text(
+        await show_card(update, ctx,
             f"<b>Шаг 3/4.</b> Отправьте имя пользователя:",
-            parse_mode='HTML',
         )
 
     async def _wizard_user(self, update, ctx, text):
         self.temp['user'] = text
         self.state = 'wizard:pass'
-        await update.message.reply_text(
+        await show_card(update, ctx,
             f"<b>Шаг 4/4.</b> Отправьте пароль.\n\n"
             f"⚠️ Я сразу удалю его из чата.",
-            parse_mode='HTML',
         )
     async def _wizard_pass(self, update, ctx, text):
         log.info('wizard:pass received password len=%d', len(text))
         self.temp['password'] = text
-        msg_id = update.message.message_id
-        chat_id = update.message.chat_id
-        await self._try_delete_msg(ctx, chat_id, msg_id)
+        # Удаляем сообщение с паролем (если ещё не удалено)
         try:
-            for delay in (3, 10, 30):
-                ctx.job_queue.run_once(
-                    self._delete_retry, when=delay,
-                    data={'chat_id': chat_id, 'msg_id': msg_id},
-                )
-        except Exception as e:
-            log.warning('job_queue failed: %s', e)
+            await update.message.delete()
+        except Exception:
+            pass
 
         ip = self.temp.get('ip', '')
         port = self.temp.get('port', 22)
         log.info('wizard:pass probing %s:%s', ip, port)
 
-        try:
-            status = await update.message.reply_text(
-                f'🔐 Проверяю SSH-хост...\n\n'
-                f'<code>{_esc(ip)}:{port}</code>\n'
-                f'<i>Может занять до 20 секунд.</i>',
-                parse_mode='HTML',
-            )
-            log.info('wizard:pass status sent id=%s', status.message_id)
-        except Exception as e:
-            log.exception('wizard:pass send status FAILED: %s', e)
+        status_msg_id = await show_card(update, ctx,
+            f'🔐 Проверяю SSH-хост...\n\n'
+            f'<code>{_esc(ip)}:{port}</code>\n'
+            f'<i>Может занять до 20 секунд.</i>',
+        )
+        if not status_msg_id:
             return
 
         try:
@@ -4777,10 +5214,14 @@ class SSHControlModule:
             self.state = 'idle'
             self.temp = {}
             try:
-                await status.edit_text(
-                    f'❌ <b>Не удалось подключиться</b>\n\n'
-                    f'Хост: <code>{_esc(ip)}:{port}</code>\n'
-                    f'Ошибка: <i>{_esc(err)}</i>',
+                await ctx.bot.edit_message_text(
+                    chat_id=self.chat_id,
+                    message_id=status_msg_id,
+                    text=(
+                        f'❌ <b>Не удалось подключиться</b>\n\n'
+                        f'Хост: <code>{_esc(ip)}:{port}</code>\n'
+                        f'Ошибка: <i>{_esc(err)}</i>'
+                    ),
                     parse_mode='HTML',
                     reply_markup=InlineKeyboardMarkup([
                         [InlineKeyboardButton('🔁 Заново',
@@ -4799,13 +5240,17 @@ class SSHControlModule:
         log.info('wizard:pass OK fp=%s', probe['fingerprint'][:30])
 
         try:
-            await status.edit_text(
-                f'🔐 <b>Проверка SSH host key</b>\n\n'
-                f'Хост: <code>{_esc(ip)}:{port}</code>\n'
-                f'Юзер: <code>{_esc(self.temp.get("user",""))}</code>\n\n'
-                f'Тип: <code>{_esc(probe["key_type"] or "?")}</code>\n'
-                f'Fingerprint:\n<code>{_esc(probe["fingerprint"])}</code>\n\n'
-                f'✅ Принять и сохранить хост?',
+            await ctx.bot.edit_message_text(
+                chat_id=self.chat_id,
+                message_id=status_msg_id,
+                text=(
+                    f'🔐 <b>Проверка SSH host key</b>\n\n'
+                    f'Хост: <code>{_esc(ip)}:{port}</code>\n'
+                    f'Юзер: <code>{_esc(self.temp.get("user",""))}</code>\n\n'
+                    f'Тип: <code>{_esc(probe["key_type"] or "?")}</code>\n'
+                    f'Fingerprint:\n<code>{_esc(probe["fingerprint"])}</code>\n\n'
+                    f'✅ Принять и сохранить хост?'
+                ),
                 parse_mode='HTML',
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton('✅ Принять',
@@ -4879,7 +5324,7 @@ class SSHControlModule:
         if not h:
             self.state = 'idle'
             self.active_hid = None
-            await update.message.reply_text('❌ Хост не найден.')
+            await show_card(update, ctx, '❌ Хост не найден.')
             return
 
         if self.interactive:
@@ -4902,14 +5347,13 @@ class SSHControlModule:
         self.interactive_question_sent = False
         self.interactive_out_buffer = []
 
-        msg = await update.message.reply_text(
+        msg_id = await show_card(update, ctx,
             f"⏳ Выполняю: <code>{_esc(code[:200])}</code>",
-            parse_mode='HTML',
-            reply_markup=InlineKeyboardMarkup([
+            InlineKeyboardMarkup([
                 [InlineKeyboardButton('🛑 Отменить', callback_data='ssh_control:abort')],
             ]),
         )
-        self.interactive_msg_id = msg.message_id
+        self.interactive_msg_id = msg_id
 
         sess = InteractiveSSH(
             h['ip'], h['port'], h['user'], h['password'],
@@ -4926,7 +5370,7 @@ class SSHControlModule:
             try:
                 await ctx.bot.edit_message_text(
                     chat_id=update.effective_chat.id,
-                    message_id=msg.message_id,
+                    message_id=msg_id,
                     text=f"❌ <b>Ошибка запуска</b>\n\n<i>{_esc(str(e))}</i>",
                     parse_mode='HTML',
                 )
@@ -4941,9 +5385,9 @@ class SSHControlModule:
         self.state = f'exec:{hid}'
         self.active_hid = hid
 
-        status = await update.message.reply_text(
+        status_msg_id = await show_card(update, ctx,
             f'⏳ Выполняю блок ({len(script.splitlines())} строк)...',
-            reply_markup=InlineKeyboardMarkup([
+            InlineKeyboardMarkup([
                 [InlineKeyboardButton('🛑 Отменить', callback_data='ssh_control:abort_script')],
             ]),
         )
@@ -4958,16 +5402,19 @@ class SSHControlModule:
                 on_proc=_save_proc,
             )
         except Exception as e:
-            await status.edit_text(
-                f'❌ <b>Ошибка</b>\n\n<i>{_esc(str(e))}</i>',
-                parse_mode='HTML',
-            )
+            kb = InlineKeyboardMarkup([
+                        [InlineKeyboardButton('⬅️ Назад', callback_data=f'ssh_control:host:{hid}'),
+                 InlineKeyboardButton('🏠 Модули', callback_data='router:main')],
+            ])
+            try:
+                await ctx.bot.edit_message_text(
+                    chat_id=self.chat_id, message_id=status_msg_id,
+                    text=f'❌ <b>Ошибка</b>\n\n<i>{_esc(str(e))}</i>',
+                    parse_mode='HTML', reply_markup=kb,
+                )
+            except Exception:
+                pass
             return
-
-        try:
-            await status.delete()
-        except Exception:
-            pass
 
         out_clean = _filter_ssh_noise(out or '')
         err_clean = _filter_ssh_noise(err)
@@ -4977,12 +5424,26 @@ class SSHControlModule:
 
         header = f'$ script [{len(script.splitlines())} lines]\n[exit code: {rc}]\n\n'
         full = header + body
+        hint = 'Напишите текст — выполнится следующая команда.'
 
-        if len(full) <= MAX_MSG:
-            await self._send_block(update, full)
-        else:
-            for chunk in _split(full):
-                await self._send_block(update, chunk)
+        kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton('⬅️ Назад', callback_data=f'ssh_control:host:{hid}'),
+             InlineKeyboardButton('🏠 Модули', callback_data='router:main')],
+        ])
+
+        try:
+            if len(full) <= 3800:
+                text_out = f"<pre>{_esc(full)}</pre>\n\n<i>{hint}</i>"
+            else:
+                text_out = (f"<pre>{_esc(full[:3600])}</pre>\n"
+                            f"<i>…логи обрезаны. Полный лог: /opt/var/log/router_bot.log</i>\n\n"
+                            f"<i>{hint}</i>")
+            await ctx.bot.edit_message_text(
+                chat_id=self.chat_id, message_id=status_msg_id,
+                text=text_out, parse_mode='HTML', reply_markup=kb,
+            )
+        except Exception as e:
+            log.debug('script block edit: %s', e)
 
         self.state = f'exec:{hid}'
         self.active_hid = hid
@@ -5016,25 +5477,35 @@ class SSHControlModule:
         buf = b''.join(self.interactive_out_buffer).decode('utf-8', errors='replace')
         tail = buf[-400:] if len(buf) > 400 else buf
         kb = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton('✅ Да (y)', callback_data='ssh_control:answer:y'),
-                InlineKeyboardButton('❌ Нет (n)', callback_data='ssh_control:answer:n'),
-            ],
-            [
-                InlineKeyboardButton('⏎ Enter', callback_data='ssh_control:answer:enter'),
-                InlineKeyboardButton('🛑 Прервать', callback_data='ssh_control:answer:kill'),
-            ],
+            [InlineKeyboardButton('\u2705 Да (y)', callback_data='ssh_control:answer:y'),
+             InlineKeyboardButton('\u274c Нет (n)', callback_data='ssh_control:answer:n')],
+            [InlineKeyboardButton('\u23ce Enter', callback_data='ssh_control:answer:enter'),
+             InlineKeyboardButton('\U0001f6d1 Прервать', callback_data='ssh_control:answer:kill')],
         ])
+        if self.interactive_msg_id:
+            try:
+                await ctx.bot.edit_message_text(
+                    chat_id=self.chat_id,
+                    message_id=self.interactive_msg_id,
+                    text=f"\u2753 <b>Требуется ответ</b>\n\n<pre>{_esc(tail)}</pre>",
+                    parse_mode='HTML',
+                    reply_markup=kb,
+                )
+                self.interactive_question_sent = True
+                return
+            except Exception as e:
+                log.debug('send_question edit: %s', e)
         try:
-            await ctx.bot.send_message(
+            m = await ctx.bot.send_message(
                 chat_id=self.chat_id,
-                text=f"❓ <b>Требуется ответ</b>\n\n<pre>{_esc(tail)}</pre>",
+                text=f"\u2753 <b>Требуется ответ</b>\n\n<pre>{_esc(tail)}</pre>",
                 parse_mode='HTML',
                 reply_markup=kb,
             )
             self.interactive_question_sent = True
-        except Exception:
-            pass
+            self.interactive_msg_id = m.message_id
+        except Exception as e:
+            log.warning('send_question failed: %s', e)
 
     async def _answer_question(self, q, ctx, data: bytes):
         if not self.interactive:
@@ -5089,29 +5560,53 @@ class SSHControlModule:
         full_text = b''.join(self.interactive_out_buffer).decode('utf-8', errors='replace')
         header = f"[exit code: {rc}]\n\n"
         body = header + full_text
+        if not body.strip():
+            body = header + '(пусто)'
+
+        kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton('⬅️ Назад', callback_data=f'ssh_control:host:{hid}'),
+             InlineKeyboardButton('🏠 Модули', callback_data='router:main')],
+        ])
+        hint = 'Напишите текст — выполнится следующая команда.'
 
         if self.interactive_msg_id:
             try:
-                await ctx.bot.delete_message(
-                    chat_id=chat_id, message_id=self.interactive_msg_id,
-                )
-            except Exception:
-                pass
-            self.interactive_msg_id = None
-
-        if len(body) <= MAX_MSG:
-            await ctx.bot.send_message(
-                chat_id=chat_id,
-                text=f"<pre>{_esc(body)}</pre>",
-                parse_mode='HTML',
-            )
-        else:
-            for chunk in _split(body):
-                await ctx.bot.send_message(
+                if len(body) <= MAX_MSG:
+                    text_out = f"<pre>{_esc(body)}</pre>\n\n<i>{hint}</i>"
+                else:
+                    text_out = (f"<pre>{_esc(body[:MAX_MSG - 400])}</pre>\n"
+                                f"<i>…логи обрезаны. Полный лог: /opt/var/log/router_bot.log</i>\n\n"
+                                f"<i>{hint}</i>")
+                await ctx.bot.edit_message_text(
                     chat_id=chat_id,
-                    text=f"<pre>{_esc(chunk)}</pre>",
+                    message_id=self.interactive_msg_id,
+                    text=text_out,
                     parse_mode='HTML',
+                    reply_markup=kb,
                 )
+                self.interactive_msg_id = None
+                self.interactive_out_buffer = []
+                self.state = f'exec:{hid}'
+                self.active_hid = hid
+                return
+            except Exception as e:
+                log.debug('wait_interactive edit: %s', e)
+                self.interactive_msg_id = None
+
+        try:
+            if len(body) <= MAX_MSG:
+                text_out = f"<pre>{_esc(body)}</pre>\n\n<i>{hint}</i>"
+            else:
+                text_out = (f"<pre>{_esc(body[:MAX_MSG - 400])}</pre>\n"
+                            f"<i>…логи обрезаны. Полный лог: /opt/var/log/router_bot.log</i>\n\n"
+                            f"<i>{hint}</i>")
+            msg = await ctx.bot.send_message(
+                chat_id=chat_id, text=text_out,
+                parse_mode='HTML', reply_markup=kb,
+            )
+            set_last_msg(chat_id, msg.message_id)
+        except Exception as e:
+            log.warning('wait_interactive send failed: %s', e)
 
         self.interactive_out_buffer = []
         self.state = f'exec:{hid}'
@@ -5119,19 +5614,22 @@ class SSHControlModule:
 
     async def _send_block(self, update, text):
         try:
-            await update.message.reply_text(
-                f"<pre>{_esc(text)}</pre>", parse_mode='HTML',
-            )
+            await show_card(update, update.message.chat_id, f"<pre>{_esc(text)}</pre>")
         except Exception:
-            await update.message.reply_text(text)
+            pass
 
     async def _edit(self, q, text, kb):
         try:
             await q.edit_message_text(text, parse_mode='HTML', reply_markup=kb)
+            set_last_msg(self.chat_id, q.message.message_id)
         except Exception as e:
-            if 'not modified' not in str(e).lower():
-                raise
-
+            if 'not modified' in str(e).lower():
+                return
+            bot = q.get_bot() if hasattr(q, 'get_bot') else q.message.get_bot()
+            msg = await bot.send_message(
+                chat_id=self.chat_id, text=text, parse_mode='HTML', reply_markup=kb
+            )
+            set_last_msg(self.chat_id, msg.message_id)
 RB_MODULES_SSH_CONTROL_MODULE_PY_EOF
 
 echo "  → modules/ssh_control/ssh_client.py"
@@ -5689,6 +6187,7 @@ from datetime import datetime, timedelta
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from core.config import get as cfg
+from core.utils import show_card, set_last_msg
 
 log = logging.getLogger(__name__)
 
@@ -6477,9 +6976,9 @@ class SystemModule:
     async def send_card_message(self, update, ctx):
         upd = get_update_info()
         text = build_system_card(upd=upd)
-        await update.message.reply_text(
-            text, parse_mode='HTML',
-            reply_markup=_kb(upd.get('update_available', False)),
+        await show_card(update, ctx, 
+            text,
+            kb=_kb(upd.get('update_available', False)),
         )
 
     async def handle_callback(self, action, q, ctx):
@@ -6731,7 +7230,6 @@ class SystemModule:
                      login or 'admin')
         except Exception as e:
             log.exception('_fw_start: start_firmware_update failed: %s', e)
-
 RB_MODULES_SYSTEM_MODULE_PY_EOF
 
 echo "  → modules/hydraroute/__init__.py"
@@ -6760,12 +7258,15 @@ from .actions import (
     get_hr_web_url, get_router_ip, get_versions, check_updates,
     load_last_seen, save_last_seen, get_update_status,
 )
+from core.utils import set_last_msg
 
 log = logging.getLogger(__name__)
 from core.utils import (
     existing_targets, sync_opts, build_uninstall_menu,
     collect_uninstall_cmd, toggle_opt,
     scan_leftovers, build_leftovers_message,
+    ui_edit_q, ui_edit_or_send,
+    show_card,
 )
 
 MAX_MSG = 3500
@@ -6950,7 +7451,7 @@ class HydraRouteModule:
 
     async def send_card_message(self, update, ctx):
         text, kb = self._build_card()
-        await update.message.reply_text(text, parse_mode='HTML', reply_markup=kb)
+        await show_card(update, ctx, text, kb=kb)
 
     conflicts_with = {
         'xkeen': 'оба используют /opt/etc/xray и запускают демон xray',
@@ -7166,7 +7667,7 @@ class HydraRouteModule:
             a = ACTIONS.get(key)
             if not a:
                 return
-            await self._start_action(ctx, key, a)
+            await self._start_action(q, ctx, key, a)
             return
 
         if action == 'kill':
@@ -7178,13 +7679,13 @@ class HydraRouteModule:
             return
 
         if action == 'ans:y':
-            await self._answer(q, ctx, b'y\n')
+            await self._answer(q, b'y\r')
             return
         if action == 'ans:n':
-            await self._answer(q, ctx, b'n\n')
+            await self._answer(q, b'n\r')
             return
         if action == 'ans:enter':
-            await self._answer(q, ctx, b'\n')
+            await self._answer(q, b'\r')
             return
 
         await q.answer()
@@ -7241,6 +7742,7 @@ class HydraRouteModule:
             ]),
         )
         self._status_msg_id = msg.message_id
+        set_last_msg(self.chat_id, msg.message_id)
         asyncio.create_task(self._run_action(ctx, action))
 
     async def _show_uninstall_menu(self, q, ctx):
@@ -7297,6 +7799,7 @@ class HydraRouteModule:
                 ]),
             )
             self._status_msg_id = msg.message_id
+            set_last_msg(self.chat_id, msg.message_id)
             asyncio.create_task(self._run_action(ctx, action))
             return
 
@@ -7349,19 +7852,23 @@ class HydraRouteModule:
             self._token_editing = False
             from .actions import build_keenetic_cmd
             cmd = build_keenetic_cmd(text)
-            await update.message.reply_text('🔑 Записываю токен...')
-            await self._start_action(ctx, 'keenetic',
+            try:
+                await update.message.delete()
+            except Exception:
+                pass
+            await self._start_action(None, ctx, 'keenetic',
                 {'icon': '🔑', 'title': 'Keenetic token', 'cmd': cmd})
             return
         if self._match_editing:
             self._match_editing = False
             from .actions import build_match_cmd
             cmd = build_match_cmd(text)
-            await update.message.reply_text(
-                f'🎯 Проверяю для <code>{text}</code>...',
-                parse_mode='HTML')
-            await self._start_action(ctx, 'match',
-                {'icon': '🎯', 'title': 'Match domain', 'cmd': cmd})
+            try:
+                await update.message.delete()
+            except Exception:
+                pass
+            await self._start_action(None, ctx, 'match',
+                {'icon': '🎯', 'title': f'Match {text}', 'cmd': cmd})
             return
 
     async def _ask_keenetic(self, q, ctx):
@@ -7397,31 +7904,51 @@ class HydraRouteModule:
         except Exception as e:
             if 'not modified' not in str(e).lower():
                 raise
-    async def _start_action(self, ctx, key, action):
-        self._last_action = key
+    async def _start_action(self, q, ctx, key, action):
         if self._running:
             return
-
         self._running = True
-        self._awaiting_answer = False
+        self._last_action = key
+        self._buf = b''
+        self._last_edit = 0.0
+        self._awaiting_yn = False
 
-        status_text = (
-            f'{action["icon"]} <b>{action["title"]}</b>\n\n'
-            f'<pre>Запускаю...</pre>'
-        )
+        status_text = f'{action["icon"]} <b>{action["title"]}</b>\n\n<pre>Запускаю...</pre>'
         kb = InlineKeyboardMarkup([
-            [InlineKeyboardButton('🛑 Отменить', callback_data='hydraroute:kill')],
+            [InlineKeyboardButton('\U0001f6d1 Отменить', callback_data='hydraroute:kill')],
         ])
-        msg = await ctx.bot.send_message(
-            chat_id=self.chat_id,
-            text=status_text,
-            parse_mode='HTML',
-            reply_markup=kb,
-        )
-        self._status_msg_id = msg.message_id
-        asyncio.create_task(self._run_action(ctx, action))
+    
+        if q is not None:
+            self._status_msg_id = await ui_edit_q(q, status_text, kb=kb)
+        else:
+            msg = await ctx.bot.send_message(
+                chat_id=self.chat_id, text=status_text,
+                parse_mode='HTML', reply_markup=kb,
+            )
+            self._status_msg_id = msg.message_id
+            set_last_msg(self.chat_id, msg.message_id)
+
+        async def _safe_run():
+            try:
+                await self._run_action(ctx, action)
+            except Exception as e:
+                log.exception('hydraroute _run_action failed: %s', e)
+                self._running = False
+                if self._status_msg_id:
+                    try:
+                        await ctx.bot.edit_message_text(
+                            chat_id=self.chat_id,
+                            message_id=self._status_msg_id,
+                            text=f'❌ <b>Ошибка выполнения</b>\n<pre>{_esc(str(e))}</pre>',
+                            parse_mode='HTML',
+                        )
+                    except Exception:
+                        pass
+
+        asyncio.create_task(_safe_run())
 
     async def _run_action(self, ctx, action):
+        import pty, subprocess, time, os
         cmd = action['cmd']
         log.info('hydraroute action cmd: %s', cmd)
 
@@ -7429,16 +7956,12 @@ class HydraRouteModule:
         try:
             proc = subprocess.Popen(
                 ['sh', '-c', cmd],
-                stdin=slave,
-                stdout=slave,
-                stderr=slave,
-                close_fds=True,
-                start_new_session=True,
+                stdin=slave, stdout=slave, stderr=slave,
+                close_fds=True, start_new_session=True,
                 env={**os.environ, 'DEBIAN_FRONTEND': 'noninteractive'},
             )
         except Exception as e:
-            os.close(master)
-            os.close(slave)
+            os.close(master); os.close(slave)
             await self._finish(ctx, f'Не удалось запустить: {e}'.encode(), -1)
             return
 
@@ -7453,53 +7976,58 @@ class HydraRouteModule:
             log.warning('nonblock set failed: %s', e)
 
         buf = b''
-        last_update = 0.0
-        idle_start = time.time()
+        last_update = time.time()
+        start_time = time.time()
+        timeout_total = 30 if self._last_action == "match" else 120
+
+        # Принудительно отправляем первое обновление статуса (убираем "Запускаю...")
+        await self._update_status(ctx, buf)
 
         try:
             while True:
-                if self._proc is None:
-                    break
+                if self._proc is None: break
                 ret = proc.poll()
                 if ret is not None:
                     buf += self._drain_master(master)
                     break
 
-                try:
-                    data = os.read(master, 4096)
-                    idle_start = time.time()
-                except BlockingIOError:
-                    await asyncio.sleep(0.15)
-                    if time.time() - idle_start > 2.0 and proc.poll() is not None:
-                        buf += self._drain_master(master)
-                        break
-                    continue
-                except OSError:
-                    break
-                if not data:
+                if time.time() - start_time > timeout_total:
+                    buf += b'\n[!] Timeout\n'
+                    proc.kill()
                     break
 
-                buf += data
-                if len(buf) > 600000:
-                    buf = buf[-500000:]
+                try:
+                    data = os.read(master, 4096)
+                    if data:
+                        buf += data
+                        if len(buf) > 600000: buf = buf[-500000:]
+                        self._buf = buf
+                except BlockingIOError:
+                    pass
+                except OSError:
+                    break
 
                 now = time.time()
                 if now - last_update >= 1.2:
                     last_update = now
                     await self._update_status(ctx, buf)
 
-                if not self._awaiting_answer and _has_question(buf[-500:]):
+                if not getattr(self, '_awaiting_yn', False) and _has_question(buf[-500:]):
                     await self._ask_question(ctx, buf)
+
+                await asyncio.sleep(0.15)
         except Exception as e:
             log.exception('hydraroute run error: %s', e)
         finally:
-            try:
-                os.close(master)
-            except Exception:
-                pass
+            try: os.close(master)
+            except Exception: pass
             self._master_fd = None
 
-        rc = proc.wait()
+        try:
+            rc = proc.wait(timeout=2)
+        except Exception:
+            proc.kill()
+            rc = -1
         self._proc = None
         await self._finish(ctx, buf, rc)
 
@@ -7523,68 +8051,55 @@ class HydraRouteModule:
         return extra
 
     async def _update_status(self, ctx, buf):
-        if not self._status_msg_id:
-            return
+        if not self._status_msg_id: return
         text_buf = buf.decode('utf-8', errors='replace')
-        tail = text_buf[-2000:] if len(text_buf) > 2000 else text_buf
+        tail = text_buf[-1800:] if len(text_buf) > 1800 else text_buf
+    
+        if getattr(self, '_awaiting_yn', False):
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton('\u2705 Да (y)', callback_data='hydraroute:ans:y'),
+                 InlineKeyboardButton('\u274c Нет (n)', callback_data='hydraroute:ans:n')],
+                [InlineKeyboardButton('\u23ce Enter', callback_data='hydraroute:ans:enter'),
+                 InlineKeyboardButton('\U0001f6d1 Прервать', callback_data='hydraroute:kill')],
+            ])
+        else:
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton('\U0001f6d1 Отменить', callback_data='hydraroute:kill')],
+            ])
+        
         try:
             await ctx.bot.edit_message_text(
                 chat_id=self.chat_id,
                 message_id=self._status_msg_id,
-                text=f'⏳ <b>Выполняется...</b>\n\n<pre>{_esc(tail)}</pre>',
-                parse_mode='HTML',
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton('🛑 Отменить', callback_data='hydraroute:kill')],
-                ]),
+                text=f'\u23f3 <b>Выполняется...</b>\n\n<pre>{_esc(tail)}</pre>',
+                parse_mode='HTML', reply_markup=kb,
             )
         except Exception as e:
             if 'not modified' not in str(e).lower():
                 log.debug('edit status: %s', e)
 
     async def _ask_question(self, ctx, buf):
-        self._awaiting_answer = True
-        text_buf = buf.decode('utf-8', errors='replace')
-        tail = text_buf[-400:] if len(text_buf) > 400 else text_buf
-        kb = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton('✅ Да (y)', callback_data='hydraroute:ans:y'),
-                InlineKeyboardButton('❌ Нет (n)', callback_data='hydraroute:ans:n'),
-            ],
-            [
-                InlineKeyboardButton('⏎ Enter', callback_data='hydraroute:ans:enter'),
-                InlineKeyboardButton('🛑 Прервать', callback_data='hydraroute:kill'),
-            ],
-        ])
-        try:
-            q = await ctx.bot.send_message(
-                chat_id=self.chat_id,
-                text=f'❓ <b>Требуется ответ</b>\n\n<pre>{_esc(tail)}</pre>',
-                parse_mode='HTML',
-                reply_markup=kb,
-            )
-            self._question_msg_id = q.message_id
-        except Exception as e:
-            log.warning('ask_question failed: %s', e)
+        if getattr(self, '_awaiting_yn', False): return
+        self._awaiting_yn = True
+        await self._update_status(ctx, buf)
 
-    async def _answer(self, q, ctx, data):
-        if not self._proc or not self._master_fd:
-            await q.answer('Процесс уже завершён', show_alert=False)
+    async def _answer(self, q, payload: bytes):
+        if not getattr(self, '_proc', None) or self._master_fd is None:
+            await q.answer('Сессия завершена', show_alert=False)
             return
         try:
-            os.write(self._master_fd, data)
+            os.write(self._master_fd, payload)
+            await q.answer(f'Отправлено: {payload.decode(errors="replace").strip() or "Enter"}')
         except OSError as e:
-            log.warning('write to master failed: %s', e)
-        await q.answer(f'Отправлено: {data.decode().strip() or "Enter"}')
-        try:
-            await q.message.delete()
-        except Exception:
-            pass
-        self._awaiting_answer = False
-        self._question_msg_id = None
+            log.warning('write failed: %s', e)
+            await q.answer(f'Ошибка: {e}', show_alert=True)
+            return
+        self._awaiting_yn = False
+        # _run_action сам перерисует статус через 1.2с
 
     async def _finish(self, ctx, buf, rc):
         self._running = False
-        self._awaiting_answer = False
+        self._awaiting_yn = False
         was_uninstall = (self._last_action == 'uninstall')
         was_cleanup = (self._last_action == 'cleanup')
         was_match = (self._last_action == 'match')
@@ -7596,61 +8111,46 @@ class HydraRouteModule:
         text = text.strip()
 
         if rc == 0 and 'Collected errors' in text:
-            new_lines = []
-            skip = False
+            new_lines, skip = [], False
             for ln in text.split('\n'):
                 if 'Collected errors' in ln:
-                    skip = True
-                    continue
+                    skip = True; continue
                 if skip:
                     if ln.strip().startswith('*'):
-                        if 'is not installed' in ln:
-                            continue
-                        new_lines.append(ln)
-                        continue
+                        if 'is not installed' in ln: continue
+                        new_lines.append(ln); continue
                     else:
                         skip = False
                 new_lines.append(ln)
             text = '\n'.join(new_lines).strip()
 
-        offer_start = (
-            getattr(self, '_last_action', None) == 'install'
-            and rc == 0
-            and is_installed()
-        )
+        offer_start = (getattr(self, '_last_action', None) == 'install' and rc == 0 and is_installed())
         self._last_action = None
 
         if self._question_msg_id:
-            try:
-                await ctx.bot.delete_message(
-                    chat_id=self.chat_id, message_id=self._question_msg_id,
-                )
-            except Exception:
-                pass
+            try: await ctx.bot.delete_message(chat_id=self.chat_id, message_id=self._question_msg_id)
+            except Exception: pass
             self._question_msg_id = None
 
         icon = '✅' if rc == 0 else '❌'
+
+        # --- WATCHLIST ---
         if was_watchlist and self._status_msg_id:
             lines = text.splitlines()
             total = len(lines)
             if total > 100:
-                preview_lines = (lines[:50]
-                    + ['', f'... (опущено {total-100} строк) ...', '']
-                    + lines[-50:])
-                preview = '\n'.join(preview_lines)
+                preview = '\n'.join(lines[:50] + ['', f'... (опущено {total-100} строк) ...', ''] + lines[-50:])
             else:
                 preview = text
-            if len(preview) > 3500:
-                preview = preview[:3500] + '\n...'
+            if len(preview) > 3500: preview = preview[:3500] + '\n...'
             try:
                 await ctx.bot.edit_message_text(
-                    chat_id=self.chat_id,
-                    message_id=self._status_msg_id,
+                    chat_id=self.chat_id, message_id=self._status_msg_id,
                     text=f'📋 <b>Watchlist</b> — {total} строк\n\n<pre>{_esc(preview)}</pre>',
                     parse_mode='HTML', reply_markup=None,
                 )
-            except Exception as e:
-                log.debug('watchlist M1 edit failed: %s', e)
+            except Exception as e: log.debug('watchlist M1 edit failed: %s', e)
+        
             try:
                 from telegram import InputFile
                 import io as _io
@@ -7660,137 +8160,77 @@ class HydraRouteModule:
                     chat_id=self.chat_id,
                     document=InputFile(fbuf, filename='watchlist.txt'),
                     caption=f'📋 Watchlist — полный список ({total} строк)',
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton('⬅️ Назад',
-                                              callback_data='hydraroute:main')],
-                    ]),
+                    reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('⬅️ Назад', callback_data='hydraroute:main')]]),
                 )
-            except Exception as e:
-                log.warning('watchlist file send failed: %s', e)
+            except Exception as e: log.warning('watchlist file send failed: %s', e)
             self._status_msg_id = None
             return
 
+        # --- MATCH ---
         if was_match and self._status_msg_id:
             stripped = text.strip() if text else ''
             if stripped.startswith('OK'):
                 parts = stripped.split(None, 3)
                 if len(parts) >= 4:
-                    pol = parts[1]
-                    dom = parts[3]
-                    final = (f'🟢 <b>Маршрутизируется через HR</b>\n\n'
-                             f'Домен: <code>{_esc(dom)}</code>\n'
-                             f'Политика: <b>{_esc(pol)}</b>')
+                    final = f'🟢 <b>Маршрутизируется через HR</b>\n\nДомен: <code>{_esc(parts[3])}</code>\nПолитика: <b>{_esc(parts[1])}</b>'
                 else:
-                    final = (f'🟢 <b>OK</b>\n\n'
-                             f'<pre>{_esc(stripped)}</pre>')
+                    final = f'🟢 <b>OK</b>\n\n<pre>{_esc(stripped)}</pre>'
             elif stripped.startswith('NO'):
-                final = ('⚪ <b>Не найдено в HR</b>\n'
-                         '<i>Пойдёт напрямую через WAN.</i>')
+                final = '⚪ <b>Не найдено в HR</b>\n<i>Пойдёт напрямую через WAN.</i>'
             else:
                 final = '🎯 <b>Match</b>'
-                if stripped:
-                    final += f'\n\n<pre>{_esc(stripped[-1500:])}</pre>'
+                if stripped: final += f'\n\n<pre>{_esc(stripped[-1500:])}</pre>'
+        
             kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton('🔄 Ещё',
-                                      callback_data='hydraroute:ask:match')],
-                [InlineKeyboardButton('⬅️ Назад',
-                                      callback_data='hydraroute:main')],
+                [InlineKeyboardButton('🔄 Ещё', callback_data='hydraroute:ask:match')],
+                [InlineKeyboardButton('⬅️ Назад', callback_data='hydraroute:main')],
             ])
             try:
                 await ctx.bot.edit_message_text(
-                    chat_id=self.chat_id,
-                    message_id=self._status_msg_id,
-                    text=final,
-                    parse_mode='HTML',
-                    reply_markup=kb,
+                    chat_id=self.chat_id, message_id=self._status_msg_id,
+                    text=final, parse_mode='HTML', reply_markup=kb,
                 )
             except Exception as e:
                 log.debug('final match M1 failed: %s', e)
             self._status_msg_id = None
             return
 
+        # --- UNINSTALL / INSTALL / OTHER ---
         if self._status_msg_id:
-            if was_cleanup:
-                m1_title = '🗑 <b>Удаление остатков</b>'
-            elif was_uninstall:
-                m1_title = '🗑 <b>Удаление HydraRoute</b>'
-            elif offer_start:
-                m1_title = '📦 <b>Установка HydraRoute</b>'
-            else:
-                m1_title = '⚙️ <b>Операция</b>'
-
+            if was_cleanup: m1_title = '🗑 <b>Удаление остатков</b>'
+            elif was_uninstall: m1_title = '🗑 <b>Удаление HydraRoute</b>'
+            elif offer_start: m1_title = '📦 <b>Установка HydraRoute</b>'
+            else: m1_title = '⚙️ <b>Операция</b>'
             tail_m1 = text[-3500:] if len(text) > 3500 else text
-            m1_text = f'{m1_title}\n\n<pre>{_esc(tail_m1)}</pre>'
             try:
                 await ctx.bot.edit_message_text(
-                    chat_id=self.chat_id,
-                    message_id=self._status_msg_id,
-                    text=m1_text,
-                    parse_mode='HTML',
-                    reply_markup=None,
+                    chat_id=self.chat_id, message_id=self._status_msg_id,
+                    text=f'{m1_title}\n\n<pre>{_esc(tail_m1)}</pre>',
+                    parse_mode='HTML', reply_markup=None,
                 )
-            except Exception as e:
-                log.debug('final M1 update failed: %s', e)
+            except Exception as e: log.debug('final M1 update failed: %s', e)
             self._status_msg_id = None
 
         if offer_start:
-            header = (
-                f'{icon} <b>Установка HydraRoute завершена</b>\n'
-                f'<i>exit code: {rc}</i>'
-            )
-            kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton('⬅️ Назад',
-                                      callback_data='hydraroute:main')],
-            ])
+            header = f'{icon} <b>Установка HydraRoute завершена</b>\n<i>exit code: {rc}</i>'
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton('⬅️ Назад', callback_data='hydraroute:main')]])
         elif was_cleanup:
             header = f'{icon} <b>Остатки удалены</b> (exit code: {rc})'
-            kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton('⬅️ Назад',
-                                      callback_data='hydraroute:main')],
-            ])
-        elif was_match:
-            stripped = text.strip() if text else ''
-            if stripped.startswith('OK'):
-                header = (f'🟢 <b>Маршрутизируется через HR</b>\n\n'
-                          f'<pre>{_esc(stripped)}</pre>')
-            elif stripped.startswith('NO'):
-                header = ('⚪ <b>Не найдено в HR</b>\n'
-                          '<i>Пойдёт напрямую через WAN.</i>')
-            else:
-                header = '🎯 <b>Match</b>'
-                if stripped:
-                    header += f'\n\n<pre>{_esc(stripped[-1500:])}</pre>'
-            kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton('⬅️ Назад',
-                                      callback_data='hydraroute:main')],
-            ])
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton('⬅️ Назад', callback_data='hydraroute:main')]])
         else:
             header = f'{icon} <b>Завершено</b> (exit code: {rc})'
-            kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton('⬅️ Назад',
-                                      callback_data='hydraroute:main')],
-            ])
+            kb = InlineKeyboardMarkup([[InlineKeyboardButton('⬅️ Назад', callback_data='hydraroute:main')]])
 
         body = header
-        if not was_match and rc != 0 and text:
+        if rc != 0 and text and not was_match:
             err_tail = '\n'.join(text.split('\n')[-15:])
-            if len(err_tail) > 1500:
-                err_tail = err_tail[-1500:]
-            body += f'\n\n<pre>{_esc(err_tail)}</pre>'
+            body += f'\n\n<pre>{_esc(err_tail[-1500:])}</pre>'
 
         try:
-            await ctx.bot.send_message(
-                chat_id=self.chat_id,
-                text=body,
-                parse_mode='HTML',
-                reply_markup=kb,
-            )
-        except Exception as e:
-            log.warning('final M2 send failed: %s', e)
-
-        if rc == 0 and was_uninstall:
-            await self._check_leftovers(ctx)
-
+            await ctx.bot.send_message(chat_id=self.chat_id, text=body, parse_mode='HTML', reply_markup=kb)
+        except Exception as e: log.warning('final M2 send failed: %s', e)
+    
+        if rc == 0 and was_uninstall: await self._check_leftovers(ctx)
 RB_MODULES_HYDRAROUTE_MODULE_PY_EOF
 
 echo "  → modules/hydraroute/actions.py"
@@ -8369,7 +8809,10 @@ from core.utils import (
     existing_targets, sync_opts, build_uninstall_menu,
     collect_uninstall_cmd, toggle_opt,
     scan_leftovers, build_leftovers_message,
+    ui_edit_q, ui_edit_or_send,
+    show_card,
 )
+from core.utils import set_last_msg
 
 log = logging.getLogger(__name__)
 
@@ -8562,7 +9005,7 @@ class FlashkeenModule:
 
     async def send_card_message(self, update, ctx):
         text, kb = self._build_card()
-        await update.message.reply_text(text, parse_mode='HTML', reply_markup=kb)
+        await show_card(update, ctx, text, kb=kb)
 
     # --- статус для карточки «Сервис» ---
     conflicts_with = {}
@@ -8635,12 +9078,12 @@ class FlashkeenModule:
             cmd = cmds.get(key)
             if not cmd:
                 return
-            await self._start_action(ctx, key, cmd)
+            await self._start_action(q, ctx, key, cmd)
             return
 
         if action == 'run':
             await q.answer('Запускаю...')
-            await self._start_interactive(ctx)
+            await self._start_interactive(q, ctx)
             return
 
         if action == 'kill':
@@ -8753,6 +9196,7 @@ class FlashkeenModule:
             ]),
         )
         self._status_msg_id = msg.message_id
+        set_last_msg(self.chat_id, msg.message_id)
 
         pid, master = pty.fork()
         if pid == 0:
@@ -8815,6 +9259,7 @@ class FlashkeenModule:
                 ]),
             )
             self._status_msg_id = msg.message_id
+            set_last_msg(self.chat_id, msg.message_id)
 
             pid, master = pty.fork()
             if pid == 0:
@@ -8829,7 +9274,7 @@ class FlashkeenModule:
             return
 
         await q.answer()
-    async def _start_action(self, ctx, key, cmd):
+    async def _start_action(self, q, ctx, key, cmd):
         if self._running:
             return
         self._running = True
@@ -8838,27 +9283,23 @@ class FlashkeenModule:
         self._buf = b''
         self._last_edit = 0.0
 
-        msg = await ctx.bot.send_message(
-            chat_id=self.chat_id,
-            text='⏳ <b>Выполняется...</b>\n\n<pre>запуск...</pre>',
-            parse_mode='HTML',
-            reply_markup=InlineKeyboardMarkup([
+        self._status_msg_id = await ui_edit_q(
+            q,
+            '\u23f3 <b>Выполняется...</b>\n\n<pre>запуск...</pre>',
+            kb=InlineKeyboardMarkup([
                 [InlineKeyboardButton('\U0001f6d1 Отменить',
                                       callback_data='flashkeen:kill')],
             ]),
         )
-        self._status_msg_id = msg.message_id
 
         pid, master = pty.fork()
         if pid == 0:
-            # дочерний процесс — exec, никогда не возвращаемся
             try:
                 os.environ['DEBIAN_FRONTEND'] = 'noninteractive'
                 os.environ['TERM'] = 'dumb'
                 os.execv('/bin/sh', ['sh', '-c', cmd])
             except Exception:
                 os._exit(1)
-
         self._proc_pid = pid
         self._master = master
         asyncio.create_task(self._reader_loop_action(ctx, pid, master))
@@ -8965,28 +9406,29 @@ class FlashkeenModule:
                 log.debug('edit status: %s', e)
 
     async def _ask_yn(self, ctx, buf):
+        if self._awaiting_yn:
+            return
         self._awaiting_yn = True
+        if not self._status_msg_id:
+            return
         text = _strip_ansi(buf.decode('utf-8', errors='replace'))
-        tail = text[-400:] if len(text) > 400 else text
-        kb = InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton('\u2705 Да (y)', callback_data='flashkeen:send:y'),
-                InlineKeyboardButton('\u274c Нет (n)', callback_data='flashkeen:send:n'),
-            ],
-            [
-                InlineKeyboardButton('\u23ce Enter', callback_data='flashkeen:send:enter'),
-                InlineKeyboardButton('\U0001f6d1 Прервать', callback_data='flashkeen:kill'),
-            ],
-        ])
+        tail = text[-1800:] if len(text) > 1800 else text
         try:
-            q = await ctx.bot.send_message(
+            await ctx.bot.edit_message_text(
                 chat_id=self.chat_id,
+                message_id=self._status_msg_id,
                 text=f'\u2753 <b>Требуется ответ</b>\n\n<pre>{_esc(tail)}</pre>',
-                parse_mode='HTML', reply_markup=kb,
+                parse_mode='HTML',
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton('\u2705 Да (y)', callback_data='flashkeen:send:y'),
+                     InlineKeyboardButton('\u274c Нет (n)', callback_data='flashkeen:send:n')],
+                    [InlineKeyboardButton('\u23ce Enter', callback_data='flashkeen:send:enter'),
+                     InlineKeyboardButton('\U0001f6d1 Прервать', callback_data='flashkeen:kill')],
+                ]),
             )
-            self._question_msg_id = q.message_id
         except Exception as e:
-            log.warning('ask_yn: %s', e)
+            if 'not modified' not in str(e).lower():
+                log.debug('ask_yn edit: %s', e)
 
     async def _send_input(self, q, ctx, payload: bytes):
         if not getattr(self, '_proc_pid', None) or self._master is None:
@@ -9123,7 +9565,7 @@ class FlashkeenModule:
 
         if rc == 0 and was_uninstall:
             await self._check_leftovers(ctx)
-    async def _start_interactive(self, ctx):
+    async def _start_interactive(self, q, ctx):
         if self._running:
             return
         self._running = True
@@ -9133,16 +9575,14 @@ class FlashkeenModule:
 
         launch = find_flashkeen() or FLASHKEEN_LAUNCH
 
-        msg = await ctx.bot.send_message(
-            chat_id=self.chat_id,
-            text='⏳ <b>Запускаю Flashkeen...</b>',
-            parse_mode='HTML',
-            reply_markup=InlineKeyboardMarkup([
+        self._status_msg_id = await ui_edit_q(
+            q,
+            '\u23f3 <b>Запускаю Flashkeen...</b>',
+            kb=InlineKeyboardMarkup([
                 [InlineKeyboardButton('\U0001f6d1 Закрыть',
                                       callback_data='flashkeen:kill')],
             ]),
         )
-        self._status_msg_id = msg.message_id
 
         pid, master = pty.fork()
         if pid == 0:
@@ -9312,7 +9752,6 @@ class FlashkeenModule:
         except Exception:
             pass
         await self._refresh_interactive(ctx)
-
 RB_MODULES_FLASHKEEN_MODULE_PY_EOF
 
 echo "  → modules/flashkeen/actions.py"
@@ -9425,7 +9864,10 @@ from core.utils import (
     existing_targets, sync_opts, build_uninstall_menu,
     collect_uninstall_cmd, toggle_opt,
     scan_leftovers, build_leftovers_message,
+    ui_edit_q, ui_edit_or_send,
+    show_card,
 )
+from core.utils import set_last_msg
 
 log = logging.getLogger(__name__)
 
@@ -9757,7 +10199,7 @@ class XKeenModule:
 
     async def send_card_message(self, update, ctx):
         text, kb = self._build_card()
-        await update.message.reply_text(text, parse_mode='HTML', reply_markup=kb)
+        await show_card(update, ctx, text, kb=kb)
 
     # --- статус для карточки «Сервис» ---
     conflicts_with = {
@@ -9877,7 +10319,7 @@ class XKeenModule:
             a = ACTIONS.get(key)
             if not a:
                 return
-            await self._start_action(ctx, key, a)
+            await self._start_action(q, ctx, key, a)
             return
 
         if action == 'kill':
@@ -9915,26 +10357,20 @@ class XKeenModule:
         await q.answer()
 
     async def _answer(self, q, payload: bytes):
-        if not self._proc_pid or self._master is None:
-            log.warning('answer: сессия закрыта (pid=%s)', self._proc_pid)
+        if not getattr(self, '_proc_pid', None) or self._master is None:
             await q.answer('Сессия завершена', show_alert=False)
             return
         try:
-            n = os.write(self._master, payload)
-            log.info('answer: отправлено %r (%d bytes) pid=%s',
-                     payload, n, self._proc_pid)
+            os.write(self._master, payload)
             await q.answer(
                 f'Отправлено: {payload.decode(errors="replace").strip() or "Enter"}',
             )
         except OSError as e:
             log.warning('write failed: %s', e)
-            await q.answer(f'Ошибка отправки: {e}', show_alert=True)
+            await q.answer(f'Ошибка: {e}', show_alert=True)
             return
         self._awaiting_yn = False
-        try:
-            await self._update_status(bot=q.bot)
-        except Exception as e:
-            log.debug('post-answer update failed: %s', e)
+        await self._update_status(bot=q.bot)
     # ================= удаление остатков =================
 
     async def _check_leftovers(self, ctx):
@@ -9985,6 +10421,7 @@ class XKeenModule:
             ]),
         )
         self._status_msg_id = msg.message_id
+        set_last_msg(self.chat_id, msg.message_id)
 
         pid, master = pty.fork()
         if pid == 0:
@@ -10050,6 +10487,7 @@ class XKeenModule:
                 ]),
             )
             self._status_msg_id = msg.message_id
+            set_last_msg(self.chat_id, msg.message_id)
 
             pid, master = pty.fork()
             if pid == 0:
@@ -10064,7 +10502,7 @@ class XKeenModule:
             return
 
         await q.answer()
-    async def _start_action(self, ctx, key, action):
+    async def _start_action(self, q, ctx, key, action):
         if self._running:
             return
         self._running = True
@@ -10073,30 +10511,26 @@ class XKeenModule:
         self._last_edit = 0.0
         self._awaiting_yn = False
 
-        msg = await ctx.bot.send_message(
-            chat_id=self.chat_id,
-            text=f'{action["icon"]} <b>{action["title"]}</b>\n\n<pre>запуск...</pre>',
-            parse_mode='HTML',
-            reply_markup=InlineKeyboardMarkup([
+        self._status_msg_id = await ui_edit_q(
+            q,
+            f'{action["icon"]} <b>{action["title"]}</b>\n\n<pre>запуск...</pre>',
+            kb=InlineKeyboardMarkup([
                 [InlineKeyboardButton('\U0001f6d1 Отменить',
                                       callback_data='xkeen:kill')],
             ]),
         )
-        self._status_msg_id = msg.message_id
 
-        fork_pid, master = pty.fork()
-        if fork_pid == 0:
+        pid, master = pty.fork()
+        if pid == 0:
             try:
-                os.environ['DEBIAN_FRONTEND'] = 'noninteractive'
                 os.environ['TERM'] = 'dumb'
+                os.environ['DEBIAN_FRONTEND'] = 'noninteractive'
                 os.execv('/bin/sh', ['sh', '-c', action['cmd']])
             except Exception:
                 os._exit(1)
-
-        self._proc_pid = fork_pid
+        self._proc_pid = pid
         self._master = master
-
-        asyncio.create_task(self._reader_loop(ctx, fork_pid, master))
+        asyncio.create_task(self._reader_loop(ctx, pid, master))
 
     def _drain_master(self, master):
         """Дочитывает остаток из pty после смерти процесса."""
@@ -10184,36 +10618,24 @@ class XKeenModule:
         await self._finish(ctx, self._buf, rc)
 
     async def _update_status(self, ctx=None, bot=None):
-        if not self._status_msg_id:
-            return
         if bot is None and ctx is not None:
             bot = ctx.bot
-        if bot is None:
+        if bot is None or not self._status_msg_id:
             return
-
         text = _strip_ansi(self._buf.decode('utf-8', errors='replace'))
         tail = text[-1800:] if len(text) > 1800 else text
-
-        items = _detect_menu_items(text)
-        kb_rows = []
-        if items:
-            kb_rows.extend(_menu_row_buttons(items))
-
-        if self._awaiting_yn:
-            kb_rows.append([
-                InlineKeyboardButton('\u2705 Да (y)', callback_data='xkeen:ans:y'),
-                InlineKeyboardButton('\u274c Нет (n)', callback_data='xkeen:ans:n'),
-            ])
-            kb_rows.append([
-                InlineKeyboardButton('\u23ce Enter', callback_data='xkeen:ans:enter'),
-                InlineKeyboardButton('\U0001f6d1 Прервать', callback_data='xkeen:kill'),
+        if getattr(self, '_awaiting_yn', False):
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton('\u2705 Да (y)', callback_data='xkeen:ans:y'),
+                 InlineKeyboardButton('\u274c Нет (n)', callback_data='xkeen:ans:n')],
+                [InlineKeyboardButton('\u23ce Enter', callback_data='xkeen:ans:enter'),
+                 InlineKeyboardButton('\U0001f6d1 Прервать', callback_data='xkeen:kill')],
             ])
         else:
-            kb_rows.append([
-                InlineKeyboardButton('\U0001f6d1 Отменить', callback_data='xkeen:kill'),
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton('\U0001f6d1 Отменить',
+                                      callback_data='xkeen:kill')],
             ])
-
-        kb = InlineKeyboardMarkup(kb_rows)
         try:
             await bot.edit_message_text(
                 chat_id=self.chat_id,
@@ -10225,9 +10647,7 @@ class XKeenModule:
         except Exception as e:
             if 'not modified' not in str(e).lower():
                 log.debug('update_status: %s', e)
-    async def _ask_question(self, ctx):
-        """Ставит флаг ожидания и обновляет статусное сообщение
-        с кнопками ответа."""
+    async def _ask_question(self, ctx, buf=None):
         if self._awaiting_yn:
             return
         self._awaiting_yn = True
@@ -10237,13 +10657,10 @@ class XKeenModule:
         self._awaiting_yn = False
         was_uninstall = (self._last_action == 'uninstall')
         was_cleanup = (self._last_action == 'cleanup')
-
         text = _strip_ansi(buf.decode('utf-8', errors='replace'))
 
-        # Фильтр безобидного шума opkg
         if rc == 0 and 'Collected errors' in text:
-            new_lines = []
-            skip = False
+            new_lines, skip = [], False
             for ln in text.split('\n'):
                 if 'Collected errors' in ln:
                     skip = True
@@ -10259,48 +10676,18 @@ class XKeenModule:
                 new_lines.append(ln)
             text = '\n'.join(new_lines).strip()
 
-        # Предложить запуск после успешной установки
         offer_start = (
             self._last_action == 'install'
             and rc == 0
-            and is_installed()
-            and get_service_status() != 'running'
+            and (get_service_status() != 'unknown')
+            and not (get_service_status() == 'running')
         )
         self._last_action = None
-
         icon = '\u2705' if rc == 0 else '\u274c'
 
-        # M1 — полным логом с заголовком
-        if self._status_msg_id:
-            if was_cleanup:
-                m1_title = '\U0001f5d1 <b>Удаление остатков</b>'
-            elif was_uninstall:
-                m1_title = '\U0001f5d1 <b>Удаление XKeen</b>'
-            elif offer_start:
-                m1_title = '\U0001f4e6 <b>Установка XKeen</b>'
-            else:
-                m1_title = '\u2699\ufe0f <b>Операция</b>'
-
-            tail_m1 = text[-3500:] if len(text) > 3500 else text
-            m1_text = f'{m1_title}\n\n<pre>{_esc(tail_m1)}</pre>'
-            try:
-                await ctx.bot.edit_message_text(
-                    chat_id=self.chat_id,
-                    message_id=self._status_msg_id,
-                    text=m1_text,
-                    parse_mode='HTML',
-                    reply_markup=None,
-                )
-            except Exception as e:
-                log.debug('final M1 update failed: %s', e)
-            self._status_msg_id = None
-
-        # M2 — короткий
         if offer_start:
-            header = (
-                f'{icon} <b>Установка XKeen завершена</b>\n'
-                f'<i>exit code: {rc}</i>'
-            )
+            header = (f'{icon} <b>Установка завершена</b>\n'
+                      f'<i>exit code: {rc}</i>')
             kb = InlineKeyboardMarkup([
                 [InlineKeyboardButton('\u25b6\ufe0f Запустить сейчас',
                                       callback_data='xkeen:ask:start')],
@@ -10314,33 +10701,56 @@ class XKeenModule:
                                       callback_data='xkeen:main')],
             ])
         else:
-            header = f'{icon} <b>Завершено</b> (exit code: {rc})'
+            header = f'{icon} <b>Операция завершена</b> (exit code: {rc})'
             kb = InlineKeyboardMarkup([
                 [InlineKeyboardButton('\u2b05\ufe0f Назад',
                                       callback_data='xkeen:main')],
             ])
 
         body = header
-        if rc != 0 and text.strip():
-            err_tail = '\n'.join(text.strip().split('\n')[-15:])
-            if len(err_tail) > 1500:
-                err_tail = err_tail[-1500:]
-            body += f'\n\n<pre>{_esc(err_tail)}</pre>'
+        if text.strip():
+            tail = '\n'.join(text.strip().split('\n')[-20:])
+            if len(tail) > 1800:
+                tail = '\u2026' + tail[-1800:]
+            body += f'\n\n<pre>{_esc(tail)}</pre>'
+            body += '\n\n<i>Полный лог: /opt/var/log/router_bot.log</i>'
 
-        try:
-            await ctx.bot.send_message(
-                chat_id=self.chat_id,
-                text=body,
-                parse_mode='HTML',
-                reply_markup=kb,
-            )
-        except Exception as e:
-            log.warning('final M2 send failed: %s', e)
-
-        # После успешного удаления — сканируем остатки
         if rc == 0 and was_uninstall:
-            await self._check_leftovers(ctx)
+            try:
+                leftovers = scan_leftovers(SCAN_PATTERNS)
+            except Exception:
+                leftovers = []
+            if leftovers:
+                self._leftovers = leftovers
+                body += f'\n\n\U0001f50d <b>Найдено {len(leftovers)} остатков.</b>'
+                kb = InlineKeyboardMarkup([
+                    [InlineKeyboardButton(
+                        f'\U0001f5d1 Удалить все ({len(leftovers)})',
+                        callback_data='xkeen:cleanup:all')],
+                    [InlineKeyboardButton('\u2705 Оставить',
+                                          callback_data='xkeen:main')],
+                ])
 
+        if self._status_msg_id:
+            try:
+                await ctx.bot.edit_message_text(
+                    chat_id=self.chat_id,
+                    message_id=self._status_msg_id,
+                    text=body,
+                    parse_mode='HTML',
+                    reply_markup=kb,
+                )
+                self._status_msg_id = None
+                return
+            except Exception as e:
+                log.debug('final edit failed: %s', e)
+                self._status_msg_id = None
+
+        msg = await ctx.bot.send_message(            chat_id=self.chat_id, text=body,
+            parse_mode='HTML', reply_markup=kb,
+        )
+
+        set_last_msg(self.chat_id, msg.message_id)
 RB_MODULES_XKEEN_MODULE_PY_EOF
 
 echo "  → modules/xkeen/actions.py"
@@ -10651,7 +11061,10 @@ from core.utils import (
     existing_targets, sync_opts, build_uninstall_menu,
     collect_uninstall_cmd, toggle_opt,
     scan_leftovers, build_leftovers_message,
+    ui_edit_q, ui_edit_or_send,
+    show_card,
 )
+from core.utils import set_last_msg
 
 log = logging.getLogger(__name__)
 
@@ -10867,7 +11280,7 @@ class BirdModule:
 
     async def send_card_message(self, update, ctx):
         text, kb = self._build_card()
-        await update.message.reply_text(text, parse_mode='HTML', reply_markup=kb)
+        await show_card(update, ctx, text, kb=kb)
 
     async def handle_callback(self, action, q, ctx):
         if action == 'main':
@@ -10943,7 +11356,7 @@ class BirdModule:
             a = ACTIONS.get(key)
             if not a:
                 return
-            await self._start_action(ctx, key, a['cmd'])
+            await self._start_action(q, ctx, key, a)
             return
 
         await q.answer()
@@ -11017,6 +11430,7 @@ class BirdModule:
             ]),
         )
         self._status_msg_id = msg.message_id
+        set_last_msg(self.chat_id, msg.message_id)
 
         pid, master = pty.fork()
         if pid == 0:
@@ -11078,6 +11492,7 @@ class BirdModule:
                 ]),
             )
             self._status_msg_id = msg.message_id
+            set_last_msg(self.chat_id, msg.message_id)
 
             pid, master = pty.fork()
             if pid == 0:
@@ -11177,39 +11592,34 @@ class BirdModule:
 
     # ================= запуск операций =================
 
-    async def _start_action(self, ctx, key, cmd):
+    async def _start_action(self, q, ctx, key, action):
         if self._running:
             return
         self._running = True
         self._last_action = key
         self._buf = b''
         self._last_edit = 0.0
+        self._awaiting_yn = False
 
-        a = ACTIONS.get(key, {})
-        icon = a.get('icon', '⚙️')
-        title = a.get('title', key)
-
-        msg = await ctx.bot.send_message(
-            chat_id=self.chat_id,
-            text=f'{icon} <b>{title}</b>\n\n<pre>запуск...</pre>',
-            parse_mode='HTML',
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton('\U0001f6d1 Отменить', callback_data='bird:kill')],
+        self._status_msg_id = await ui_edit_q(
+            q,
+            f'{action["icon"]} <b>{action["title"]}</b>\n\n<pre>запуск...</pre>',
+            kb=InlineKeyboardMarkup([
+                [InlineKeyboardButton('\U0001f6d1 Отменить',
+                                      callback_data='bird:kill')],
             ]),
         )
-        self._status_msg_id = msg.message_id
 
         pid, master = pty.fork()
         if pid == 0:
             try:
                 os.environ['TERM'] = 'dumb'
-                os.execv('/bin/sh', ['sh', '-c', cmd])
+                os.environ['DEBIAN_FRONTEND'] = 'noninteractive'
+                os.execv('/bin/sh', ['sh', '-c', action['cmd']])
             except Exception:
                 os._exit(1)
-
         self._proc_pid = pid
         self._master = master
-
         asyncio.create_task(self._reader_loop(ctx, pid, master))
 
     async def _reader_loop(self, ctx, pid, master):
@@ -11283,20 +11693,32 @@ class BirdModule:
         self._proc_pid = None
         await self._finish(ctx, self._buf, rc)
 
-    async def _update_status(self, ctx):
-        if not self._status_msg_id:
+    async def _update_status(self, ctx=None, bot=None):
+        if bot is None and ctx is not None:
+            bot = ctx.bot
+        if bot is None or not self._status_msg_id:
             return
         text = _strip_ansi(self._buf.decode('utf-8', errors='replace'))
         tail = text[-1800:] if len(text) > 1800 else text
+        if getattr(self, '_awaiting_yn', False):
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton('\u2705 Да (y)', callback_data='bird:ans:y'),
+                 InlineKeyboardButton('\u274c Нет (n)', callback_data='bird:ans:n')],
+                [InlineKeyboardButton('\u23ce Enter', callback_data='bird:ans:enter'),
+                 InlineKeyboardButton('\U0001f6d1 Прервать', callback_data='bird:kill')],
+            ])
+        else:
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton('\U0001f6d1 Отменить',
+                                      callback_data='bird:kill')],
+            ])
         try:
-            await ctx.bot.edit_message_text(
+            await bot.edit_message_text(
                 chat_id=self.chat_id,
                 message_id=self._status_msg_id,
-                text=f'⏳ <b>Выполняется...</b>\n\n<pre>{_esc(tail)}</pre>',
+                text=f'\u23f3 <b>Выполняется...</b>\n\n<pre>{_esc(tail)}</pre>',
                 parse_mode='HTML',
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton('\U0001f6d1 Отменить', callback_data='bird:kill')],
-                ]),
+                reply_markup=kb,
             )
         except Exception as e:
             if 'not modified' not in str(e).lower():
@@ -11304,14 +11726,13 @@ class BirdModule:
 
     async def _finish(self, ctx, buf, rc):
         self._running = False
+        self._awaiting_yn = False
         was_uninstall = (self._last_action == 'uninstall')
         was_cleanup = (self._last_action == 'cleanup')
         text = _strip_ansi(buf.decode('utf-8', errors='replace'))
 
-        # Фильтр безобидного шума opkg
         if rc == 0 and 'Collected errors' in text:
-            new_lines = []
-            skip = False
+            new_lines, skip = [], False
             for ln in text.split('\n'):
                 if 'Collected errors' in ln:
                     skip = True
@@ -11327,49 +11748,18 @@ class BirdModule:
                 new_lines.append(ln)
             text = '\n'.join(new_lines).strip()
 
-        # Предложить запуск после установки
         offer_start = (
             self._last_action == 'install'
             and rc == 0
-            and is_installed()
-            and not is_running()
+            and (is_installed())
+            and not (is_running())
         )
         self._last_action = None
-
         icon = '\u2705' if rc == 0 else '\u274c'
 
-        # Обновляем M1 — полным логом с заголовком.
-        if self._status_msg_id:
-            if was_cleanup:
-                m1_title = '\U0001f5d1 <b>Удаление остатков</b>'
-            elif was_uninstall:
-                m1_title = '\U0001f5d1 <b>Удаление BIRD</b>'
-            elif offer_start:
-                m1_title = '\U0001f4e6 <b>Установка BIRD</b>'
-            else:
-                m1_title = '\u2699\ufe0f <b>Операция</b>'
-
-            tail_m1 = text[-3500:] if len(text) > 3500 else text
-            m1_text = f'{m1_title}\n\n<pre>{_esc(tail_m1)}</pre>'
-            try:
-                await ctx.bot.edit_message_text(
-                    chat_id=self.chat_id,
-                    message_id=self._status_msg_id,
-                    text=m1_text,
-                    parse_mode='HTML',
-                    reply_markup=None,
-                )
-            except Exception as e:
-                log.debug('final M1 update failed: %s', e)
-            self._status_msg_id = None
-
-        # M2 — ТОЛЬКО заголовок + кнопки.
-        # Лог при ошибке — добавим последние 15 строк для диагностики.
         if offer_start:
-            header = (
-                f'{icon} <b>Установка BIRD завершена</b>\n'
-                f'<i>exit code: {rc}</i>'
-            )
+            header = (f'{icon} <b>Установка завершена</b>\n'
+                      f'<i>exit code: {rc}</i>')
             kb = InlineKeyboardMarkup([
                 [InlineKeyboardButton('\u25b6\ufe0f Запустить сейчас',
                                       callback_data='bird:ask:start')],
@@ -11383,34 +11773,78 @@ class BirdModule:
                                       callback_data='bird:main')],
             ])
         else:
-            header = f'{icon} <b>Завершено</b> (exit code: {rc})'
+            header = f'{icon} <b>Операция завершена</b> (exit code: {rc})'
             kb = InlineKeyboardMarkup([
                 [InlineKeyboardButton('\u2b05\ufe0f Назад',
                                       callback_data='bird:main')],
             ])
 
         body = header
-        # Лог в M2 — только если операция завершилась с ошибкой
-        if rc != 0 and text.strip():
-            err_tail = '\n'.join(text.strip().split('\n')[-15:])
-            if len(err_tail) > 1500:
-                err_tail = err_tail[-1500:]
-            body += f'\n\n<pre>{_esc(err_tail)}</pre>'
+        if text.strip():
+            tail = '\n'.join(text.strip().split('\n')[-20:])
+            if len(tail) > 1800:
+                tail = '\u2026' + tail[-1800:]
+            body += f'\n\n<pre>{_esc(tail)}</pre>'
+            body += '\n\n<i>Полный лог: /opt/var/log/router_bot.log</i>'
 
-        try:
-            await ctx.bot.send_message(
-                chat_id=self.chat_id,
-                text=body,
-                parse_mode='HTML',
-                reply_markup=kb,
-            )
-        except Exception as e:
-            log.warning('final M2 send failed: %s', e)
-
-        # После успешного удаления — сканируем остатки
         if rc == 0 and was_uninstall:
-            await self._check_leftovers(ctx)
+            try:
+                leftovers = scan_leftovers(SCAN_PATTERNS)
+            except Exception:
+                leftovers = []
+            if leftovers:
+                self._leftovers = leftovers
+                body += f'\n\n\U0001f50d <b>Найдено {len(leftovers)} остатков.</b>'
+                kb = InlineKeyboardMarkup([
+                    [InlineKeyboardButton(
+                        f'\U0001f5d1 Удалить все ({len(leftovers)})',
+                        callback_data='bird:cleanup:all')],
+                    [InlineKeyboardButton('\u2705 Оставить',
+                                          callback_data='bird:main')],
+                ])
 
+        if self._status_msg_id:
+            try:
+                await ctx.bot.edit_message_text(
+                    chat_id=self.chat_id,
+                    message_id=self._status_msg_id,
+                    text=body,
+                    parse_mode='HTML',
+                    reply_markup=kb,
+                )
+                self._status_msg_id = None
+                return
+            except Exception as e:
+                log.debug('final edit failed: %s', e)
+                self._status_msg_id = None
+
+        msg = await ctx.bot.send_message(            chat_id=self.chat_id, text=body,
+            parse_mode='HTML', reply_markup=kb,
+        )
+
+        set_last_msg(self.chat_id, msg.message_id)
+
+    async def _ask_question(self, ctx, buf=None):
+        if self._awaiting_yn:
+            return
+        self._awaiting_yn = True
+        await self._update_status(ctx)
+
+    async def _answer(self, q, payload: bytes):
+        if not getattr(self, '_proc_pid', None) or self._master is None:
+            await q.answer('Сессия завершена', show_alert=False)
+            return
+        try:
+            os.write(self._master, payload)
+            await q.answer(
+                f'Отправлено: {payload.decode(errors="replace").strip() or "Enter"}',
+            )
+        except OSError as e:
+            log.warning('write failed: %s', e)
+            await q.answer(f'Ошибка: {e}', show_alert=True)
+            return
+        self._awaiting_yn = False
+        await self._update_status(bot=q.bot)
 RB_MODULES_BIRD_MODULE_PY_EOF
 
 echo "  → modules/bird/actions.py"
@@ -11714,7 +12148,10 @@ from core.utils import (
     existing_targets, sync_opts, build_uninstall_menu,
     collect_uninstall_cmd, toggle_opt,
     scan_leftovers, build_leftovers_message,
+    ui_edit_q, ui_edit_or_send,
+    show_card,
 )
+from core.utils import set_last_msg
 
 log = logging.getLogger(__name__)
 
@@ -11923,7 +12360,7 @@ class MTProxyModule:
 
     async def send_card_message(self, update, ctx):
         text, kb = self._build_card()
-        await update.message.reply_text(text, parse_mode='HTML', reply_markup=kb)
+        await show_card(update, ctx, text, kb=kb)
 
     async def handle_callback(self, action, q, ctx):
         if action == 'main':
@@ -12006,7 +12443,7 @@ class MTProxyModule:
             a = ACTIONS.get(key)
             if not a:
                 return
-            await self._start_action(ctx, key, a['cmd'])
+            await self._start_action(q, ctx, key, a)
             return
 
         await q.answer()
@@ -12159,33 +12596,30 @@ class MTProxyModule:
 
     # ================= запуск =================
 
-    async def _start_action(self, ctx, key, cmd):
+    async def _start_action(self, q, ctx, key, action):
         if self._running:
             return
         self._running = True
         self._last_action = key
         self._buf = b''
         self._last_edit = 0.0
+        self._awaiting_yn = False
 
-        a = ACTIONS.get(key, {})
-        icon = a.get('icon', '⚙️')
-        title = a.get('title', key)
-
-        msg = await ctx.bot.send_message(
-            chat_id=self.chat_id,
-            text=f'{icon} <b>{title}</b>\n\n<pre>запуск...</pre>',
-            parse_mode='HTML',
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton('\U0001f6d1 Отменить', callback_data='mtproxy:kill')],
+        self._status_msg_id = await ui_edit_q(
+            q,
+            f'{action["icon"]} <b>{action["title"]}</b>\n\n<pre>запуск...</pre>',
+            kb=InlineKeyboardMarkup([
+                [InlineKeyboardButton('\U0001f6d1 Отменить',
+                                      callback_data='mtproxy:kill')],
             ]),
         )
-        self._status_msg_id = msg.message_id
 
         pid, master = pty.fork()
         if pid == 0:
             try:
                 os.environ['TERM'] = 'dumb'
-                os.execv('/bin/sh', ['sh', '-c', cmd])
+                os.environ['DEBIAN_FRONTEND'] = 'noninteractive'
+                os.execv('/bin/sh', ['sh', '-c', action['cmd']])
             except Exception:
                 os._exit(1)
         self._proc_pid = pid
@@ -12274,19 +12708,22 @@ class MTProxyModule:
         self._proc_pid = None
         await self._finish(ctx, self._buf, rc)
 
-    async def _update_status(self, ctx):
-        if not self._status_msg_id:
+    async def _update_status(self, ctx=None, bot=None):
+        if bot is None and ctx is not None:
+            bot = ctx.bot
+        if bot is None or not self._status_msg_id:
             return
         text = _strip_ansi(self._buf.decode('utf-8', errors='replace'))
         tail = text[-1800:] if len(text) > 1800 else text
         try:
-            await ctx.bot.edit_message_text(
+            await bot.edit_message_text(
                 chat_id=self.chat_id,
                 message_id=self._status_msg_id,
-                text=f'⏳ <b>Выполняется...</b>\n\n<pre>{_esc(tail)}</pre>',
+                text=f'\u23f3 <b>Выполняется...</b>\n\n<pre>{_esc(tail)}</pre>',
                 parse_mode='HTML',
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton('\U0001f6d1 Отменить', callback_data='mtproxy:kill')],
+                    [InlineKeyboardButton('\U0001f6d1 Отменить',
+                                          callback_data='mtproxy:kill')],
                 ]),
             )
         except Exception as e:
@@ -12295,13 +12732,13 @@ class MTProxyModule:
 
     async def _finish(self, ctx, buf, rc):
         self._running = False
+        self._awaiting_yn = False
         was_uninstall = (self._last_action == 'uninstall')
         was_cleanup = (self._last_action == 'cleanup')
         text = _strip_ansi(buf.decode('utf-8', errors='replace'))
 
         if rc == 0 and 'Collected errors' in text:
-            new_lines = []
-            skip = False
+            new_lines, skip = [], False
             for ln in text.split('\n'):
                 if 'Collected errors' in ln:
                     skip = True
@@ -12320,40 +12757,15 @@ class MTProxyModule:
         offer_start = (
             self._last_action == 'install'
             and rc == 0
-            and is_installed()
-            and not is_running()
+            and (is_installed())
+            and not (is_running())
         )
         self._last_action = None
-
         icon = '\u2705' if rc == 0 else '\u274c'
 
-        if self._status_msg_id:
-            if was_cleanup:
-                m1_title = '\U0001f5d1 <b>Удаление остатков</b>'
-            elif was_uninstall:
-                m1_title = '\U0001f5d1 <b>Удаление MTProxy</b>'
-            elif offer_start:
-                m1_title = '\U0001f4e6 <b>Установка MTProxy</b>'
-            else:
-                m1_title = '\u2699\ufe0f <b>Операция</b>'
-            tail_m1 = text[-3500:] if len(text) > 3500 else text
-            try:
-                await ctx.bot.edit_message_text(
-                    chat_id=self.chat_id,
-                    message_id=self._status_msg_id,
-                    text=f'{m1_title}\n\n<pre>{_esc(tail_m1)}</pre>',
-                    parse_mode='HTML',
-                    reply_markup=None,
-                )
-            except Exception as e:
-                log.debug('final M1 update failed: %s', e)
-            self._status_msg_id = None
-
         if offer_start:
-            header = (
-                f'{icon} <b>Установка MTProxy завершена</b>\n'
-                f'<i>exit code: {rc}</i>'
-            )
+            header = (f'{icon} <b>Установка завершена</b>\n'
+                      f'<i>exit code: {rc}</i>')
             kb = InlineKeyboardMarkup([
                 [InlineKeyboardButton('\u25b6\ufe0f Запустить сейчас',
                                       callback_data='mtproxy:ask:start')],
@@ -12363,33 +12775,60 @@ class MTProxyModule:
         elif was_cleanup:
             header = f'{icon} <b>Остатки удалены</b> (exit code: {rc})'
             kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton('\u2b05\ufe0f Назад', callback_data='mtproxy:main')],
+                [InlineKeyboardButton('\u2b05\ufe0f Назад',
+                                      callback_data='mtproxy:main')],
             ])
         else:
-            header = f'{icon} <b>Завершено</b> (exit code: {rc})'
+            header = f'{icon} <b>Операция завершена</b> (exit code: {rc})'
             kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton('\u2b05\ufe0f Назад', callback_data='mtproxy:main')],
+                [InlineKeyboardButton('\u2b05\ufe0f Назад',
+                                      callback_data='mtproxy:main')],
             ])
 
         body = header
-        if rc != 0 and text.strip():
-            err_tail = '\n'.join(text.strip().split('\n')[-15:])
-            if len(err_tail) > 1500:
-                err_tail = err_tail[-1500:]
-            body += f'\n\n<pre>{_esc(err_tail)}</pre>'
-
-        try:
-            await ctx.bot.send_message(
-                chat_id=self.chat_id,
-                text=body,
-                parse_mode='HTML',
-                reply_markup=kb,
-            )
-        except Exception as e:
-            log.warning('final M2 send failed: %s', e)
+        if text.strip():
+            tail = '\n'.join(text.strip().split('\n')[-20:])
+            if len(tail) > 1800:
+                tail = '\u2026' + tail[-1800:]
+            body += f'\n\n<pre>{_esc(tail)}</pre>'
+            body += '\n\n<i>Полный лог: /opt/var/log/router_bot.log</i>'
 
         if rc == 0 and was_uninstall:
-            await self._check_leftovers(ctx)
+            try:
+                leftovers = scan_leftovers(SCAN_PATTERNS)
+            except Exception:
+                leftovers = []
+            if leftovers:
+                self._leftovers = leftovers
+                body += f'\n\n\U0001f50d <b>Найдено {len(leftovers)} остатков.</b>'
+                kb = InlineKeyboardMarkup([
+                    [InlineKeyboardButton(
+                        f'\U0001f5d1 Удалить все ({len(leftovers)})',
+                        callback_data='mtproxy:cleanup:all')],
+                    [InlineKeyboardButton('\u2705 Оставить',
+                                          callback_data='mtproxy:main')],
+                ])
+
+        if self._status_msg_id:
+            try:
+                await ctx.bot.edit_message_text(
+                    chat_id=self.chat_id,
+                    message_id=self._status_msg_id,
+                    text=body,
+                    parse_mode='HTML',
+                    reply_markup=kb,
+                )
+                self._status_msg_id = None
+                return
+            except Exception as e:
+                log.debug('final edit failed: %s', e)
+                self._status_msg_id = None
+
+        msg = await ctx.bot.send_message(            chat_id=self.chat_id, text=body,
+            parse_mode='HTML', reply_markup=kb,
+        )
+
+        set_last_msg(self.chat_id, msg.message_id)
 
     # ================= меню удаления =================
 
@@ -12438,6 +12877,7 @@ class MTProxyModule:
                 ]),
             )
             self._status_msg_id = msg.message_id
+            set_last_msg(self.chat_id, msg.message_id)
             pid, master = pty.fork()
             if pid == 0:
                 try:
@@ -12501,6 +12941,7 @@ class MTProxyModule:
             ]),
         )
         self._status_msg_id = msg.message_id
+        set_last_msg(self.chat_id, msg.message_id)
         pid, master = pty.fork()
         if pid == 0:
             try:
@@ -12511,7 +12952,6 @@ class MTProxyModule:
         self._proc_pid = pid
         self._master = master
         asyncio.create_task(self._reader_loop(ctx, pid, master))
-
 RB_MODULES_MTPROXY_MODULE_PY_EOF
 
 echo "  → modules/mtproxy/actions.py"
@@ -12798,7 +13238,10 @@ from core.utils import (
     existing_targets, sync_opts, build_uninstall_menu,
     collect_uninstall_cmd, toggle_opt,
     scan_leftovers, build_leftovers_message,
+    ui_edit_q, ui_edit_or_send,
+    show_card,
 )
+from core.utils import set_last_msg
 
 log = logging.getLogger(__name__)
 
@@ -13006,7 +13449,7 @@ class KeenPbrModule:
 
     async def send_card_message(self, update, ctx):
         text, kb = self._build_card()
-        await update.message.reply_text(text, parse_mode='HTML', reply_markup=kb)
+        await show_card(update, ctx, text, kb=kb)
 
     async def handle_callback(self, action, q, ctx):
         if action == 'main':
@@ -13084,7 +13527,7 @@ class KeenPbrModule:
             a = ACTIONS.get(key)
             if not a:
                 return
-            await self._start_action(ctx, key, a['cmd'])
+            await self._start_action(q, ctx, key, a)
             return
 
         await q.answer()
@@ -13180,33 +13623,30 @@ class KeenPbrModule:
 
     # ================= запуск =================
 
-    async def _start_action(self, ctx, key, cmd):
+    async def _start_action(self, q, ctx, key, action):
         if self._running:
             return
         self._running = True
         self._last_action = key
         self._buf = b''
         self._last_edit = 0.0
+        self._awaiting_yn = False
 
-        a = ACTIONS.get(key, {})
-        icon = a.get('icon', '\u2699\ufe0f')
-        title = a.get('title', key)
-
-        msg = await ctx.bot.send_message(
-            chat_id=self.chat_id,
-            text=f'{icon} <b>{title}</b>\n\n<pre>запуск...</pre>',
-            parse_mode='HTML',
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton('\U0001f6d1 Отменить', callback_data='keen_pbr:kill')],
+        self._status_msg_id = await ui_edit_q(
+            q,
+            f'{action["icon"]} <b>{action["title"]}</b>\n\n<pre>запуск...</pre>',
+            kb=InlineKeyboardMarkup([
+                [InlineKeyboardButton('\U0001f6d1 Отменить',
+                                      callback_data='keen_pbr:kill')],
             ]),
         )
-        self._status_msg_id = msg.message_id
 
         pid, master = pty.fork()
         if pid == 0:
             try:
                 os.environ['TERM'] = 'dumb'
-                os.execv('/bin/sh', ['sh', '-c', cmd])
+                os.environ['DEBIAN_FRONTEND'] = 'noninteractive'
+                os.execv('/bin/sh', ['sh', '-c', action['cmd']])
             except Exception:
                 os._exit(1)
         self._proc_pid = pid
@@ -13295,19 +13735,22 @@ class KeenPbrModule:
         self._proc_pid = None
         await self._finish(ctx, self._buf, rc)
 
-    async def _update_status(self, ctx):
-        if not self._status_msg_id:
+    async def _update_status(self, ctx=None, bot=None):
+        if bot is None and ctx is not None:
+            bot = ctx.bot
+        if bot is None or not self._status_msg_id:
             return
         text = _strip_ansi(self._buf.decode('utf-8', errors='replace'))
         tail = text[-1800:] if len(text) > 1800 else text
         try:
-            await ctx.bot.edit_message_text(
+            await bot.edit_message_text(
                 chat_id=self.chat_id,
                 message_id=self._status_msg_id,
-                text=f'⏳ <b>Выполняется...</b>\n\n<pre>{_esc(tail)}</pre>',
+                text=f'\u23f3 <b>Выполняется...</b>\n\n<pre>{_esc(tail)}</pre>',
                 parse_mode='HTML',
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton('\U0001f6d1 Отменить', callback_data='keen_pbr:kill')],
+                    [InlineKeyboardButton('\U0001f6d1 Отменить',
+                                          callback_data='keen_pbr:kill')],
                 ]),
             )
         except Exception as e:
@@ -13316,13 +13759,13 @@ class KeenPbrModule:
 
     async def _finish(self, ctx, buf, rc):
         self._running = False
+        self._awaiting_yn = False
         was_uninstall = (self._last_action == 'uninstall')
         was_cleanup = (self._last_action == 'cleanup')
         text = _strip_ansi(buf.decode('utf-8', errors='replace'))
 
         if rc == 0 and 'Collected errors' in text:
-            new_lines = []
-            skip = False
+            new_lines, skip = [], False
             for ln in text.split('\n'):
                 if 'Collected errors' in ln:
                     skip = True
@@ -13341,40 +13784,15 @@ class KeenPbrModule:
         offer_start = (
             self._last_action == 'install'
             and rc == 0
-            and is_installed()
-            and not is_running()
+            and (is_installed())
+            and not (is_running())
         )
         self._last_action = None
-
         icon = '\u2705' if rc == 0 else '\u274c'
 
-        if self._status_msg_id:
-            if was_cleanup:
-                m1_title = '\U0001f5d1 <b>Удаление остатков</b>'
-            elif was_uninstall:
-                m1_title = '\U0001f5d1 <b>Удаление keen-pbr</b>'
-            elif offer_start:
-                m1_title = '\U0001f4e6 <b>Установка keen-pbr</b>'
-            else:
-                m1_title = '\u2699\ufe0f <b>Операция</b>'
-            tail_m1 = text[-3500:] if len(text) > 3500 else text
-            try:
-                await ctx.bot.edit_message_text(
-                    chat_id=self.chat_id,
-                    message_id=self._status_msg_id,
-                    text=f'{m1_title}\n\n<pre>{_esc(tail_m1)}</pre>',
-                    parse_mode='HTML',
-                    reply_markup=None,
-                )
-            except Exception as e:
-                log.debug('final M1 update failed: %s', e)
-            self._status_msg_id = None
-
         if offer_start:
-            header = (
-                f'{icon} <b>Установка keen-pbr завершена</b>\n'
-                f'<i>exit code: {rc}</i>'
-            )
+            header = (f'{icon} <b>Установка завершена</b>\n'
+                      f'<i>exit code: {rc}</i>')
             kb = InlineKeyboardMarkup([
                 [InlineKeyboardButton('\u25b6\ufe0f Запустить сейчас',
                                       callback_data='keen_pbr:ask:start')],
@@ -13388,31 +13806,56 @@ class KeenPbrModule:
                                       callback_data='keen_pbr:main')],
             ])
         else:
-            header = f'{icon} <b>Завершено</b> (exit code: {rc})'
+            header = f'{icon} <b>Операция завершена</b> (exit code: {rc})'
             kb = InlineKeyboardMarkup([
                 [InlineKeyboardButton('\u2b05\ufe0f Назад',
                                       callback_data='keen_pbr:main')],
             ])
 
         body = header
-        if rc != 0 and text.strip():
-            err_tail = '\n'.join(text.strip().split('\n')[-15:])
-            if len(err_tail) > 1500:
-                err_tail = err_tail[-1500:]
-            body += f'\n\n<pre>{_esc(err_tail)}</pre>'
-
-        try:
-            await ctx.bot.send_message(
-                chat_id=self.chat_id,
-                text=body,
-                parse_mode='HTML',
-                reply_markup=kb,
-            )
-        except Exception as e:
-            log.warning('final M2 send failed: %s', e)
+        if text.strip():
+            tail = '\n'.join(text.strip().split('\n')[-20:])
+            if len(tail) > 1800:
+                tail = '\u2026' + tail[-1800:]
+            body += f'\n\n<pre>{_esc(tail)}</pre>'
+            body += '\n\n<i>Полный лог: /opt/var/log/router_bot.log</i>'
 
         if rc == 0 and was_uninstall:
-            await self._check_leftovers(ctx)
+            try:
+                leftovers = scan_leftovers(SCAN_PATTERNS)
+            except Exception:
+                leftovers = []
+            if leftovers:
+                self._leftovers = leftovers
+                body += f'\n\n\U0001f50d <b>Найдено {len(leftovers)} остатков.</b>'
+                kb = InlineKeyboardMarkup([
+                    [InlineKeyboardButton(
+                        f'\U0001f5d1 Удалить все ({len(leftovers)})',
+                        callback_data='keen_pbr:cleanup:all')],
+                    [InlineKeyboardButton('\u2705 Оставить',
+                                          callback_data='keen_pbr:main')],
+                ])
+
+        if self._status_msg_id:
+            try:
+                await ctx.bot.edit_message_text(
+                    chat_id=self.chat_id,
+                    message_id=self._status_msg_id,
+                    text=body,
+                    parse_mode='HTML',
+                    reply_markup=kb,
+                )
+                self._status_msg_id = None
+                return
+            except Exception as e:
+                log.debug('final edit failed: %s', e)
+                self._status_msg_id = None
+
+        msg = await ctx.bot.send_message(            chat_id=self.chat_id, text=body,
+            parse_mode='HTML', reply_markup=kb,
+        )
+
+        set_last_msg(self.chat_id, msg.message_id)
 
     # ================= меню удаления =================
 
@@ -13461,6 +13904,7 @@ class KeenPbrModule:
                 ]),
             )
             self._status_msg_id = msg.message_id
+            set_last_msg(self.chat_id, msg.message_id)
             pid, master = pty.fork()
             if pid == 0:
                 try:
@@ -13524,6 +13968,7 @@ class KeenPbrModule:
             ]),
         )
         self._status_msg_id = msg.message_id
+        set_last_msg(self.chat_id, msg.message_id)
         pid, master = pty.fork()
         if pid == 0:
             try:
@@ -13534,7 +13979,6 @@ class KeenPbrModule:
         self._proc_pid = pid
         self._master = master
         asyncio.create_task(self._reader_loop(ctx, pid, master))
-
 RB_MODULES_KEEN_PBR_MODULE_PY_EOF
 
 echo "  → modules/keen_pbr/actions.py"
@@ -13807,7 +14251,9 @@ from .actions import (
 from core.utils import (
     existing_targets, sync_opts, build_uninstall_menu,
     collect_uninstall_cmd, toggle_opt, scan_leftovers, build_leftovers_message,
+    show_card,
 )
+from core.utils import set_last_msg
 
 log = logging.getLogger(__name__)
 MAX_MSG = 3500
@@ -13972,7 +14418,7 @@ class NeoFitModule:
 
     async def send_card_message(self, update, ctx):
         text, kb = self._build_card()
-        await update.message.reply_text(text, parse_mode='HTML', reply_markup=kb)
+        await show_card(update, ctx, text, kb=kb)
 
     # ================= callback =================
 
@@ -14041,41 +14487,37 @@ class NeoFitModule:
             a = ACTIONS.get(key)
             if not a:
                 return
-            await self._start_action(ctx, key, a['cmd'])
+            await self._start_action(q, ctx, key, a)
             return
 
         await q.answer()
 
     # ================= запуск =================
 
-    async def _start_action(self, ctx, key, cmd):
+    async def _start_action(self, q, ctx, key, action):
         if self._running:
             return
         self._running = True
         self._last_action = key
         self._buf = b''
         self._last_edit = 0.0
+        self._awaiting_yn = False
 
-        a = ACTIONS.get(key, {})
-        icon = a.get('icon', '\u2699\ufe0f')
-        title = a.get('title', key)
-
-        msg = await ctx.bot.send_message(
-            chat_id=self.chat_id,
-            text=f'{icon} <b>{title}</b>\n\n<pre>запуск...</pre>',
-            parse_mode='HTML',
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton('\U0001f6d1 Отменить', callback_data='neofit:kill')],
+        self._status_msg_id = await ui_edit_q(
+            q,
+            f'{action["icon"]} <b>{action["title"]}</b>\n\n<pre>запуск...</pre>',
+            kb=InlineKeyboardMarkup([
+                [InlineKeyboardButton('\U0001f6d1 Отменить',
+                                      callback_data='neofit:kill')],
             ]),
         )
-        self._status_msg_id = msg.message_id
 
         pid, master = pty.fork()
         if pid == 0:
             try:
                 os.environ['TERM'] = 'dumb'
-                os.environ['PATH'] = '/opt/sbin:/opt/bin:/usr/sbin:/usr/bin:/sbin:/bin'
-                os.execv('/bin/sh', ['sh', '-c', cmd])
+                os.environ['DEBIAN_FRONTEND'] = 'noninteractive'
+                os.execv('/bin/sh', ['sh', '-c', action['cmd']])
             except Exception:
                 os._exit(1)
         self._proc_pid = pid
@@ -14164,19 +14606,22 @@ class NeoFitModule:
         self._proc_pid = None
         await self._finish(ctx, self._buf, rc)
 
-    async def _update_status(self, ctx):
-        if not self._status_msg_id:
+    async def _update_status(self, ctx=None, bot=None):
+        if bot is None and ctx is not None:
+            bot = ctx.bot
+        if bot is None or not self._status_msg_id:
             return
         text = _strip_ansi(self._buf.decode('utf-8', errors='replace'))
         tail = text[-1800:] if len(text) > 1800 else text
         try:
-            await ctx.bot.edit_message_text(
+            await bot.edit_message_text(
                 chat_id=self.chat_id,
                 message_id=self._status_msg_id,
-                text=f'⏳ <b>Выполняется...</b>\n\n<pre>{_esc(tail)}</pre>',
+                text=f'\u23f3 <b>Выполняется...</b>\n\n<pre>{_esc(tail)}</pre>',
                 parse_mode='HTML',
                 reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton('\U0001f6d1 Отменить', callback_data='neofit:kill')],
+                    [InlineKeyboardButton('\U0001f6d1 Отменить',
+                                          callback_data='neofit:kill')],
                 ]),
             )
         except Exception as e:
@@ -14187,13 +14632,13 @@ class NeoFitModule:
 
     async def _finish(self, ctx, buf, rc):
         self._running = False
+        self._awaiting_yn = False
         was_uninstall = (self._last_action == 'uninstall')
         was_cleanup = (self._last_action == 'cleanup')
         text = _strip_ansi(buf.decode('utf-8', errors='replace'))
 
         if rc == 0 and 'Collected errors' in text:
-            new_lines = []
-            skip = False
+            new_lines, skip = [], False
             for ln in text.split('\n'):
                 if 'Collected errors' in ln:
                     skip = True
@@ -14212,72 +14657,78 @@ class NeoFitModule:
         offer_start = (
             self._last_action == 'install'
             and rc == 0
-            and is_installed()
-            and not is_running()
+            and (is_installed())
+            and not (is_running())
         )
         self._last_action = None
         icon = '\u2705' if rc == 0 else '\u274c'
 
-        if self._status_msg_id:
-            if was_cleanup:
-                m1_title = '\U0001f5d1 <b>Удаление остатков NeoFit</b>'
-            elif was_uninstall:
-                m1_title = '\U0001f5d1 <b>Удаление NeoFit</b>'
-            elif offer_start:
-                m1_title = '\U0001f4e6 <b>Установка NeoFit</b>'
-            else:
-                m1_title = '\u2699\ufe0f <b>Операция</b>'
-            tail_m1 = text[-3500:] if len(text) > 3500 else text
-            try:
-                await ctx.bot.edit_message_text(
-                    chat_id=self.chat_id,
-                    message_id=self._status_msg_id,
-                    text=f'{m1_title}\n\n<pre>{_esc(tail_m1)}</pre>',
-                    parse_mode='HTML',
-                    reply_markup=None,
-                )
-            except Exception as e:
-                log.debug('final M1 update failed: %s', e)
-            self._status_msg_id = None
-
         if offer_start:
-            header = (
-                f'{icon} <b>Установка NeoFit завершена</b>\n'
-                f'<i>exit code: {rc}</i>'
-            )
+            header = (f'{icon} <b>Установка завершена</b>\n'
+                      f'<i>exit code: {rc}</i>')
             kb = InlineKeyboardMarkup([
                 [InlineKeyboardButton('\u25b6\ufe0f Запустить сейчас',
                                       callback_data='neofit:ask:start')],
-                [InlineKeyboardButton('\u23ed Позже', callback_data='neofit:main')],
+                [InlineKeyboardButton('\u23ed Позже',
+                                      callback_data='neofit:main')],
             ])
         elif was_cleanup:
             header = f'{icon} <b>Остатки удалены</b> (exit code: {rc})'
             kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton('\u2b05\ufe0f Назад', callback_data='neofit:main')],
+                [InlineKeyboardButton('\u2b05\ufe0f Назад',
+                                      callback_data='neofit:main')],
             ])
         else:
-            header = f'{icon} <b>Завершено</b> (exit code: {rc})'
+            header = f'{icon} <b>Операция завершена</b> (exit code: {rc})'
             kb = InlineKeyboardMarkup([
-                [InlineKeyboardButton('\u2b05\ufe0f Назад', callback_data='neofit:main')],
+                [InlineKeyboardButton('\u2b05\ufe0f Назад',
+                                      callback_data='neofit:main')],
             ])
 
         body = header
-        if rc != 0 and text.strip():
-            err_tail = '\n'.join(text.strip().split('\n')[-15:])
-            if len(err_tail) > 1500:
-                err_tail = err_tail[-1500:]
-            body += f'\n\n<pre>{_esc(err_tail)}</pre>'
-
-        try:
-            await ctx.bot.send_message(
-                chat_id=self.chat_id, text=body,
-                parse_mode='HTML', reply_markup=kb,
-            )
-        except Exception as e:
-            log.warning('final M2 send failed: %s', e)
+        if text.strip():
+            tail = '\n'.join(text.strip().split('\n')[-20:])
+            if len(tail) > 1800:
+                tail = '\u2026' + tail[-1800:]
+            body += f'\n\n<pre>{_esc(tail)}</pre>'
+            body += '\n\n<i>Полный лог: /opt/var/log/router_bot.log</i>'
 
         if rc == 0 and was_uninstall:
-            await self._check_leftovers(ctx)
+            try:
+                leftovers = scan_leftovers(SCAN_PATTERNS)
+            except Exception:
+                leftovers = []
+            if leftovers:
+                self._leftovers = leftovers
+                body += f'\n\n\U0001f50d <b>Найдено {len(leftovers)} остатков.</b>'
+                kb = InlineKeyboardMarkup([
+                    [InlineKeyboardButton(
+                        f'\U0001f5d1 Удалить все ({len(leftovers)})',
+                        callback_data='neofit:cleanup:all')],
+                    [InlineKeyboardButton('\u2705 Оставить',
+                                          callback_data='neofit:main')],
+                ])
+
+        if self._status_msg_id:
+            try:
+                await ctx.bot.edit_message_text(
+                    chat_id=self.chat_id,
+                    message_id=self._status_msg_id,
+                    text=body,
+                    parse_mode='HTML',
+                    reply_markup=kb,
+                )
+                self._status_msg_id = None
+                return
+            except Exception as e:
+                log.debug('final edit failed: %s', e)
+                self._status_msg_id = None
+
+        msg = await ctx.bot.send_message(            chat_id=self.chat_id, text=body,
+            parse_mode='HTML', reply_markup=kb,
+        )
+
+        set_last_msg(self.chat_id, msg.message_id)
 
     # ================= меню удаления =================
 
@@ -14322,6 +14773,7 @@ class NeoFitModule:
                 ]),
             )
             self._status_msg_id = msg.message_id
+            set_last_msg(self.chat_id, msg.message_id)
             pid, master = pty.fork()
             if pid == 0:
                 try:
@@ -14381,6 +14833,7 @@ class NeoFitModule:
             ]),
         )
         self._status_msg_id = msg.message_id
+        set_last_msg(self.chat_id, msg.message_id)
         pid, master = pty.fork()
         if pid == 0:
             try:
@@ -14391,7 +14844,6 @@ class NeoFitModule:
         self._proc_pid = pid
         self._master = master
         asyncio.create_task(self._reader_loop(ctx, pid, master))
-
 RB_MODULES_NEOFIT_MODULE_PY_EOF
 
 echo "  → modules/neofit/actions.py"
@@ -14673,7 +15125,10 @@ from core.utils import (
     existing_targets, sync_opts, build_uninstall_menu,
     collect_uninstall_cmd, toggle_opt,
     scan_leftovers, build_leftovers_message,
+    ui_edit_q, ui_edit_or_send,
+    show_card,
 )
+from core.utils import set_last_msg
 
 log = logging.getLogger(__name__)
 
@@ -14842,7 +15297,7 @@ class UsqueKeeneticModule:
 
     async def send_card_message(self, update, ctx):
         text, kb = self._build_card()
-        await update.message.reply_text(text, parse_mode='HTML', reply_markup=kb)
+        await show_card(update, ctx, text, kb=kb)
 
     async def handle_callback(self, action, q, ctx):
         if action == 'main':
@@ -14919,35 +15374,36 @@ class UsqueKeeneticModule:
             await q.answer()
             a = ACTIONS.get(key)
             if a:
-                await self._start_action(ctx, key, a['cmd'])
+                await self._start_action(q, ctx, key, a)
             return
         await q.answer()
 
-    async def _start_action(self, ctx, key, cmd):
-        if self._running: return
+    async def _start_action(self, q, ctx, key, action):
+        if self._running:
+            return
         self._running = True
         self._last_action = key
         self._buf = b''
         self._last_edit = 0.0
-        a = ACTIONS.get(key, {})
-        icon = a.get('icon', '\u2699\ufe0f')
-        title = a.get('title', key)
-        msg = await ctx.bot.send_message(
-            chat_id=self.chat_id,
-            text=f'{icon} <b>{title}</b>\n\n<pre>запуск...</pre>',
-            parse_mode='HTML',
-            reply_markup=InlineKeyboardMarkup([
+        self._awaiting_yn = False
+
+        self._status_msg_id = await ui_edit_q(
+            q,
+            f'{action["icon"]} <b>{action["title"]}</b>\n\n<pre>запуск...</pre>',
+            kb=InlineKeyboardMarkup([
                 [InlineKeyboardButton('\U0001f6d1 Отменить',
                                       callback_data='usque_keenetic:kill')],
             ]),
         )
-        self._status_msg_id = msg.message_id
+
         pid, master = pty.fork()
         if pid == 0:
             try:
                 os.environ['TERM'] = 'dumb'
-                os.execv('/bin/sh', ['sh', '-c', cmd])
-            except Exception: os._exit(1)
+                os.environ['DEBIAN_FRONTEND'] = 'noninteractive'
+                os.execv('/bin/sh', ['sh', '-c', action['cmd']])
+            except Exception:
+                os._exit(1)
         self._proc_pid = pid
         self._master = master
         asyncio.create_task(self._reader_loop(ctx, pid, master))
@@ -15012,15 +15468,18 @@ class UsqueKeeneticModule:
         self._proc_pid = None
         await self._finish(ctx, self._buf, rc)
 
-    async def _update_status(self, ctx):
-        if not self._status_msg_id: return
+    async def _update_status(self, ctx=None, bot=None):
+        if bot is None and ctx is not None:
+            bot = ctx.bot
+        if bot is None or not self._status_msg_id:
+            return
         text = _strip_ansi(self._buf.decode('utf-8', errors='replace'))
         tail = text[-1800:] if len(text) > 1800 else text
         try:
-            await ctx.bot.edit_message_text(
+            await bot.edit_message_text(
                 chat_id=self.chat_id,
                 message_id=self._status_msg_id,
-                text=f'⏳ <b>Выполняется...</b>\n\n<pre>{_esc(tail)}</pre>',
+                text=f'\u23f3 <b>Выполняется...</b>\n\n<pre>{_esc(tail)}</pre>',
                 parse_mode='HTML',
                 reply_markup=InlineKeyboardMarkup([
                     [InlineKeyboardButton('\U0001f6d1 Отменить',
@@ -15033,44 +15492,39 @@ class UsqueKeeneticModule:
 
     async def _finish(self, ctx, buf, rc):
         self._running = False
+        self._awaiting_yn = False
         was_uninstall = (self._last_action == 'uninstall')
         was_cleanup = (self._last_action == 'cleanup')
         text = _strip_ansi(buf.decode('utf-8', errors='replace'))
+
         if rc == 0 and 'Collected errors' in text:
             new_lines, skip = [], False
             for ln in text.split('\n'):
                 if 'Collected errors' in ln:
-                    skip = True; continue
+                    skip = True
+                    continue
                 if skip:
                     if ln.strip().startswith('*'):
-                        if 'is not installed' in ln: continue
-                        new_lines.append(ln); continue
-                    else: skip = False
+                        if 'is not installed' in ln:
+                            continue
+                        new_lines.append(ln)
+                        continue
+                    else:
+                        skip = False
                 new_lines.append(ln)
             text = '\n'.join(new_lines).strip()
-        offer_start = (self._last_action == 'install' and rc == 0
-                       and is_installed() and not is_running())
+
+        offer_start = (
+            self._last_action == 'install'
+            and rc == 0
+            and (is_installed())
+            and not (is_running())
+        )
         self._last_action = None
         icon = '\u2705' if rc == 0 else '\u274c'
 
-        if self._status_msg_id:
-            if was_cleanup:     m1_title = '\U0001f5d1 <b>Удаление остатков usque</b>'
-            elif was_uninstall: m1_title = '\U0001f5d1 <b>Удаление usque-keenetic</b>'
-            elif offer_start:   m1_title = '\U0001f4e6 <b>Установка usque-keenetic</b>'
-            else:               m1_title = '\u2699\ufe0f <b>Операция</b>'
-            tail_m1 = text[-3500:] if len(text) > 3500 else text
-            try:
-                await ctx.bot.edit_message_text(
-                    chat_id=self.chat_id,
-                    message_id=self._status_msg_id,
-                    text=f'{m1_title}\n\n<pre>{_esc(tail_m1)}</pre>',
-                    parse_mode='HTML', reply_markup=None,
-                )
-            except Exception as e: log.debug('final M1 update failed: %s', e)
-            self._status_msg_id = None
-
         if offer_start:
-            header = (f'{icon} <b>Установка usque-keenetic завершена</b>\n'
+            header = (f'{icon} <b>Установка завершена</b>\n'
                       f'<i>exit code: {rc}</i>')
             kb = InlineKeyboardMarkup([
                 [InlineKeyboardButton('\u25b6\ufe0f Запустить сейчас',
@@ -15085,22 +15539,56 @@ class UsqueKeeneticModule:
                                       callback_data='usque_keenetic:main')],
             ])
         else:
-            header = f'{icon} <b>Завершено</b> (exit code: {rc})'
+            header = f'{icon} <b>Операция завершена</b> (exit code: {rc})'
             kb = InlineKeyboardMarkup([
                 [InlineKeyboardButton('\u2b05\ufe0f Назад',
                                       callback_data='usque_keenetic:main')],
             ])
+
         body = header
-        if rc != 0 and text.strip():
-            err_tail = '\n'.join(text.strip().split('\n')[-15:])
-            if len(err_tail) > 1500: err_tail = err_tail[-1500:]
-            body += f'\n\n<pre>{_esc(err_tail)}</pre>'
-        try:
-            await ctx.bot.send_message(chat_id=self.chat_id, text=body,
-                                       parse_mode='HTML', reply_markup=kb)
-        except Exception as e: log.warning('final M2 send failed: %s', e)
+        if text.strip():
+            tail = '\n'.join(text.strip().split('\n')[-20:])
+            if len(tail) > 1800:
+                tail = '\u2026' + tail[-1800:]
+            body += f'\n\n<pre>{_esc(tail)}</pre>'
+            body += '\n\n<i>Полный лог: /opt/var/log/router_bot.log</i>'
+
         if rc == 0 and was_uninstall:
-            await self._check_leftovers(ctx)
+            try:
+                leftovers = scan_leftovers(SCAN_PATTERNS)
+            except Exception:
+                leftovers = []
+            if leftovers:
+                self._leftovers = leftovers
+                body += f'\n\n\U0001f50d <b>Найдено {len(leftovers)} остатков.</b>'
+                kb = InlineKeyboardMarkup([
+                    [InlineKeyboardButton(
+                        f'\U0001f5d1 Удалить все ({len(leftovers)})',
+                        callback_data='usque_keenetic:cleanup:all')],
+                    [InlineKeyboardButton('\u2705 Оставить',
+                                          callback_data='usque_keenetic:main')],
+                ])
+
+        if self._status_msg_id:
+            try:
+                await ctx.bot.edit_message_text(
+                    chat_id=self.chat_id,
+                    message_id=self._status_msg_id,
+                    text=body,
+                    parse_mode='HTML',
+                    reply_markup=kb,
+                )
+                self._status_msg_id = None
+                return
+            except Exception as e:
+                log.debug('final edit failed: %s', e)
+                self._status_msg_id = None
+
+        msg = await ctx.bot.send_message(            chat_id=self.chat_id, text=body,
+            parse_mode='HTML', reply_markup=kb,
+        )
+
+        set_last_msg(self.chat_id, msg.message_id)
 
     async def _show_uninstall_menu(self, q, ctx):
         targets = existing_targets(UNINSTALL_TARGETS)
@@ -15140,6 +15628,7 @@ class UsqueKeeneticModule:
                 ]),
             )
             self._status_msg_id = msg.message_id
+            set_last_msg(self.chat_id, msg.message_id)
             pid, master = pty.fork()
             if pid == 0:
                 try:
@@ -15271,6 +15760,7 @@ class UsqueKeeneticModule:
             ]),
         )
         self._status_msg_id = msg.message_id
+        set_last_msg(self.chat_id, msg.message_id)
         pid, master = pty.fork()
         if pid == 0:
             try:
@@ -15279,7 +15769,6 @@ class UsqueKeeneticModule:
             except Exception: os._exit(1)
         self._proc_pid = pid; self._master = master
         asyncio.create_task(self._reader_loop(ctx, pid, master))
-
 RB_MODULES_USQUE_KEENETIC_MODULE_PY_EOF
 
 echo "  → modules/usque_keenetic/actions.py"
@@ -15639,7 +16128,6 @@ def save_mcp_token(token: str) -> bool:
         import logging
         logging.getLogger(__name__).warning('save_mcp_token failed: %s', e)
         return False
-
 RB_MODULES_AWG_ACTIONS_PY_EOF
 
 echo "  → modules/awg_manager/module.py"
@@ -15661,6 +16149,8 @@ from core.utils import (
     existing_targets, sync_opts, build_uninstall_menu,
     collect_uninstall_cmd, toggle_opt,
     scan_leftovers, build_leftovers_message,
+    ui_edit_q, ui_edit_or_send,
+    show_card,
 )
 
 from .actions import (
@@ -15912,7 +16402,7 @@ class AwgManagerModule:
 
     async def send_card_message(self, update, ctx):
         text, kb = self._build_card()
-        await update.message.reply_text(text, parse_mode='HTML', reply_markup=kb)
+        await show_card(update, ctx, text, kb=kb)
 
     # ================= Callbacks =================
 
@@ -16037,15 +16527,15 @@ class AwgManagerModule:
     async def _run_action(self, q, ctx, key, action):
         import asyncio, os, pty, select, time, subprocess
         self._running = True
-        msg = await ctx.bot.send_message(
-            chat_id=self.chat_id,
-            text=f'{action["icon"]} <b>{action["title"]}</b>\n\n<pre>запуск...</pre>',
-            parse_mode='HTML',
-            reply_markup=InlineKeyboardMarkup([
-                [InlineKeyboardButton('🛑 Отменить', callback_data='awg_manager:main')],
+
+        self._status_msg_id = await ui_edit_q(
+            q,
+            f'{action["icon"]} <b>{action["title"]}</b>\n\n<pre>запуск...</pre>',
+            kb=InlineKeyboardMarkup([
+                [InlineKeyboardButton('\U0001f6d1 Отменить',
+                                      callback_data='awg_manager:main')],
             ]),
         )
-        self._status_msg_id = msg.message_id
 
         cmd = action['cmd']
 
@@ -16067,14 +16557,12 @@ class AwgManagerModule:
                         if wpid == proc.pid:
                             while True:
                                 r, _, _ = select.select([master], [], [], 0.2)
-                                if not r:
-                                    break
+                                if not r: break
                                 try:
                                     data = os.read(master, 4096)
                                 except OSError:
                                     break
-                                if not data:
-                                    break
+                                if not data: break
                                 buf += data
                             break
                     except ChildProcessError:
@@ -16086,8 +16574,7 @@ class AwgManagerModule:
                         if r:
                             try:
                                 data = os.read(master, 4096)
-                                if data:
-                                    buf += data
+                                if data: buf += data
                             except OSError:
                                 break
                     except Exception:
@@ -16111,30 +16598,54 @@ class AwgManagerModule:
 
         out, rc = await asyncio.to_thread(_exec)
         self._running = False
-        self._status_msg_id = None
 
-        icon = '✅' if rc == 0 else '❌'
+        icon = '\u2705' if rc == 0 else '\u274c'
         tail = out[-3000:] if len(out) > 3000 else out
         text = (
             f'{icon} <b>{action["title"]} завершено</b>\n'
             f'<i>exit code: {rc}</i>\n\n'
-            f'<pre>{tail}</pre>'
+            f'<pre>{_esc(tail)}</pre>'
         )
-        try:
-            await ctx.bot.edit_message_text(
-                chat_id=self.chat_id,
-                message_id=msg.message_id,
-                text=text,
-                parse_mode='HTML',
-                reply_markup=InlineKeyboardMarkup([
-                    [InlineKeyboardButton('⬅️ Назад', callback_data='awg_manager:main')],
-                ]),
-            )
-        except Exception:
-            pass
+
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton('\u2b05\ufe0f Назад',
+                                  callback_data='awg_manager:main')],
+        ])
 
         if rc == 0 and key == 'uninstall':
-            await self._check_leftovers(ctx)
+            try:
+                leftovers = scan_leftovers(SCAN_PATTERNS)
+            except Exception:
+                leftovers = []
+            if leftovers:
+                self._leftovers = leftovers
+                text += f'\n\n\U0001f50d <b>Найдено {len(leftovers)} остатков.</b>'
+                kb = InlineKeyboardMarkup([
+                    [InlineKeyboardButton(
+                        f'\U0001f5d1 Удалить все ({len(leftovers)})',
+                        callback_data='awg_manager:cleanup:all')],
+                    [InlineKeyboardButton('\u2705 Оставить',
+                                          callback_data='awg_manager:main')],
+                ])
+
+        if self._status_msg_id:
+            try:
+                await ctx.bot.edit_message_text(
+                    chat_id=self.chat_id,
+                    message_id=self._status_msg_id,
+                    text=text, parse_mode='HTML',
+                    reply_markup=kb,
+                )
+                self._status_msg_id = None
+                return
+            except Exception as e:
+                log.debug('awg final edit: %s', e)
+                self._status_msg_id = None
+
+        await ctx.bot.send_message(
+            chat_id=self.chat_id, text=text,
+            parse_mode='HTML', reply_markup=kb,
+        )
 
     # ================= Удаление с чекбоксами =================
 
@@ -16213,7 +16724,6 @@ class AwgManagerModule:
             'cmd': cmd,
         }
         await self._run_action(q, ctx, 'cleanup', action)
-
 RB_MODULES_AWG_MODULE_PY_EOF
 
 echo "  → install.sh"
@@ -17681,7 +18191,6 @@ echo "  Управление:  /opt/etc/init.d/S98routerbot {start|stop|restart}
 echo "  Логи:        tail -f $LOG_DIR/router_bot.log"
 echo "  Удаление:    $BASE_DIR/uninstall.sh"
 echo ""
-
 RB_INSTALL_SH_EOF
 
 echo "  → uninstall.sh"
@@ -17941,7 +18450,6 @@ echo ""
 echo "  Если отказались удалять зависимости —"
 echo "  они остались в системе."
 echo ""
-
 RB_UNINSTALL_SH_EOF
 
 echo "  → core/wrapper.sh"
