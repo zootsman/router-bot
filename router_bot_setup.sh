@@ -6,15 +6,11 @@ set -e
 # на /dev/tty, чтобы "read" работали.
 # Если /dev/tty нет (cron, systemd, etc.) — работаем с дефолтами
 # (все "read" получат пустую строку).
-if [ ! -t 0 ]; then
-    if [ -e /dev/tty ] && [ -r /dev/tty ]; then
-        exec < /dev/tty
-    else
-        : # не интерактивно, работаем с дефолтами
-    fi
-fi
+# При не-терминале stdin (curl|sh, Popen, cron) "read" получат EOF
+# и вернут дефолт. При интерактивном запуске работают как обычно.
+# Блок exec < /dev/tty УБРАН: при setsid() (Popen) /dev/tty не открывается.
 
-SETUP_VERSION="0.0.8-2"
+SETUP_VERSION="0.0.8-3"
 VERSION_FILE="/opt/router_bot/VERSION"
 INSTALLED_VERSION=""
 if [ -f "$VERSION_FILE" ]; then
@@ -189,7 +185,7 @@ RB_MAIN_PY_EOF
 
 echo "  → VERSION"
 cat > /opt/router_bot/VERSION << 'RB_VERSION_EOF'
-0.0.8-2
+0.0.8-3
 RB_VERSION_EOF
 
 echo "  → core/__init__.py"
@@ -778,7 +774,10 @@ async def _cmd_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def _on_self_update_now(q, ctx):
-    await q.answer('Скачиваю...')
+    try:
+        await q.answer('Скачиваю...')
+    except Exception as e:
+        log.warning('q.answer update_now failed: %s', e)
     try:
         await q.edit_message_text(
             '\U0001f4e5 <b>Скачиваю и проверяю обновление...</b>\n\n'
@@ -803,8 +802,8 @@ async def _on_self_update_now(q, ctx):
     try:
         await q.edit_message_text(
             '\u2705 <b>Обновление скачано и проверено</b>\n\n'
-            'Запускаю установку. Бот перезапустится через 5–10 секунд.\n'
-            'Напишите /start после этого.',
+            'Установка займёт 1–2 минуты. Бот перезапустится автоматически.\n'
+            'Напишите /start через 2 минуты.',
             parse_mode='HTML')
     except Exception:
         pass
@@ -824,6 +823,10 @@ async def _on_self_update_now(q, ctx):
 
 
 async def _on_self_update_later(q, ctx):
+    try:
+        await q.answer()
+    except Exception:
+        pass
     st = _load_update_state()
     until = (datetime.now() + timedelta(days=_UPDATE_SNOOZE_DAYS)).isoformat(timespec='seconds')
     st['snoozed_until'] = until
@@ -840,6 +843,10 @@ async def _on_self_update_later(q, ctx):
 
 
 async def _on_self_update_never(q, ctx):
+    try:
+        await q.answer('Уведомления отключены для этой версии')
+    except Exception:
+        pass
     st = _load_update_state()
     latest = st.get('last_notified_version', '')
     if latest:
@@ -1222,6 +1229,12 @@ def main():
             if _m and hasattr(_m, '_ask_new_config'):
                 await _m._ask_new_config(q, ctx)
                 return
+        if q.data == 'router:update_now':
+            return await _on_self_update_now(q, ctx)
+        if q.data == 'router:update_later':
+            return await _on_self_update_later(q, ctx)
+        if q.data == 'router:update_never':
+            return await _on_self_update_never(q, ctx)
         if q.data == 'router:mirrors':
             return await _on_mirrors(q, ctx)
         if q.data == 'router:mirrors_check':
@@ -15753,6 +15766,8 @@ set -e
 # При RB_NONINTERACTIVE=1 все read получат EOF и вернут дефолт
 if [ "${RB_NONINTERACTIVE:-}" = "1" ]; then
     exec < /dev/null
+    # read с EOF возвращает 1 — не убивать скрипт через set -e
+    set +e
 fi
 
 BASE_DIR="/opt/router_bot"
