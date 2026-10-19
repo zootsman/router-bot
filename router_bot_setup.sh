@@ -10,7 +10,7 @@ set -e
 # и вернут дефолт. При интерактивном запуске работают как обычно.
 # Блок exec < /dev/tty УБРАН: при setsid() (Popen) /dev/tty не открывается.
 
-SETUP_VERSION="0.0.8-5"
+SETUP_VERSION="0.0.8-6"
 VERSION_FILE="/opt/router_bot/VERSION"
 INSTALLED_VERSION=""
 if [ -f "$VERSION_FILE" ]; then
@@ -187,7 +187,7 @@ RB_MAIN_PY_EOF
 
 echo "  → VERSION"
 cat > /opt/router_bot/VERSION << 'RB_VERSION_EOF'
-0.0.8-5
+0.0.8-6
 RB_VERSION_EOF
 
 echo "  → core/__init__.py"
@@ -15133,6 +15133,7 @@ SCAN_PATTERNS = ['*usque*', '*Usque*']
 RB_MODULES_USQUE_KEENETIC_ACTIONS_PY_EOF
 
 mkdir -p /opt/router_bot/modules/awg_manager /opt/router_bot/data/awg_manager
+mkdir -p /opt/router_bot/modules/awg_manager /opt/router_bot/data/awg_manager
 echo "  → modules/awg_manager/__init__.py"
 cat > /opt/router_bot/modules/awg_manager/__init__.py << 'RB_MODULES_AWG___INIT___PY_EOF'
 
@@ -15335,7 +15336,11 @@ RB_MODULES_AWG_ACTIONS_PY_EOF
 echo "  → modules/awg_manager/module.py"
 cat > /opt/router_bot/modules/awg_manager/module.py << 'RB_MODULES_AWG_MODULE_PY_EOF'
 """Модуль AWG Manager — управление AmneziaWG / Sing-box."""
+import asyncio
+import html
+import json
 import logging
+import urllib.request
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
@@ -15359,6 +15364,48 @@ from .actions import (
 
 log = logging.getLogger(__name__)
 
+
+
+def _esc(s):
+    return html.escape(s or '')
+
+
+def _mcp_call_sync(method: str, params: dict = None) -> dict:
+    from .actions import get_mcp_token, MCP_URL
+    token = get_mcp_token()
+    if not token:
+        raise RuntimeError('MCP-токен не задан')
+    body = {'jsonrpc': '2.0', 'id': 1, 'method': method, 'params': params or {}}
+    req = urllib.request.Request(
+        MCP_URL, data=json.dumps(body).encode('utf-8'),
+        headers={
+            'Authorization': f'Bearer {token}',
+            'Content-Type': 'application/json',
+            'Accept': 'application/json, text/event-stream',
+        },
+        method='POST')
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            raw = r.read().decode('utf-8', errors='replace')
+    except urllib.error.HTTPError as e:
+        try:
+            body_err = e.read().decode('utf-8', errors='replace')[:300]
+        except Exception:
+            body_err = '(no body)'
+        raise RuntimeError(f'MCP HTTP {e.code}: {body_err}')
+    for line in raw.splitlines():
+        if line.startswith('data: '):
+            data = json.loads(line[6:])
+            res = data.get('result', {})
+            if res.get('isError'):
+                raise RuntimeError(res.get('content', [{}])[0].get('text', 'MCP error'))
+            sc = res.get('structuredContent')
+            if sc is not None: return sc
+            return json.loads(res.get('content', [{}])[0].get('text', '{}'))
+    raise RuntimeError('Пустой ответ MCP')
+
+async def _mcp_tool(name: str, args: dict = None) -> dict:
+    return await asyncio.to_thread(_mcp_call_sync, 'tools/call', {'name': name, 'arguments': args or {}})
 
 class AwgManagerModule:
     name = 'awg_manager'
@@ -15457,7 +15504,12 @@ class AwgManagerModule:
             rows.append([InlineKeyboardButton(
                 '🗑 Удалить AWG Manager',
                 callback_data='awg_manager:ask:uninstall')])
+        if installed:
+
+            rows.append([InlineKeyboardButton('📊 Dashboard', callback_data='awg_manager:dashboard')])
+
         rows.append([InlineKeyboardButton(
+
             '🔄 Обновить карточку', callback_data='awg_manager:main')])
         rows.append([
             InlineKeyboardButton('⬅️ Назад', callback_data='router:cat:services'),
@@ -15544,7 +15596,55 @@ class AwgManagerModule:
 
     # ================= Callbacks =================
 
+    async def _show_dashboard(self, q, ctx):
+        try:
+            tunnels = await _mcp_tool('list_tunnels')
+            servers = await _mcp_tool('list_managed_servers')
+            dns = await _mcp_tool('list_dns_routes')
+            static = await _mcp_tool('list_static_routes')
+        except Exception as e:
+            log.error('Dashboard MCP error: %s', e)
+            await q.edit_message_text(
+                f'❌ <b>Ошибка MCP</b>\n\n<code>{_esc(str(e))}</code>',
+                parse_mode='HTML',
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton('⬅️ Назад', callback_data='awg_manager:main')],
+                ]))
+            return
+
+        lines = [f'{self.icon} <b>AWG Dashboard</b>', '']
+        
+        t_list = tunnels.get('tunnels', [])
+        lines.append(f'📡 Туннели: <b>{len(t_list)}</b>')
+        for t in t_list[:5]:
+            st = '🟢' if t.get('up') else '🔴'
+            lines.append(f'  {st} {_esc(t.get("name") or t.get("id", "?"))}')
+
+        s_list = servers.get('servers', [])
+        lines.append(f'\n🛡 WG Серверы: <b>{len(s_list)}</b>')
+        for srv in s_list:
+            st = '🟢' if srv.get('connected') else '🔴'
+            mg = ' ⚙️' if srv.get('managed') else ''
+            lines.append(f'  {st} {_esc(srv.get("description") or "?")} ({srv.get("interfaceName")}) · {srv.get("peerCount")} peers{mg}')
+
+        lines.append('\n📋 Маршруты:')
+        lines.append(f'  🌐 DNS: <b>{len(dns.get("routes", []))}</b>')
+        lines.append(f'  🔗 Static: <b>{len(static.get("routes", []))}</b>')
+
+        kb = InlineKeyboardMarkup([
+            [InlineKeyboardButton('🔄 Обновить', callback_data='awg_manager:dashboard')],
+            [InlineKeyboardButton('⬅️ Назад', callback_data='awg_manager:main')],
+        ])
+        try:
+            await q.edit_message_text('\n'.join(lines), parse_mode='HTML', reply_markup=kb)
+        except Exception as e:
+            if 'not modified' not in str(e).lower():
+                raise
+
     async def handle_callback(self, action, q, ctx):
+        if action == 'dashboard':
+            await q.answer()
+            return await self._show_dashboard(q, ctx)
         if action == 'main':
             await q.answer()
             text, kb = self._build_card()
@@ -16543,7 +16643,7 @@ printf "Установить все модули без вопросов? (y/N):
 read ANS_ALL
 echo ""
 if [ "$ANS_ALL" = "y" ] || [ "$ANS_ALL" = "Y" ]; then
-    ENABLED=",net_watch,ssh_control,system,hydraroute,flashkeen,xkeen,bird,mtproxy,keen_pbr,neofit,usque_keenetic"
+    ENABLED=",net_watch,ssh_control,system,hydraroute,flashkeen,xkeen,bird,mtproxy,keen_pbr,neofit,usque_keenetic,awg_manager"
     echo "════════════════════════════════════════════"
     echo "  ✅ Выбрано: установка ВСЕХ модулей"
     echo "════════════════════════════════════════════"
@@ -16742,6 +16842,19 @@ if [ "$ANS_USQUE" != "n" ] && [ "$ANS_USQUE" != "N" ]; then
     echo "   ✅ Usque WARP будет установлен"
 else
     echo "   ⏭  Usque WARP пропущен"
+fi
+echo ""
+echo "🛡 AWG Manager"
+echo "   Управление AmneziaWG / Sing-box туннелями."
+echo "   Веб-интерфейс, MCP-сервер, WireGuard пиры."
+echo ""
+printf "   Установить? (Y/n): "
+read ANS_AWG
+if [ "$ANS_AWG" != "n" ] && [ "$ANS_AWG" != "N" ]; then
+    ENABLED="$ENABLED,awg_manager"
+    echo "   ✅ AWG Manager будет установлен"
+else
+    echo "   ⏭  AWG Manager пропущен"
 fi
 echo ""
 
