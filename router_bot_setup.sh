@@ -1596,16 +1596,91 @@ MIRROR_BASES = [
 _MIRROR_BASES = MIRROR_BASES
 
 
-def detect_entware_arch() -> str:
-    """Определяет архитектуру Entware.
+_KNOWN_ARCH_CATALOGS = (
+    'aarch64-k3.10', 'aarch64-3.10',
+    'mipselsf-k3.4', 'mipssf-k3.4',
+    'mips64elsf-k3.4', 'mips64sf-k3.4',
+    'armv7sf-k3.2', 'armv7sf-k2.6',
+    'x86-64-k3.2',
+)
 
-    Источники (по приоритету):
-      1. opkg print-architecture — arch с максимальным приоритетом,
-         исключая 'all' и суффикс '_kn' (Keenetic-специфичный).
-      2. /opt/etc/opkg.conf — первая src/gz entware строка.
-      3. Fallback mipselsf-k3.4.
+
+def _normalize_arch(arch: str) -> str:
+    """Приводит arch к имени каталога на зеркалах Entware.
+
+    Keenetic opkg часто отдаёт короткую форму (aarch64, mipsel),
+    а на зеркалах каталоги называются aarch64-k3.10, mipselsf-k3.4.
+    """
+    if not arch:
+        return ''
+    a = arch.strip().lower()
+    # Уже валидный каталог — оставляем как есть
+    for known in _KNOWN_ARCH_CATALOGS:
+        if a == known.lower():
+            return known
+    # Голые формы
+    if a in ('aarch64', 'arm64', 'armv8', 'aarch64_be'):
+        return 'aarch64-k3.10'
+    if a in ('mipsel', 'mips32', 'mips32el', 'mipsel_24kc'):
+        return 'mipselsf-k3.4'
+    if a in ('mips', 'mips32be'):
+        return 'mipssf-k3.4'
+    if a in ('mips64', 'mips64el'):
+        return 'mips64elsf-k3.4'
+    if a in ('armv7', 'armv7l', 'armhf'):
+        return 'armv7sf-k3.2'
+    if a in ('x86_64', 'amd64', 'x86-64'):
+        return 'x86-64-k3.2'
+    # Есть суффикс -k — принимаем как есть
+    if '-k' in a:
+        return a
+    return a
+
+
+def _read_arch_from_opkg_conf() -> str:
+    try:
+        with open('/opt/etc/opkg.conf') as f:
+            for line in f:
+                if line.startswith('src/gz entware '):
+                    url = line.split()[-1]
+                    arch = url.rstrip('/').rsplit('/', 1)[-1]
+                    if arch and '-' in arch:
+                        return arch
+    except Exception:
+        pass
+    return ''
+
+
+def _read_arch_from_entware_release() -> str:
+    try:
+        with open('/opt/etc/entware_release') as f:
+            for line in f:
+                line = line.strip()
+                if line.startswith('arch='):
+                    return line.split('=', 1)[1].strip()
+                if ' arch=' in line:
+                    for part in line.split():
+                        if part.startswith('arch='):
+                            return part.split('=', 1)[1].strip()
+    except Exception:
+        pass
+    return ''
+
+
+def detect_entware_arch() -> str:
+    """Определяет архитектуру Entware с нормализацией.
+
+    Цепочка источников:
+      1. opkg print-architecture (наибольший приоритет, кроме all и _kn)
+      2. /opt/etc/opkg.conf
+      3. /opt/etc/entware_release
+      4. uname -m
+    Каждый кандидат нормализуется через _normalize_arch().
     """
     import subprocess as _sp
+    candidates = []
+
+    # 1. opkg print-architecture
     try:
         r = _sp.run(['opkg', 'print-architecture'],
                     capture_output=True, text=True, timeout=5)
@@ -1626,23 +1701,28 @@ def detect_entware_arch() -> str:
                         best_pri = pri
                         best_arch = arch
             if best_arch:
-                return best_arch
+                candidates.append(best_arch)
     except Exception:
         pass
 
-    # Fallback — opkg.conf
+    # 2-3. opkg.conf и entware_release
+    for src_arch in (_read_arch_from_opkg_conf(),
+                     _read_arch_from_entware_release()):
+        if src_arch:
+            candidates.append(src_arch)
+
+    # 4. uname -m
     try:
-        with open('/opt/etc/opkg.conf') as f:
-            for line in f:
-                if line.startswith('src/gz entware '):
-                    url = line.split()[-1]
-                    # http://host/entware/ARCH → ARCH
-                    arch = url.rstrip('/').rsplit('/', 1)[-1]
-                    if arch and '-' in arch:
-                        return arch
+        r = _sp.run(['uname', '-m'], capture_output=True, text=True, timeout=3)
+        if r.returncode == 0 and r.stdout.strip():
+            candidates.append(r.stdout.strip())
     except Exception:
         pass
 
+    for c in candidates:
+        n = _normalize_arch(c)
+        if n:
+            return n
     return 'mipselsf-k3.4'
 
 
@@ -1661,19 +1741,42 @@ ENTWARE_MIRRORS = get_entware_mirrors()
 OPKG_CONF = '/opt/etc/opkg.conf'
 
 
-def _check_one_sync(url, timeout=4):
+_MIRROR_OK_CODES = ('200', '204', '206', '301', '302', '303', '307', '308')
+
+
+def _check_one_sync(url, timeout=8):
+    """HEAD-проверка Packages.gz. Если HEAD заблокирован — GET с Range."""
     start = _time.time()
+
+    def _run_curl(mode):
+        args = ['/opt/bin/curl', '-4', '-sL', '--max-time', str(timeout),
+                '-A', 'RouterBot-mirror-check/1.0',
+                '-o', '/dev/null', '-w', '%{http_code}']
+        if mode == 'HEAD':
+            args.insert(2, '-I')
+        elif mode == 'GET_RANGE':
+            args.extend(['-r', '0-0'])
+        args.append(url + '/Packages.gz')
+        r = _sp.run(args, capture_output=True, text=True,
+                    timeout=timeout + 2)
+        return (r.stdout or '').strip()
+
+    last_code = ''
     try:
-        r = _sp.run(
-            ['/opt/bin/curl', '-sI', '--max-time', str(timeout),
-             '-o', '/dev/null', '-w', '%{http_code}',
-             url + '/Packages.gz'],
-            capture_output=True, text=True, timeout=timeout + 2,
-        )
-        elapsed = _time.time() - start
-        code = (r.stdout or '').strip()
-        ok = code in ('200', '301', '302', '304')
-        return {'url': url, 'time': round(elapsed, 2), 'ok': ok, 'code': code}
+        code = _run_curl('HEAD')
+        last_code = code
+        if code in _MIRROR_OK_CODES:
+            return {'url': url, 'time': round(_time.time() - start, 2),
+                    'ok': True, 'code': code}
+        # HEAD заблокирован — пробуем GET с Range
+        if code in ('403', '405', '501', '', '000'):
+            code = _run_curl('GET_RANGE')
+            last_code = code
+            if code in _MIRROR_OK_CODES:
+                return {'url': url, 'time': round(_time.time() - start, 2),
+                        'ok': True, 'code': code}
+        return {'url': url, 'time': round(_time.time() - start, 2),
+                'ok': False, 'code': last_code or 'HEAD/GET failed'}
     except Exception as e:
         return {'url': url, 'time': 0, 'ok': False, 'code': str(e)[:40]}
 
@@ -1749,6 +1852,11 @@ def apply_mirror(new_base):
 def build_mirrors_text(results, current):
     """Формирует текст карточки со списком зеркал."""
     lines = ['\U0001f30d <b>Зеркала Entware</b>', '']
+    try:
+        _arch = detect_entware_arch()
+        lines.append(f'Архитектура: <code>{_arch}</code>')
+    except Exception:
+        pass
     if current:
         lines.append(f'Текущее: <code>{current}</code>')
     lines.append('')
@@ -15228,7 +15336,14 @@ BIN_PATH = '/opt/bin/awg-manager'
 CONF_DIR = '/opt/etc/awg-manager'
 LOG_FILE = '/opt/var/log/awg-manager.log'
 
+AWG_REPO_URL  = 'http://repo.hoaxisr.ru/mipsel-k3.4'
+AWG_REPO_CONF = '/opt/etc/opkg/awg_manager.conf'
+
 INSTALL_CMD = (
+    'mkdir -p /opt/etc/opkg && '
+    'if ! grep -q repo.hoaxisr.ru ' + AWG_REPO_CONF + ' 2>/dev/null; then '
+    'printf "src/gz hoaxisr %s\\n" ' + AWG_REPO_URL + ' > ' + AWG_REPO_CONF + '; '
+    'fi && '
     'opkg update && '
     'opkg install awg-manager'
 )
@@ -15415,6 +15530,7 @@ import html
 import json
 import logging
 import urllib.request
+import urllib.error
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
@@ -15513,6 +15629,7 @@ class AwgManagerModule:
         log.info('AWG Manager module started')
 
     async def on_leave(self):
+        self._awaiting_token = False
         self._uninstall_opts = {}
         self._leftovers = []
 
@@ -16119,30 +16236,50 @@ if [ -z "$_entware_arch" ]; then
     _entware_arch=$(grep '^src/gz entware ' /opt/etc/opkg.conf 2>/dev/null \
         | awk '{print $NF}' | sed 's|.*/||')
 fi
+# Нормализация коротких форм под каталоги Entware
+case "$_entware_arch" in
+    aarch64|arm64|armv8)     _entware_arch="aarch64-k3.10" ;;
+    mipsel|mips32|mips32el)  _entware_arch="mipselsf-k3.4" ;;
+    mips)                    _entware_arch="mipssf-k3.4" ;;
+    mips64|mips64el)         _entware_arch="mips64elsf-k3.4" ;;
+    armv7|armv7l|armhf)      _entware_arch="armv7sf-k3.2" ;;
+    x86_64|amd64|x86-64)     _entware_arch="x86-64-k3.2" ;;
+esac
 [ -z "$_entware_arch" ] && _entware_arch="mipselsf-k3.4"
 echo "  Архитектура Entware: $_entware_arch"
 
-# --- Fallback по зеркалам (живые на 2026-10) ---
+# --- Пробегаем ВСЕ зеркала (HEAD с fallback на GET range) ---
 _MIRROR_BASES="http://bin.entware.net https://mirrors.bfsu.edu.cn/entware http://mirrors.nju.edu.cn/entware https://mirror.vinet.io/entware http://entware.mirror.digitalpacific.com.au"
 _OPKG_OK=0
 for _mb in $_MIRROR_BASES; do
     _url="$_mb/$_entware_arch"
     echo "  Проверяю зеркало: $_url"
-    if /opt/bin/curl -sI -o /dev/null -w "%{http_code}" --max-time 5 "$_url/Packages.gz" 2>/dev/null | grep -q '^200$'; then
-        echo "    ✅ доступно, применяю"
-        sed -i "s|^src/gz entware .*|src/gz entware $_url|" /opt/etc/opkg.conf
-        if opkg update >/dev/null 2>&1; then
-            _OPKG_OK=1
-            break
-        fi
-        echo "    ⚠️  opkg update не прошёл, пробую следующее"
-    else
-        echo "    ❌ недоступно"
-    fi
+    _code=$(/opt/bin/curl -4 -sL -I -A 'RouterBot-mirror-check/1.0' \
+        -o /dev/null -w "%{http_code}" --max-time 8 "$_url/Packages.gz" 2>/dev/null)
+    case "$_code" in
+        403|405|501|000|"")
+            _code=$(/opt/bin/curl -4 -sL -r 0-0 -A 'RouterBot-mirror-check/1.0' \
+                -o /dev/null -w "%{http_code}" --max-time 8 "$_url/Packages.gz" 2>/dev/null)
+            ;;
+    esac
+    case "$_code" in
+        200|204|206|301|302|303|307|308)
+            echo "    ✅ $_code — применяю"
+            sed -i "s|^src/gz entware .*|src/gz entware $_url|" /opt/etc/opkg.conf
+            if opkg update >/dev/null 2>&1; then
+                _OPKG_OK=1
+                break
+            fi
+            echo "    ⚠️  opkg update не прошёл, пробую следующее"
+            ;;
+        *)
+            echo "    ❌ $_code"
+            ;;
+    esac
 done
 
 if [ "$_OPKG_OK" = "0" ]; then
-    echo "  ❌ Ни одно зеркало не отвечает. Пробую исходный opkg.conf..."
+    echo "  ⚠️  Ни одно зеркало не отвечает. Пробую как есть."
     opkg update >/dev/null 2>&1 || true
 fi
 
@@ -17164,7 +17301,7 @@ printf "Искать вендора по MAC (on/off) [on]: "; read VENDOR
 [ -z "$VENDOR" ] && VENDOR=on
 
 # ---------- 8. Запись config.env ----------
-mkdir -p "$BASE_DIR" "$LOG_DIR" "$INIT_DIR" "$BASE_DIR/data" "$BASE_DIR/data/net_watch" "$BASE_DIR/data/ssh_control" "$BASE_DIR/data/xkeen" "$BASE_DIR/data/bird" "$BASE_DIR/data/hydraroute" "$BASE_DIR/data/mtproxy" "$BASE_DIR/data/keen_pbr" "$BASE_DIR/data/neofit" "$BASE_DIR/data/usque_keenetic" "$BASE_DIR/data/mtproxy"
+mkdir -p "$BASE_DIR" "$LOG_DIR" "$INIT_DIR" "$BASE_DIR/data" "$BASE_DIR/data/net_watch" "$BASE_DIR/data/ssh_control" "$BASE_DIR/data/xkeen" "$BASE_DIR/data/bird" "$BASE_DIR/data/hydraroute" "$BASE_DIR/data/mtproxy" "$BASE_DIR/data/keen_pbr" "$BASE_DIR/data/neofit" "$BASE_DIR/data/usque_keenetic" "$BASE_DIR/data/awg_manager"
 
 cat > "$BASE_DIR/config.env" << EOF
 # Router Bot — конфиг
