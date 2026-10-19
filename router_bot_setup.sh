@@ -10,7 +10,7 @@ set -e
 # и вернут дефолт. При интерактивном запуске работают как обычно.
 # Блок exec < /dev/tty УБРАН: при setsid() (Popen) /dev/tty не открывается.
 
-SETUP_VERSION="0.0.8-7"
+SETUP_VERSION="0.0.8-9"  # AUTO_DISCOVERY_PATCH_V1
 VERSION_FILE="/opt/router_bot/VERSION"
 INSTALLED_VERSION=""
 if [ -f "$VERSION_FILE" ]; then
@@ -187,13 +187,159 @@ RB_MAIN_PY_EOF
 
 echo "  → VERSION"
 cat > /opt/router_bot/VERSION << 'RB_VERSION_EOF'
-0.0.8-7
+0.0.8-9
 RB_VERSION_EOF
 
 echo "  → core/__init__.py"
 cat > /opt/router_bot/core/__init__.py << 'RB_CORE___INIT___PY_EOF'
 
 RB_CORE___INIT___PY_EOF
+
+echo "  → core/module_base.py"
+cat > /opt/router_bot/core/module_base.py << 'RB_CORE_MODULE_BASE_PY_EOF'
+"""Базовый класс модуля router_bot (контракт + дефолты)."""
+
+
+class ModuleBase:
+    name = ''
+    title = ''
+    icon = '📦'
+    description = ''
+    category = None
+    category_title = ''
+    category_icon = '📁'
+    commands = []
+    conflicts_with = {}
+    default_enabled = True
+    cleanup_paths = []
+    cleanup_init = []
+
+    def __init__(self, chat_id):
+        self.chat_id = str(chat_id)
+
+    async def startup(self, app): pass
+    async def on_leave(self): pass
+    async def send_card_message(self, update, ctx): pass
+    async def handle_callback(self, action, query, ctx): pass
+    def get_installed(self): return False
+    def get_status_short(self): return '❔'
+RB_CORE_MODULE_BASE_PY_EOF
+
+echo "  → core/module_loader.py"
+cat > /opt/router_bot/core/module_loader.py << 'RB_CORE_MODULE_LOADER_PY_EOF'
+"""Авто-обнаружение модулей из /opt/router_bot/modules/."""
+import importlib
+import logging
+import pkgutil
+
+log = logging.getLogger(__name__)
+MODULES_DIR = '/opt/router_bot/modules'
+
+
+def discover_module_classes() -> dict:
+    result = {}
+    for entry in pkgutil.iter_modules([MODULES_DIR]):
+        if not entry.ispkg or entry.name.startswith('_'):
+            continue
+        folder = entry.name
+        try:
+            mod = importlib.import_module(f'modules.{folder}.module')
+        except Exception as e:
+            log.warning('Module %s: import failed: %s', folder, e)
+            continue
+        cls = _find_module_class(mod, folder)
+        if cls is None:
+            log.warning('Module %s: no class with .name=="%s"', folder, folder)
+            continue
+        if folder in result:
+            log.warning('Module %s: duplicate', folder); continue
+        result[folder] = cls
+        log.info('Discovered module: %s -> %s', folder, cls.__name__)
+    return result
+
+
+def _find_module_class(module, folder_name: str):
+    for attr in dir(module):
+        try:
+            obj = getattr(module, attr)
+        except Exception:
+            continue
+        if not isinstance(obj, type): continue
+        if obj.__module__ != module.__name__: continue
+        if getattr(obj, 'name', None) == folder_name: return obj
+    return None
+RB_CORE_MODULE_LOADER_PY_EOF
+
+echo "  → core/list_modules.py"
+cat > /opt/router_bot/core/list_modules.py << 'RB_CORE_LIST_MODULES_PY_EOF'
+#!/opt/bin/python3
+"""TSV: name|title|icon|description|category|default_enabled."""
+import sys
+sys.path.insert(0, '/opt/router_bot')
+from core.module_loader import discover_module_classes
+
+
+def main():
+    try:
+        classes = discover_module_classes()
+    except Exception as e:
+        print(f'ERROR|{e}', file=sys.stderr); sys.exit(1)
+    for name in sorted(classes.keys()):
+        cls = classes[name]
+        title = getattr(cls, 'title', name) or name
+        icon = getattr(cls, 'icon', '📦') or '📦'
+        desc = (getattr(cls, 'description', '') or '').replace('|','/').replace('\n',' ')
+        cat = getattr(cls, 'category', '') or ''
+        de = '1' if getattr(cls, 'default_enabled', True) else '0'
+        print('|'.join([name, title, icon, desc, cat, de]))
+
+
+if __name__ == '__main__':
+    main()
+RB_CORE_LIST_MODULES_PY_EOF
+chmod +x /opt/router_bot/core/list_modules.py
+
+echo "  → core/uninstall_helper.py"
+cat > /opt/router_bot/core/uninstall_helper.py << 'RB_CORE_UNINSTALL_HELPER_PY_EOF'
+#!/opt/bin/python3
+"""Пути и init-скрипты модулей: --paths | --etc | --init."""
+import sys
+sys.path.insert(0, '/opt/router_bot')
+from core.module_loader import discover_module_classes
+
+
+def main():
+    mode = sys.argv[1] if len(sys.argv) > 1 else '--paths'
+    try:
+        classes = discover_module_classes()
+    except Exception as e:
+        print(f'ERROR: {e}', file=sys.stderr); sys.exit(1)
+
+    if mode == '--init':
+        seen = set()
+        for name in sorted(classes.keys()):
+            for i in getattr(classes[name], 'cleanup_init', []):
+                if i and i not in seen:
+                    seen.add(i); print(i)
+        return
+
+    if mode not in ('--paths', '--etc'):
+        print(f'Unknown mode: {mode}', file=sys.stderr); sys.exit(2)
+
+    seen = set()
+    for name in sorted(classes.keys()):
+        for p in getattr(classes[name], 'cleanup_paths', []):
+            if not p or p in seen: continue
+            seen.add(p)
+            is_etc = p.startswith('/opt/etc/')
+            if (mode == '--etc' and is_etc) or (mode == '--paths' and not is_etc):
+                print(p)
+
+
+if __name__ == '__main__':
+    main()
+RB_CORE_UNINSTALL_HELPER_PY_EOF
+chmod +x /opt/router_bot/core/uninstall_helper.py
 
 echo "  → core/config.py"
 cat > /opt/router_bot/core/config.py << 'RB_CORE_CONFIG_PY_EOF'
@@ -641,21 +787,6 @@ async def _show_category(q, ctx, cat_name: str):
 
 
 
-async def _open_module_card(update, ctx, mod_name: str, icon: str, title: str):
-    """Открывает карточку модуля командой. Если у модуля нет send_card_message —
-    присылает сообщение с кнопкой."""
-    router = ctx.application.bot_data['router']
-    mod = router.get(mod_name)
-    if not mod:
-        await update.message.reply_text(f'{title} недоступен')
-        return
-    if hasattr(mod, 'send_card_message'):
-        try:
-            await mod.send_card_message(update, ctx)
-            return
-        except Exception as e:
-            log.exception('send_card_message %s failed: %s', mod_name, e)
-
     await update.message.reply_text(
         f'{icon} <b>{title}</b>\n\nНажмите кнопку ниже, чтобы открыть модуль.',
         parse_mode='HTML',
@@ -946,124 +1077,35 @@ async def _on_mirror_apply(q, ctx, idx):
 
 async def _cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     router = ctx.application.bot_data['router']
-    enabled = {m.name for m in router.all()}
-
-    lines = ['\U0001f916 <b>Router Bot</b>', '', '<b>Основные команды:</b>']
-    lines.append('/start   \u2014 главное меню')
-    lines.append('/help    \u2014 эта справка')
-    lines.append('/restart \u2014 перезапуск бота')
-    lines.append('/reboot  \u2014 перезагрузка роутера')
-    lines.append('/mirrors \u2014 проверка зеркал Entware')
-    lines.append('/update  \u2014 проверка обновления бота')
-
+    lines = ['\U0001f916 <b>Router Bot</b>', '', '<b>Основные команды:</b>',
+             '/start   \u2014 главное меню',
+             '/help    \u2014 эта справка',
+             '/restart \u2014 перезапуск бота',
+             '/reboot  \u2014 перезагрузка роутера',
+             '/mirrors \u2014 проверка зеркал Entware',
+             '/update  \u2014 проверка обновления бота']
     mod_cmds = []
-    if 'net_watch' in enabled:
-        mod_cmds.append('/net     \u2014 Net Watch')
-        mod_cmds.append('/status  \u2014 список клиентов')
-        mod_cmds.append('/stats   \u2014 статистика')
-    if 'ssh_control' in enabled:
-        mod_cmds.append('/ssh     \u2014 SSH Control')
-    if 'system' in enabled:
-        mod_cmds.append('/sys     \u2014 Состояние системы')
-    if 'hydraroute' in enabled:
-        mod_cmds.append('/hr      \u2014 HydraRoute')
-    if 'flashkeen' in enabled:
-        mod_cmds.append('/fk      \u2014 Flashkeen')
-    if 'xkeen' in enabled:
-        mod_cmds.append('/xk      \u2014 XKeen')
-    if 'bird' in enabled:
-        mod_cmds.append('/bd      \u2014 BIRD')
-    if 'mtproxy' in enabled:
-        mod_cmds.append('/mt      \u2014 MTProxy')
-    if 'keen_pbr' in enabled:
-        mod_cmds.append('/kp      \u2014 Keen-PBR')
-    if 'neofit' in enabled:
-        mod_cmds.append('/nf      \u2014 NeoFit')
-    if 'usque_keenetic' in enabled:
-        mod_cmds.append('/usque   \u2014 Usque WARP')
-    if 'awg_manager' in enabled:
-        mod_cmds.append('/awg     \u2014 AWG Manager')
-
-    if mod_cmds:
-        lines.append('')
-        lines.append('<b>Модули:</b>')
-        lines.extend(mod_cmds)
-
-    lines.append('')
-    lines.append('<b>Активные модули:</b>')
     for mod in router.all():
-        desc = getattr(mod, 'description', '')
+        for cmd_name, desc in getattr(mod, 'commands', []):
+            mod_cmds.append(f'/{cmd_name}   \u2014 {desc}')
+    if mod_cmds:
+        lines += ['', '<b>Модули:</b>'] + mod_cmds
+    lines += ['', '<b>Активные модули:</b>']
+    for mod in router.all():
+        icon  = getattr(mod, 'icon', '\U0001f4e6')
+        title = getattr(mod, 'title', mod.name)
+        desc  = getattr(mod, 'description', '')
         if desc:
-            lines.append(f'{mod.icon} <b>{mod.title}</b> \u2014 {desc}')
+            lines.append(f'{icon} <b>{title}</b> \u2014 {desc}')
         else:
-            lines.append(f'{mod.icon} <b>{mod.title}</b>')
-
-    lines.append('')
-    lines.append('<i>Полный список команд \u2014 нажмите / в поле ввода.</i>')
-
+            lines.append(f'{icon} <b>{title}</b>')
+    lines += ['', '<i>Полный список команд \u2014 нажмите / в поле ввода.</i>']
     kb = InlineKeyboardMarkup([
         [InlineKeyboardButton('\U0001f680 Открыть главное меню', callback_data='router:main')],
     ])
     await update.message.reply_text(
         '\n'.join(lines), parse_mode='HTML', reply_markup=kb,
     )
-
-async def _cmd_net(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    router = ctx.application.bot_data['router']
-    mod = router.get('net_watch')
-    if mod and hasattr(mod, 'send_card_message'):
-        await mod.send_card_message(update, ctx)
-    else:
-        await update.message.reply_text('Net Watch недоступен')
-
-
-async def _cmd_ssh(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    router = ctx.application.bot_data['router']
-    mod = router.get('ssh_control')
-    if mod and hasattr(mod, 'send_card_message'):
-        await mod.send_card_message(update, ctx)
-    else:
-        await update.message.reply_text('SSH Control недоступен')
-
-
-async def _cmd_sys(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await _open_module_card(update, ctx, 'system', '🖥', 'System')
-
-
-async def _cmd_hr(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await _open_module_card(update, ctx, 'hydraroute', '\U0001f40d', 'HydraRoute')
-
-
-async def _cmd_fk(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await _open_module_card(update, ctx, 'flashkeen', '\U0001f4be', 'Flashkeen')
-
-
-async def _cmd_xk(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await _open_module_card(update, ctx, 'xkeen', '\U0001f43e', 'XKeen')
-
-
-async def _cmd_bd(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await _open_module_card(update, ctx, 'bird', '\U0001f426', 'BIRD')
-
-
-async def _cmd_mt(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await _open_module_card(update, ctx, 'mtproxy', '\U0001f310', 'MTProxy')
-
-
-async def _cmd_kp(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await _open_module_card(update, ctx, 'keen_pbr', '\U0001f6e4', 'Keen-PBR')
-
-
-async def _cmd_nf(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await _open_module_card(update, ctx, 'neofit', '\U0001f500', 'NeoFit')
-
-
-async def _cmd_usque(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await _open_module_card(update, ctx, 'usque_keenetic', '\u2601\ufe0f', 'Usque WARP')
-
-
-async def _cmd_awg(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-    await _open_module_card(update, ctx, 'awg_manager', '\U0001f6e1', 'AWG Manager')
 
 
 async def _on_router_main(query, ctx):
@@ -1078,13 +1120,32 @@ async def _on_router_main(query, ctx):
             raise
 
 
+def _register_module_open_handler(app, mod, cmd_name):
+    """Открывает карточку модуля по /<cmd_name>."""
+    async def _open(update, ctx, _mod=mod):
+        try:
+            if hasattr(_mod, 'send_card_message'):
+                await _mod.send_card_message(update, ctx)
+            else:
+                await update.message.reply_text(
+                    f'{getattr(_mod, "title", _mod.name)} недоступен')
+        except Exception as e:
+            log.exception('Open %s failed: %s', getattr(_mod, 'name', '?'), e)
+            try:
+                await update.message.reply_text(
+                    f'\u274c {getattr(_mod, "title", "модуль")}: {e}')
+            except Exception:
+                pass
+    app.add_handler(CommandHandler(cmd_name, _open))
+
+
 async def post_init(app):
-    # session_started пишет сам NetWatchModule.startup — дублировать не нужно
     router = app.bot_data['router']
-
-    # 1. Меню команд — глобальные + только для активных модулей
-    enabled_names = {m.name for m in router.all()}
-
+    for mod in router.all():
+        try:
+            await mod.startup(app)
+        except Exception as e:
+            log.exception('Module %s startup failed: %s', mod.name, e)
     cmds = [
         BotCommand('start',   '\U0001f680 Главное меню'),
         BotCommand('help',    '\u2753 Помощь'),
@@ -1093,52 +1154,22 @@ async def post_init(app):
         BotCommand('mirrors', '\U0001f30d Проверка зеркал Entware'),
         BotCommand('update',  '\U0001f195 Проверить обновление'),
     ]
-    if 'net_watch' in enabled_names:
-        cmds.append(BotCommand('net', '\U0001f4e1 Net Watch'))
-    if 'ssh_control' in enabled_names:
-        cmds.append(BotCommand('ssh', '\U0001f4bb SSH Control'))
-    if 'system' in enabled_names:
-        cmds.append(BotCommand('sys', '\U0001f5a5 Система'))
-    if 'hydraroute' in enabled_names:
-        cmds.append(BotCommand('hr', '\U0001f40d HydraRoute'))
-    if 'flashkeen' in enabled_names:
-        cmds.append(BotCommand('fk', '\U0001f4be Flashkeen'))
-    if 'xkeen' in enabled_names:
-        cmds.append(BotCommand('xk', '\U0001f43e XKeen'))
-    if 'bird' in enabled_names:
-        cmds.append(BotCommand('bd', '\U0001f426 BIRD'))
-    if 'mtproxy' in enabled_names:
-        cmds.append(BotCommand('mt', '\U0001f310 MTProxy'))
-    if 'keen_pbr' in enabled_names:
-        cmds.append(BotCommand('kp', '\U0001f6e4 Keen-PBR'))
-    if 'neofit' in enabled_names:
-        cmds.append(BotCommand('nf', '\U0001f500 NeoFit'))
-    if 'usque_keenetic' in enabled_names:
-        cmds.append(BotCommand('usque', '\u2601\ufe0f Usque WARP'))
-    if 'awg_manager' in enabled_names:
-        cmds.append(BotCommand('awg', '\U0001f6e1 AWG Manager'))
+    seen = {c.command for c in cmds}
     for mod in router.all():
-        for cmd, desc in getattr(mod, 'commands', []):
-            cmds.append(BotCommand(cmd, desc))
-
+        for cmd_name, desc in getattr(mod, 'commands', []):
+            if cmd_name in seen:
+                continue
+            seen.add(cmd_name)
+            cmds.append(BotCommand(cmd_name, desc))
+            _register_module_open_handler(app, mod, cmd_name)
     try:
         await app.bot.set_my_commands(cmds)
         log.info('Commands registered: %s', [c.command for c in cmds])
     except Exception as e:
         log.warning('set_my_commands failed: %s', e)
-
-    # 2. Инициализация модулей
-    for mod in router.all():
-        try:
-            await mod.startup(app)
-        except Exception as e:
-            log.exception('Module %s startup failed: %s', mod.name, e)
-
-    # 3. Фоновый цикл self-update
     app.bot_data['chat_id'] = cfg('TG_CHAT_ID')
     asyncio.create_task(_self_update_loop(app))
     log.info('self-update loop started (interval %ss)', _UPDATE_CHECK_INTERVAL)
-
     log.info('Router bot started')
 
 
@@ -1178,32 +1209,18 @@ def main():
 
     router = ModuleRouter()
 
-    import importlib
-    _MODULES_MAP = {
-        'net_watch': ('modules.net_watch.module', 'NetWatchModule'),
-        'ssh_control': ('modules.ssh_control.module', 'SSHControlModule'),
-        'system': ('modules.system.module', 'SystemModule'),
-        'hydraroute': ('modules.hydraroute.module', 'HydraRouteModule'),
-        'flashkeen': ('modules.flashkeen.module', 'FlashkeenModule'),
-        'xkeen': ('modules.xkeen.module', 'XKeenModule'),
-        'bird': ('modules.bird.module', 'BirdModule'),
-        'mtproxy': ('modules.mtproxy.module', 'MTProxyModule'),
-        'keen_pbr': ('modules.keen_pbr.module', 'KeenPbrModule'),
-        'neofit': ('modules.neofit.module', 'NeoFitModule'),
-        'usque_keenetic': ('modules.usque_keenetic.module', 'UsqueKeeneticModule'),
-        'awg_manager': ('modules.awg_manager.module', 'AwgManagerModule'),
-    }
-    for _mname in enabled_set:
-        if _mname not in _MODULES_MAP:
+    from core.module_loader import discover_module_classes
+    _all_classes = discover_module_classes()
+    log.info('Discovered modules: %s', sorted(_all_classes.keys()))
+    for _mname in sorted(enabled_set):
+        _cls = _all_classes.get(_mname)
+        if _cls is None:
             log.warning('Unknown module in ENABLED_MODULES: %s', _mname)
             continue
-        _mpath, _mcls = _MODULES_MAP[_mname]
         try:
-            _mod = importlib.import_module(_mpath)
-            _cls = getattr(_mod, _mcls)
             router.register(_cls(chat_id))
         except Exception as e:
-            log.exception('Failed to load %s: %s', _mname, e)
+            log.exception('Failed to init module %s: %s', _mname, e)
 
     if not router.all():
         log.critical('Ни один модуль не включён. Проверьте ENABLED_MODULES в config.env')
@@ -1219,32 +1236,6 @@ def main():
     app.add_handler(CommandHandler('reboot', _cmd_reboot))
     app.add_handler(CommandHandler('mirrors', _cmd_mirrors))
     app.add_handler(CommandHandler('update', _cmd_update))
-
-    enabled_names = {m.name for m in router.all()}
-    if 'net_watch' in enabled_names:
-        app.add_handler(CommandHandler('net', _cmd_net))
-    if 'ssh_control' in enabled_names:
-        app.add_handler(CommandHandler('ssh', _cmd_ssh))
-    if 'system' in enabled_names:
-        app.add_handler(CommandHandler('sys', _cmd_sys))
-    if 'hydraroute' in enabled_names:
-        app.add_handler(CommandHandler('hr', _cmd_hr))
-    if 'flashkeen' in enabled_names:
-        app.add_handler(CommandHandler('fk', _cmd_fk))
-    if 'xkeen' in enabled_names:
-        app.add_handler(CommandHandler('xk', _cmd_xk))
-    if 'bird' in enabled_names:
-        app.add_handler(CommandHandler('bd', _cmd_bd))
-    if 'mtproxy' in enabled_names:
-        app.add_handler(CommandHandler('mt', _cmd_mt))
-    if 'keen_pbr' in enabled_names:
-        app.add_handler(CommandHandler('kp', _cmd_kp))
-    if 'neofit' in enabled_names:
-        app.add_handler(CommandHandler('nf', _cmd_nf))
-    if 'usque_keenetic' in enabled_names:
-        app.add_handler(CommandHandler('usque', _cmd_usque))
-    if 'awg_manager' in enabled_names:
-        app.add_handler(CommandHandler('awg', _cmd_awg))
 
     # Общий callback — обрабатывает router:main отдельно, остальное — в роутер
     async def _global_callback(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1289,6 +1280,7 @@ def main():
 
     log.info('Starting router bot...')
     app.run_polling(drop_pending_updates=True)
+
 RB_CORE_MAIN_PY_EOF
 
 echo "  → core/router.py"
@@ -1587,231 +1579,240 @@ import time as _time
 # (check_mirrors() в реальном времени ставит ✅/❌).
 MIRROR_BASES = [
     'http://bin.entware.net',
-    'https://mirrors.bfsu.edu.cn/entware',
     'http://mirrors.nju.edu.cn/entware',
+    'https://mirrors.bfsu.edu.cn/entware',
+    'https://mirrors.cernet.edu.cn/entware',
     'https://mirror.vinet.io/entware',
-    'http://entware.mirror.digitalpacific.com.au',
 ]
 # Псевдоним для совместимости с внутренним кодом
 _MIRROR_BASES = MIRROR_BASES
 
 
-_KNOWN_ARCH_CATALOGS = (
-    'aarch64-k3.10', 'aarch64-3.10',
-    'mipselsf-k3.4', 'mipssf-k3.4',
-    'mips64elsf-k3.4', 'mips64sf-k3.4',
-    'armv7sf-k3.2', 'armv7sf-k2.6',
-    'x86-64-k3.2',
-)
+def _valid_entware_arch(value):
+    import re
+    return bool(value and re.fullmatch(r'[A-Za-z0-9_.+-]+', value)
+                and '-' in value and value != 'all')
 
 
-def _normalize_arch(arch: str) -> str:
-    """Приводит arch к имени каталога на зеркалах Entware.
-
-    Keenetic opkg часто отдаёт короткую форму (aarch64, mipsel),
-    а на зеркалах каталоги называются aarch64-k3.10, mipselsf-k3.4.
-    """
-    if not arch:
-        return ''
-    a = arch.strip().lower()
-    # Уже валидный каталог — оставляем как есть
-    for known in _KNOWN_ARCH_CATALOGS:
-        if a == known.lower():
-            return known
-    # Голые формы
-    if a in ('aarch64', 'arm64', 'armv8', 'aarch64_be'):
-        return 'aarch64-k3.10'
-    if a in ('mipsel', 'mips32', 'mips32el', 'mipsel_24kc'):
-        return 'mipselsf-k3.4'
-    if a in ('mips', 'mips32be'):
-        return 'mipssf-k3.4'
-    if a in ('mips64', 'mips64el'):
-        return 'mips64elsf-k3.4'
-    if a in ('armv7', 'armv7l', 'armhf'):
-        return 'armv7sf-k3.2'
-    if a in ('x86_64', 'amd64', 'x86-64'):
-        return 'x86-64-k3.2'
-    # Есть суффикс -k — принимаем как есть
-    if '-k' in a:
-        return a
-    return a
-
-
-def _read_arch_from_opkg_conf() -> str:
+def _configured_entware_urls():
+    """Читает активные Entware src из opkg.conf без комментариев."""
+    urls = []
     try:
         with open('/opt/etc/opkg.conf') as f:
             for line in f:
-                if line.startswith('src/gz entware '):
-                    url = line.split()[-1]
-                    arch = url.rstrip('/').rsplit('/', 1)[-1]
-                    if arch and '-' in arch:
-                        return arch
-    except Exception:
-        pass
-    return ''
-
-
-def _read_arch_from_entware_release() -> str:
-    try:
-        with open('/opt/etc/entware_release') as f:
-            for line in f:
                 line = line.strip()
-                if line.startswith('arch='):
-                    return line.split('=', 1)[1].strip()
-                if ' arch=' in line:
-                    for part in line.split():
-                        if part.startswith('arch='):
-                            return part.split('=', 1)[1].strip()
+                if not line or line.startswith('#'):
+                    continue
+                parts = line.split()
+                if len(parts) >= 3 and parts[0] in ('src/gz', 'src'):
+                    urls.append((parts[1], parts[-1].rstrip('/')))
     except Exception:
         pass
+    return urls
+
+
+def _arch_from_url(url):
+    parts = [p for p in url.rstrip('/').split('/') if p]
+    if parts and parts[-1].lower() == 'keenetic':
+        parts.pop()
+    if parts and _valid_entware_arch(parts[-1]):
+        return parts[-1]
     return ''
 
 
 def detect_entware_arch() -> str:
-    """Определяет архитектуру Entware с нормализацией.
+    """Определяет архитектуру по активному Entware feed, затем по opkg."""
+    for name, url in _configured_entware_urls():
+        if name == 'entware':
+            arch = _arch_from_url(url)
+            if arch:
+                return arch
 
-    Цепочка источников:
-      1. opkg print-architecture (наибольший приоритет, кроме all и _kn)
-      2. /opt/etc/opkg.conf
-      3. /opt/etc/entware_release
-      4. uname -m
-    Каждый кандидат нормализуется через _normalize_arch().
-    """
-    import subprocess as _sp
-    candidates = []
-
-    # 1. opkg print-architecture
+    # opkg arch-теги не всегда совпадают с именами каталогов репозитория.
+    # Используем только явно известные соответствия.
+    mapping = {
+        'aarch64-3.10': 'aarch64-k3.10',
+        'aarch64-k3.10': 'aarch64-k3.10',
+        'mipselsf-3.4': 'mipselsf-k3.4',
+        'mipselsf-k3.4': 'mipselsf-k3.4',
+        'mipssf-3.4': 'mipssf-k3.4',
+        'mipssf-k3.4': 'mipssf-k3.4',
+        'armv7sf-3.2': 'armv7sf-k3.2',
+        'armv7sf-k3.2': 'armv7sf-k3.2',
+        'x64-3.2': 'x64-k3.2',
+        'x64-k3.2': 'x64-k3.2',
+    }
     try:
-        r = _sp.run(['opkg', 'print-architecture'],
-                    capture_output=True, text=True, timeout=5)
-        if r.returncode == 0:
-            best_pri = -1
-            best_arch = ''
-            for line in (r.stdout or '').splitlines():
-                parts = line.split()
-                if len(parts) >= 3 and parts[0] == 'arch':
-                    arch = parts[1]
-                    try:
-                        pri = int(parts[2])
-                    except ValueError:
-                        continue
-                    if arch == 'all' or arch.endswith('_kn'):
-                        continue
-                    if pri > best_pri:
-                        best_pri = pri
-                        best_arch = arch
-            if best_arch:
-                candidates.append(best_arch)
+        r = _sp.run(['opkg', 'print-architecture'], capture_output=True,
+                    text=True, timeout=5)
+        candidates = []
+        for line in (r.stdout or '').splitlines():
+            parts = line.split()
+            if len(parts) >= 3 and parts[0] == 'arch':
+                try:
+                    priority = int(parts[2])
+                except ValueError:
+                    continue
+                if parts[1] in mapping:
+                    candidates.append((priority, mapping[parts[1]]))
+        if candidates:
+            return max(candidates)[1]
     except Exception:
         pass
-
-    # 2-3. opkg.conf и entware_release
-    for src_arch in (_read_arch_from_opkg_conf(),
-                     _read_arch_from_entware_release()):
-        if src_arch:
-            candidates.append(src_arch)
-
-    # 4. uname -m
-    try:
-        r = _sp.run(['uname', '-m'], capture_output=True, text=True, timeout=3)
-        if r.returncode == 0 and r.stdout.strip():
-            candidates.append(r.stdout.strip())
-    except Exception:
-        pass
-
-    for c in candidates:
-        n = _normalize_arch(c)
-        if n:
-            return n
-    return 'mipselsf-k3.4'
+    return ''
 
 
-def get_entware_mirrors() -> list:
-    """Возвращает полные URL зеркал с подставленной архитектурой."""
-    arch = detect_entware_arch()
-    return [f'{base}/{arch}' for base in _MIRROR_BASES]
-
-
-# Обратная совместимость: старый код импортирует ENTWARE_MIRRORS.
-# Теперь это функция-обёртка, но чтобы не ломать `from core.utils import ENTWARE_MIRRORS`,
-# оставляем список, который пересчитывается при импорте.
-ENTWARE_MIRRORS = get_entware_mirrors()
-
-
+# Базовые URL зеркал без архитектуры. Для проверки к каждому добавляется
+# архитектура, найденная в конфигурации конкретного роутера.
+MIRROR_BASES = [
+    'http://bin.entware.net',
+    'http://mirrors.nju.edu.cn/entware',
+    'https://mirrors.bfsu.edu.cn/entware',
+    'https://mirrors.cernet.edu.cn/entware',
+    'https://mirror.vinet.io/entware',
+]
+_MIRROR_BASES = MIRROR_BASES
 OPKG_CONF = '/opt/etc/opkg.conf'
 
 
-_MIRROR_OK_CODES = ('200', '204', '206', '301', '302', '303', '307', '308')
+def get_entware_mirrors() -> list:
+    arch = detect_entware_arch()
+    if not arch:
+        return []
+    return [f'{base.rstrip("/")}/{arch}' for base in _MIRROR_BASES]
 
 
-def _check_one_sync(url, timeout=8):
-    """HEAD-проверка Packages.gz. Если HEAD заблокирован — GET с Range."""
-    start = _time.time()
+ENTWARE_MIRRORS = get_entware_mirrors()
+_MIRROR_PROBE_FILES = ('Packages.gz', 'Packages', 'Packages.manifest')
 
-    def _run_curl(mode):
-        args = ['/opt/bin/curl', '-4', '-sL', '--max-time', str(timeout),
-                '-A', 'RouterBot-mirror-check/1.0',
-                '-o', '/dev/null', '-w', '%{http_code}']
-        if mode == 'HEAD':
-            args.insert(2, '-I')
-        elif mode == 'GET_RANGE':
-            args.extend(['-r', '0-0'])
-        args.append(url + '/Packages.gz')
-        r = _sp.run(args, capture_output=True, text=True,
-                    timeout=timeout + 2)
-        return (r.stdout or '').strip()
 
-    last_code = ''
+def _probe_index(url, timeout=10):
+    """Проверяет индекс пакетов и не считает редирект/пустой ответ успехом."""
+    import gzip as _gzip
+    import os as _os
+    import shutil as _shutil
+    import tempfile as _tempfile
+
+    curl = _shutil.which('curl') or ('/opt/bin/curl' if _os.path.exists('/opt/bin/curl') else '')
+    if not curl:
+        return False, 'curl отсутствует', ''
+
+    fd, path = _tempfile.mkstemp(prefix='rbmirror_')
+    _os.close(fd)
+    last_code, last_file = '000', ''
     try:
-        code = _run_curl('HEAD')
-        last_code = code
-        if code in _MIRROR_OK_CODES:
-            return {'url': url, 'time': round(_time.time() - start, 2),
-                    'ok': True, 'code': code}
-        # HEAD заблокирован — пробуем GET с Range
-        if code in ('403', '405', '501', '', '000'):
-            code = _run_curl('GET_RANGE')
-            last_code = code
-            if code in _MIRROR_OK_CODES:
-                return {'url': url, 'time': round(_time.time() - start, 2),
-                        'ok': True, 'code': code}
-        return {'url': url, 'time': round(_time.time() - start, 2),
-                'ok': False, 'code': last_code or 'HEAD/GET failed'}
-    except Exception as e:
-        return {'url': url, 'time': 0, 'ok': False, 'code': str(e)[:40]}
+        # Проверяем корневой индекс и /keenetic: некоторые зеркала публикуют
+        # Keenetic-специфичный feed отдельно.
+        for suffix in ('', '/keenetic'):
+            for fname in _MIRROR_PROBE_FILES:
+                full_url = url.rstrip('/') + suffix + '/' + fname
+                last_file = suffix + '/' + fname
+                try:
+                    r = _sp.run([
+                        curl, '-4', '-sS', '-L', '--connect-timeout', '4',
+                        '--max-time', str(timeout), '--max-filesize', '1048576',
+                        '-r', '0-65535', '-A', 'RouterBot-mirror-check/3.0',
+                        '-o', path, '-w', '%{http_code}', full_url
+                    ], capture_output=True, text=True, timeout=timeout + 3)
+                    last_code = (r.stdout or '').strip()[-3:] or '000'
+                except Exception:
+                    last_code = '000'
+                    continue
+
+                if last_code not in ('200', '206') or r.returncode != 0:
+                    continue
+                try:
+                    with open(path, 'rb') as f:
+                        head = f.read(65536)
+                except Exception:
+                    continue
+                if not head or b'<html' in head[:2048].lower() or b'<!doctype html' in head[:2048].lower():
+                    continue
+
+                if head.startswith(b'\x1f\x8b'):
+                    try:
+                        with _gzip.open(path, 'rb') as gz:
+                            sample = gz.read(4096)
+                        if b'Package:' in sample or b'Filename:' in sample:
+                            return True, last_code, last_file
+                    except Exception:
+                        # Диапазон может обрываться до конца gzip-потока.
+                        # Если заголовок gzip корректный, читаем его через zlib
+                        # в режиме raw-deflate и проверяем содержимое без trailer.
+                        try:
+                            import zlib
+                            dec = zlib.decompressobj(16 + zlib.MAX_WBITS)
+                            sample = dec.decompress(head, 16384)
+                            if b'Package:' in sample or b'Filename:' in sample:
+                                return True, last_code, last_file
+                        except Exception:
+                            pass
+                elif b'Package:' in head or b'Filename:' in head:
+                    return True, last_code, last_file
+        return False, last_code or 'unreachable', last_file
+    finally:
+        try:
+            _os.unlink(path)
+        except Exception:
+            pass
+
+
+def _check_one_sync(url, timeout=10):
+    start = _time.time()
+    if not detect_entware_arch():
+        return {'url': url, 'time': 0, 'ok': False,
+                'code': 'архитектура не определена', 'file': ''}
+    ok, code, fname = _probe_index(url, timeout)
+    return {'url': url, 'time': round(_time.time() - start, 2),
+            'ok': ok, 'code': code, 'file': fname}
 
 
 async def check_mirrors():
     import asyncio as _a
-    tasks = [_a.to_thread(_check_one_sync, u) for u in ENTWARE_MIRRORS]
+    mirrors = get_entware_mirrors()
+    if not mirrors:
+        return [{'url': 'архитектура Entware не определена', 'time': 0,
+                 'ok': False, 'code': 'проверьте /opt/etc/opkg.conf', 'file': ''}]
+    tasks = [_a.to_thread(_check_one_sync, u) for u in mirrors]
     return await _a.gather(*tasks)
 
 
 def get_current_mirror():
-    if not __import__('os').path.exists(OPKG_CONF):
+    import os as _os
+    if not _os.path.exists(OPKG_CONF):
         return ''
     try:
         with open(OPKG_CONF) as f:
             for line in f:
-                if line.startswith('src/gz') or line.startswith('src '):
-                    parts = line.split()
-                    if len(parts) >= 3:
-                        url = parts[-1]
-                        # нормализуем до базового (без /keenetic)
-                        for base in ENTWARE_MIRRORS:
-                            if url.startswith(base):
-                                return base
+                s = line.strip()
+                if not s or s.startswith('#'):
+                    continue
+                parts = s.split()
+                if len(parts) < 3 or parts[0] not in ('src/gz', 'src'):
+                    continue
+                url = parts[-1].rstrip('/')
+                if parts[1] == 'entware':
+                    arch = detect_entware_arch()
+                    if arch and url.endswith('/' + arch + '/keenetic'):
+                        return url[:-len('/keenetic')]
+                    if arch and url.endswith('/' + arch):
                         return url
+                    return url
     except Exception:
         pass
     return ''
 
 
 def apply_mirror(new_base):
-    """Переписывает opkg.conf, меняя известные зеркала Entware на новое."""
+    """Меняет URL известных зеркал, сохраняя архитектуру и feed-суффиксы."""
     import os as _os
     if not _os.path.exists(OPKG_CONF):
         return False, 'opkg.conf не найден'
+    arch = detect_entware_arch()
+    if not arch:
+        return False, 'Архитектура не определена; конфигурация не изменена'
+    if not new_base.rstrip('/').endswith('/' + arch):
+        return False, 'Зеркало не соответствует архитектуре ' + arch
     try:
         with open(OPKG_CONF) as f:
             lines = f.readlines()
@@ -1820,33 +1821,41 @@ def apply_mirror(new_base):
 
     changed = 0
     new_lines = []
+    known = get_entware_mirrors()
     for line in lines:
-        orig = line
         stripped = line.strip()
-        if stripped.startswith('src/gz') or stripped.startswith('src '):
+        if stripped and not stripped.startswith('#'):
             parts = stripped.split()
-            if len(parts) >= 3:
-                url = parts[-1]
-                # меняем, если URL относится к одному из известных зеркал
-                for old_base in ENTWARE_MIRRORS:
-                    if url.startswith(old_base):
-                        new_url = url.replace(old_base, new_base, 1)
-                        # заменим в строке только URL
-                        idx = line.find(url)
-                        line = line[:idx] + new_url + line[idx+len(url):]
-                        changed += 1
+            if len(parts) >= 3 and parts[0] in ('src/gz', 'src'):
+                url = parts[-1].rstrip('/')
+                for old in known:
+                    if url == old or url.startswith(old + '/'):
+                        replacement = new_base.rstrip('/') + url[len(old):]
+                        pos = line.find(parts[-1])
+                        if pos >= 0:
+                            line = line[:pos] + replacement + line[pos + len(parts[-1]):]
+                            changed += 1
                         break
         new_lines.append(line)
 
-    if changed == 0:
-        return False, 'Нечего менять (нет известных зеркал в конфиге)'
-
+    if not changed:
+        return False, 'В opkg.conf не найдены источники текущего зеркала'
+    backup = OPKG_CONF + '.bak'
     try:
-        with open(OPKG_CONF, 'w') as f:
+        shutil.copy2(OPKG_CONF, backup)
+        tmp = OPKG_CONF + '.tmp'
+        with open(tmp, 'w') as f:
             f.writelines(new_lines)
-        return True, f'Обновлено строк: {changed}'
+        _os.replace(tmp, OPKG_CONF)
+        return True, f'Обновлено строк: {changed}; резервная копия: {backup}'
     except Exception as e:
         return False, f'Ошибка записи: {e}'
+
+
+def _short_domain(url):
+    """Возвращает домен без протокола и пути."""
+    u = url.replace('http://', '').replace('https://', '')
+    return u.split('/')[0]
 
 
 def build_mirrors_text(results, current):
@@ -1864,24 +1873,41 @@ def build_mirrors_text(results, current):
     for i, r in enumerate(results, 1):
         mark = '\u2705' if r['ok'] else '\u274c'
         t = f"{r['time']}с" if r['ok'] else r['code'][:20]
-        short = r['url'].replace('http://', '').replace('https://', '')[:40]
-        lines.append(f'{mark} {i}. <code>{short}</code> — {t}')
+        name = _short_domain(r['url'])
+        lines.append(f'{mark} {i}. <code>{name}</code> — {t}')
     return '\n'.join(lines)
 
 
 def build_mirrors_kb(results):
     from telegram import InlineKeyboardButton, InlineKeyboardMarkup
     rows = []
-    for i, r in enumerate(results, 1):
+
+    # Ищем самый быстрый
+    best_idx = -1
+    best_time = 999.0
+    for i, r in enumerate(results):
+        if r['ok'] and r['time'] < best_time:
+            best_time = r['time']
+            best_idx = i
+
+    if best_idx >= 0:
+        rows.append([InlineKeyboardButton(
+            f'\U0001f680 Автовыбор ({best_time}с)',
+            callback_data=f'router:mirror_apply:{best_idx}')])
+
+    for i, r in enumerate(results):
         if r['ok']:
+            name = _short_domain(r['url'])
             rows.append([InlineKeyboardButton(
-                f'\U0001f4e6 Применить #{i}',
-                callback_data=f'router:mirror_apply:{i-1}')])
+                f'\U0001f4e6 {name}',
+                callback_data=f'router:mirror_apply:{i}')])
+
     rows.append([InlineKeyboardButton(
         '\U0001f504 Проверить снова', callback_data='router:mirrors_check')])
     rows.append([InlineKeyboardButton(
         '\u2b05\ufe0f Назад', callback_data='router:main')])
     return InlineKeyboardMarkup(rows)
+
 RB_CORE_UTILS_PY_EOF
 
 echo "  → core/rb"
@@ -3836,10 +3862,9 @@ class NetWatchModule:
     title = 'Net Watch'
     icon = '📡'
     description = 'мониторинг сетевых клиентов'
-    commands = [
-        ('status', '📡 Список активных клиентов'),
-        ('stats',  '📊 Статистика'),
-    ]
+    commands = [('net', '📡 Net Watch')]
+    cleanup_paths = []
+    cleanup_init = []
 
     def __init__(self, chat_id: str):
         import sys
@@ -4322,6 +4347,7 @@ async def sync_known_hosts_from_router():
         save_json(KNOWN_NAMES_FILE, local)
     log.info('known hosts sync: %d added (total %d)', added, len(local))
     return added
+
 RB_MODULES_NET_WATCH_MODULE_PY_EOF
 
 echo "  → modules/ssh_control/__init__.py"
@@ -4413,7 +4439,9 @@ class SSHControlModule:
     title = 'SSH Control'
     icon = '💻'
     description = 'управление устройствами по SSH'
-    commands = []
+    commands = [('ssh', '💻 SSH Control')]
+    cleanup_paths = []
+    cleanup_init = []
 
     def __init__(self, chat_id: str):
         self.chat_id = str(chat_id)
@@ -5103,6 +5131,7 @@ class SSHControlModule:
         except Exception as e:
             if 'not modified' not in str(e).lower():
                 raise
+
 RB_MODULES_SSH_CONTROL_MODULE_PY_EOF
 
 echo "  → modules/ssh_control/ssh_client.py"
@@ -6283,7 +6312,9 @@ class SystemModule:
     title = 'System'
     icon = '\U0001f5a5'
     description = 'состояние роутера'
-    commands = []  # /sys регистрируется в core/main.py как глобальная
+    commands = [('sys', '🖥 Система')]
+    cleanup_paths = []
+    cleanup_init = []
 
     def __init__(self, chat_id):
         self.chat_id = str(chat_id)
@@ -6700,6 +6731,7 @@ class SystemModule:
                      login or 'admin')
         except Exception as e:
             log.exception('_fw_start: start_firmware_update failed: %s', e)
+
 RB_MODULES_SYSTEM_MODULE_PY_EOF
 
 echo "  → modules/hydraroute/__init__.py"
@@ -6783,7 +6815,22 @@ class HydraRouteModule:
     category = 'services'
     category_title = 'Сервис'
     category_icon = '🛠'
-    commands = []
+    commands = [('hr', '🐍 HydraRoute')]
+    cleanup_paths = [
+        '/opt/sbin/hrneo',
+        '/opt/bin/hrneo',
+        '/opt/sbin/hrweb',
+        '/opt/bin/hrweb',
+        '/opt/sbin/hrdns',
+        '/opt/bin/hrdns',
+        '/opt/etc/HydraRoute',
+        '/opt/var/log/hydraroute*',
+        '/opt/var/log/hrneo*',
+        '/opt/var/log/hrdns*',
+        '/opt/var/run/hrneo*',
+        '/opt/var/run/hrdns*',
+    ]
+    cleanup_init = ['S99hrneo', 'S99hrweb', 'S99hrdns']
 
     def __init__(self, chat_id):
         self._token_editing = False
@@ -7743,6 +7790,7 @@ class HydraRouteModule:
 
         if rc == 0 and was_uninstall:
             await self._check_leftovers(ctx)
+
 RB_MODULES_HYDRAROUTE_MODULE_PY_EOF
 
 echo "  → modules/hydraroute/actions.py"
@@ -8385,7 +8433,17 @@ class FlashkeenModule:
     category = 'services'
     category_title = 'Сервис'
     category_icon = '\U0001f6e0'
-    commands = []
+    commands = [('fk', '💾 Flashkeen')]
+    cleanup_paths = [
+        '/opt/bin/f',
+        '/opt/sbin/f',
+        '/opt/bin/flashkeen',
+        '/opt/sbin/flashkeen',
+        '/opt/etc/flashkeen',
+        '/opt/var/log/flashkeen*',
+        '/opt/var/run/flashkeen*',
+    ]
+    cleanup_init = []
 
     def __init__(self, chat_id):
         self.chat_id = str(chat_id)
@@ -9254,6 +9312,7 @@ class FlashkeenModule:
         except Exception:
             pass
         await self._refresh_interactive(ctx)
+
 RB_MODULES_FLASHKEEN_MODULE_PY_EOF
 
 echo "  → modules/flashkeen/actions.py"
@@ -9465,7 +9524,16 @@ class XKeenModule:
     category = 'services'
     category_title = 'Сервис'
     category_icon = '\U0001f6e0'
-    commands = []
+    commands = [('xk', '🐾 XKeen')]
+    cleanup_paths = [
+        '/opt/sbin/xkeen',
+        '/opt/bin/xkeen',
+        '/opt/sbin/.xkeen',
+        '/opt/etc/xkeen',
+        '/opt/var/log/xkeen*',
+        '/opt/var/run/xkeen*',
+    ]
+    cleanup_init = ['S99xkeen']
 
     def __init__(self, chat_id):
         self.chat_id = str(chat_id)
@@ -10272,6 +10340,7 @@ class XKeenModule:
         # После успешного удаления — сканируем остатки
         if rc == 0 and was_uninstall:
             await self._check_leftovers(ctx)
+
 RB_MODULES_XKEEN_MODULE_PY_EOF
 
 echo "  → modules/xkeen/actions.py"
@@ -10631,7 +10700,18 @@ class BirdModule:
         'hydraroute': 'оба меняют системные маршруты через ndmc/iptables',
         'xkeen': 'оба меняют системные маршруты через ndmc/iptables',
     }
-    commands = []
+    commands = [('bd', '🐦 BIRD')]
+    cleanup_paths = [
+        '/opt/sbin/bird',
+        '/opt/sbin/birdc',
+        '/opt/bin/bird',
+        '/opt/bin/birdc',
+        '/opt/etc/bird.conf',
+        '/opt/etc/bird.conf.bak',
+        '/opt/var/log/bird*',
+        '/opt/var/run/bird*',
+    ]
+    cleanup_init = ['S70bird']
 
     def __init__(self, chat_id):
         self.chat_id = str(chat_id)
@@ -11330,6 +11410,7 @@ class BirdModule:
         # После успешного удаления — сканируем остатки
         if rc == 0 and was_uninstall:
             await self._check_leftovers(ctx)
+
 RB_MODULES_BIRD_MODULE_PY_EOF
 
 echo "  → modules/bird/actions.py"
@@ -11679,7 +11760,15 @@ class MTProxyModule:
     category_title = 'Сервис'
     category_icon = '\U0001f6e0'
     conflicts_with = {}
-    commands = []
+    commands = [('mt', '🌐 MTProxy')]
+    cleanup_paths = [
+        '/opt/bin/tg-ws-proxy',
+        '/opt/sbin/tg-ws-proxy',
+        '/opt/etc/tg-ws-proxy',
+        '/opt/var/log/tg-ws-proxy.log',
+        '/opt/var/run/tg-ws-proxy*',
+    ]
+    cleanup_init = ['S99tg-ws-proxy']
 
     def __init__(self, chat_id):
         self.chat_id = str(chat_id)
@@ -12422,6 +12511,7 @@ class MTProxyModule:
         self._proc_pid = pid
         self._master = master
         asyncio.create_task(self._reader_loop(ctx, pid, master))
+
 RB_MODULES_MTPROXY_MODULE_PY_EOF
 
 echo "  → modules/mtproxy/actions.py"
@@ -12757,7 +12847,15 @@ class KeenPbrModule:
         'xkeen': 'оба занимают policy-routing и nftables-метки',
         'hydraroute': 'оба используют nftables/iptables для маршрутизации',
     }
-    commands = []
+    commands = [('kp', '🛤 Keen-PBR')]
+    cleanup_paths = [
+        '/opt/sbin/keen-pbr',
+        '/opt/bin/keen-pbr',
+        '/opt/etc/keen-pbr',
+        '/opt/var/log/keen-pbr*',
+        '/opt/var/run/keen-pbr*',
+    ]
+    cleanup_init = ['S99keen-pbr']
 
     def __init__(self, chat_id):
         self.chat_id = str(chat_id)
@@ -13436,6 +13534,7 @@ class KeenPbrModule:
         self._proc_pid = pid
         self._master = master
         asyncio.create_task(self._reader_loop(ctx, pid, master))
+
 RB_MODULES_KEEN_PBR_MODULE_PY_EOF
 
 echo "  → modules/keen_pbr/actions.py"
@@ -13736,7 +13835,18 @@ class NeoFitModule:
     conflicts_with = {
         'xkeen': 'оба используют Xray/Sing-Box ядра',
     }
-    commands = []
+    commands = [('nf', '🔀 NeoFit')]
+    cleanup_paths = [
+        '/opt/sbin/neofit',
+        '/opt/bin/neofit',
+        '/opt/sbin/nf',
+        '/opt/bin/nf',
+        '/opt/etc/neofit',
+        '/opt/etc/opkg/neofit.conf',
+        '/opt/var/log/neofit*',
+        '/opt/var/run/neofit*',
+    ]
+    cleanup_init = ['S69neofit']
 
     def __init__(self, chat_id):
         self.chat_id = str(chat_id)
@@ -14281,6 +14391,7 @@ class NeoFitModule:
         self._proc_pid = pid
         self._master = master
         asyncio.create_task(self._reader_loop(ctx, pid, master))
+
 RB_MODULES_NEOFIT_MODULE_PY_EOF
 
 echo "  → modules/neofit/actions.py"
@@ -14587,7 +14698,15 @@ class UsqueKeeneticModule:
         'xkeen':      'оба занимают туннели/маршрутизацию',
         'hydraroute': 'пересечение маршрутизации доменов',
     }
-    commands = []
+    commands = [('usque', '☁️ Usque WARP')]
+    cleanup_paths = [
+        '/opt/bin/usque',
+        '/opt/sbin/usque',
+        '/opt/etc/usque',
+        '/opt/etc/opkg/usque-keenetic.conf',
+        '/opt/var/log/usque*',
+    ]
+    cleanup_init = ['S51usque']
 
     def __init__(self, chat_id):
         self.chat_id = str(chat_id)
@@ -15160,6 +15279,7 @@ class UsqueKeeneticModule:
             except Exception: os._exit(1)
         self._proc_pid = pid; self._master = master
         asyncio.create_task(self._reader_loop(ctx, pid, master))
+
 RB_MODULES_USQUE_KEENETIC_MODULE_PY_EOF
 
 echo "  → modules/usque_keenetic/actions.py"
@@ -15611,7 +15731,16 @@ class AwgManagerModule:
         'keen_pbr': 'оба занимают policy-routing и nftables',
         'usque_keenetic': 'оба занимают туннели/маршрутизацию',
     }
-    commands = []
+    commands = [('awg', '🛡 AWG Manager')]
+    cleanup_paths = [
+        '/opt/bin/awg-manager',
+        '/opt/sbin/awg-manager',
+        '/opt/etc/awg-manager',
+        '/opt/etc/opkg/awg_manager.conf',
+        '/opt/var/log/awg-manager*',
+        '/opt/var/run/awg-manager*',
+    ]
+    cleanup_init = ['S99awg-manager']
 
     def __init__(self, chat_id):
         self.chat_id = str(chat_id)
@@ -16940,238 +17069,87 @@ else
 fi
 echo ""
 
-# ---------- 5. Выбор модулей ----------
+# ---------- 5. Выбор модулей (auto-discovery) ----------
 echo "────────────────────────────────────────────"
 echo "  Выбор модулей"
 echo "────────────────────────────────────────────"
 echo ""
-echo "По умолчанию все модули будут установлены."
-echo "Введите 'n' чтобы пропустить любой из них."
+
+if [ ! -x /opt/bin/python3 ]; then
+    echo "❌ python3 отсутствует — не могу получить список модулей"
+    exit 1
+fi
+
+set +e
+_MODS_LIST=$(/opt/bin/python3 /opt/router_bot/core/list_modules.py 2>&1)
+_MODS_RC=$?
+set -e
+
+if [ "$_MODS_RC" != "0" ] || [ -z "$_MODS_LIST" ]; then
+    echo "❌ Не удалось получить список модулей (rc=$_MODS_RC)"
+    echo "$_MODS_LIST" | sed 's/^/     /'
+    exit 1
+fi
+
+_MODS_FILE=/tmp/rb_modules_list.txt
+printf '%s\n' "$_MODS_LIST" > "$_MODS_FILE"
+
+_MODS_TOTAL=0
+while IFS='|' read -r _mname _mtitle _micon _mdesc _mcat _mdef; do
+    [ -n "$_mname" ] && _MODS_TOTAL=$((_MODS_TOTAL+1))
+done < "$_MODS_FILE"
+
+if [ "$_MODS_TOTAL" = "0" ]; then
+    echo "❌ В /opt/router_bot/modules/ не найдено ни одного модуля"
+    rm -f "$_MODS_FILE"
+    exit 1
+fi
+
+echo "Найдено модулей: $_MODS_TOTAL"
 echo ""
 
 ENABLED=""
-
 printf "Установить все модули без вопросов? (y/N): "
 read ANS_ALL
 echo ""
+
 if [ "$ANS_ALL" = "y" ] || [ "$ANS_ALL" = "Y" ]; then
-    ENABLED=",net_watch,ssh_control,system,hydraroute,flashkeen,xkeen,bird,mtproxy,keen_pbr,neofit,usque_keenetic,awg_manager"
+    _COUNT=0
+    while IFS='|' read -r _mname _mtitle _micon _mdesc _mcat _mdef; do
+        [ -z "$_mname" ] && continue
+        [ "$_mdef" = "1" ] || continue
+        ENABLED="$ENABLED,$_mname"
+        _COUNT=$((_COUNT+1))
+    done < "$_MODS_FILE"
     echo "════════════════════════════════════════════"
-    echo "  ✅ Выбрано: установка ВСЕХ модулей"
+    echo "  ✅ Выбрано: установка ВСЕХ модулей ($_COUNT)"
     echo "════════════════════════════════════════════"
     echo ""
-    echo "Модули:"
-    echo "  📡 Net Watch    — мониторинг сетевых клиентов"
-    echo "  💻 SSH Control  — управление по SSH"
-    echo "  🖥  System       — состояние роутера + обновления KeeneticOS"
-    echo "  🐍 HydraRoute   — HR Neo + Web + hrdns, watchlist, match"
-    echo "  💾 Flashkeen    — менеджер дисков и Entware"
-    echo "  🐾 XKeen        — Xray/Mihomo маршрутизация"
-    echo "  🐦 BIRD         — BGP/OSPF"
-    echo "  🌐 MTProxy      — MTProto-прокси для Telegram"
-    echo "  🛤  Keen-PBR     — policy-based routing"
-    echo "  🔀 NeoFit       — веб-панель Xray/Sing-Box"
-    echo "  🌐 Usque WARP   — Cloudflare MASQUE"
+    while IFS='|' read -r _mname _mtitle _micon _mdesc _mcat _mdef; do
+        [ -z "$_mname" ] && continue
+        [ "$_mdef" = "1" ] || continue
+        printf "  %s %s — %s\n" "$_micon" "$_mtitle" "$_mdesc"
+    done < "$_MODS_FILE"
     echo ""
-    echo "Зависимости: python3, python-telegram-bot, curl, openssh-client, openssh-keygen"
-    echo ""
-    SKIP_DIALOGS=1
 else
     echo "По умолчанию все модули будут установлены."
     echo "Введите 'n' чтобы пропустить любой из них."
     echo ""
-    SKIP_DIALOGS=0
+    while IFS='|' read -r _mname _mtitle _micon _mdesc _mcat _mdef; do
+        [ -z "$_mname" ] && continue
+        printf "%s %s\n" "$_micon" "$_mtitle"
+        [ -n "$_mdesc" ] && printf "   %s\n" "$_mdesc"
+        printf "   Установить? (Y/n): "
+        read _ans_mod
+        case "$_ans_mod" in
+            n|N) printf "   ⏭  %s пропущен\n" "$_mtitle" ;;
+            *)   ENABLED="$ENABLED,$_mname"; printf "   ✅ %s будет установлен\n" "$_mtitle" ;;
+        esac
+        echo ""
+    done < "$_MODS_FILE"
 fi
 
-if [ "$SKIP_DIALOGS" != "1" ]; then
-# --- Net Watch ---
-echo "📡 Net Watch"
-echo "   Мониторинг сетевых клиентов: список подключённых"
-echo "   устройств, история, блокировка по MAC, статистика,"
-echo "   определение моделей по SSDP."
-echo ""
-printf "   Установить? (Y/n): "
-read ANS_NW
-if [ "$ANS_NW" != "n" ] && [ "$ANS_NW" != "N" ]; then
-    ENABLED="$ENABLED,net_watch"
-    echo "   ✅ Net Watch будет установлен"
-else
-    echo "   ⏭  Net Watch пропущен"
-fi
-echo ""
-
-# --- SSH Control ---
-echo "💻 SSH Control"
-echo "   Управление устройствами по SSH: подключение к роутеру"
-echo "   или другим хостам, выполнение команд и скриптов,"
-echo "   интерактивные ответы (y/n) через кнопки Telegram."
-echo ""
-printf "   Установить? (Y/n): "
-read ANS_SSH
-if [ "$ANS_SSH" != "n" ] && [ "$ANS_SSH" != "N" ]; then
-    ENABLED="$ENABLED,ssh_control"
-    echo "   ✅ SSH Control будет установлен"
-else
-    echo "   ⏭  SSH Control пропущен"
-fi
-echo ""
-
-# --- System ---
-echo "🖥 System"
-echo "   Состояние роутера: CPU, RAM, Swap, место на диске,"
-echo "   информация о модели и прошивке. Проверка и установка"
-echo "   обновлений KeeneticOS прямо из Telegram."
-echo ""
-printf "   Установить? (Y/n): "
-read ANS_SYS
-if [ "$ANS_SYS" != "n" ] && [ "$ANS_SYS" != "N" ]; then
-    ENABLED="$ENABLED,system"
-    echo "   ✅ System будет установлен"
-else
-    echo "   ⏭  System пропущен"
-fi
-echo ""
-
-# --- HydraRoute ---
-echo "🐍 HydraRoute"
-echo "   Установка и управление HydraRoute: установка"
-echo "   веб-интерфейса HRweb, обновление пакетов,"
-echo "   стандартное и полное удаление."
-echo ""
-printf "   Установить? (Y/n): "
-read ANS_HR
-if [ "$ANS_HR" != "n" ] && [ "$ANS_HR" != "N" ]; then
-    ENABLED="$ENABLED,hydraroute"
-    echo "   ✅ HydraRoute будет установлен"
-else
-    echo "   ⏭  HydraRoute пропущен"
-fi
-echo ""
-
-# --- Flashkeen ---
-echo "💾 Flashkeen"
-echo "   Менеджер дисков и Entware: разметка разделов,"
-echo "   бэкапы Entware, установка с нуля, обновление."
-echo "   Полноценный интерактивный терминал в Telegram."
-echo ""
-printf "   Установить? (Y/n): "
-read ANS_FK
-if [ "$ANS_FK" != "n" ] && [ "$ANS_FK" != "N" ]; then
-    ENABLED="$ENABLED,flashkeen"
-    echo "   ✅ Flashkeen будет установлен"
-else
-    echo "   ⏭  Flashkeen пропущен"
-fi
-echo ""
-
-# --- XKeen ---
-echo "🐾 XKeen"
-echo "   Маршрутизация через Xray/Mihomo: выборочное"
-echo "   проксирование трафика TCP/UDP для выбранных клиентов."
-echo "   Управление через веб-панель."
-echo ""
-printf "   Установить? (Y/n): "
-read ANS_XK
-if [ "$ANS_XK" != "n" ] && [ "$ANS_XK" != "N" ]; then
-    ENABLED="$ENABLED,xkeen"
-    echo "   ✅ XKeen будет установлен"
-else
-    echo "   ⏭  XKeen пропущен"
-fi
-echo ""
-
-# --- BIRD ---
-echo "🐦 BIRD"
-echo "   Демон динамической маршрутизации (BGP/OSPF)."
-echo "   Для соединения с другими роутерами, офисами"
-echo "   или провайдером по BGP/OSPF."
-echo ""
-printf "   Установить? (Y/n): "
-read ANS_BIRD
-if [ "$ANS_BIRD" != "n" ] && [ "$ANS_BIRD" != "N" ]; then
-    ENABLED="$ENABLED,bird"
-    echo "   ✅ BIRD будет установлен"
-else
-    echo "   ⏭  BIRD пропущен"
-fi
-echo ""
-
-# --- MTProxy ---
-echo "🌐 MTProxy"
-echo "   MTProto-прокси для Telegram. Обход блокировок"
-echo "   провайдера, локальный прокси на роутере."
-echo "   Ссылка подключения показывается в Telegram."
-echo ""
-printf "   Установить? (Y/n): "
-read ANS_MT
-if [ "$ANS_MT" != "n" ] && [ "$ANS_MT" != "N" ]; then
-    ENABLED="$ENABLED,mtproxy"
-    echo "   ✅ MTProxy будет установлен"
-else
-    echo "   ⏭  MTProxy пропущен"
-fi
-echo ""
-
-# --- Keen-PBR ---
-echo "🛤 Keen-PBR"
-echo "   Policy-based routing для Keenetic."
-echo "   Установка, статус, управление сервисом."
-echo ""
-printf "   Установить? (Y/n): "
-read ANS_KP
-if [ "$ANS_KP" != "n" ] && [ "$ANS_KP" != "N" ]; then
-    ENABLED="$ENABLED,keen_pbr"
-    echo "   ✅ Keen-PBR будет установлен"
-else
-    echo "   ⏭  Keen-PBR пропущен"
-fi
-echo ""
-
-# --- NeoFit ---
-echo "🔀 NeoFit"
-echo "   Веб-панель управления прокси (Xray/Sing-Box)."
-echo "   Установка из opkg, управление через Web UI :92."
-echo ""
-printf "   Установить? (Y/n): "
-read ANS_NF
-if [ "$ANS_NF" != "n" ] && [ "$ANS_NF" != "N" ]; then
-    ENABLED="$ENABLED,neofit"
-    echo "   ✅ NeoFit будет установлен"
-else
-    echo "   ⏭  NeoFit пропущен"
-fi
-echo ""
-
-# --- Usque WARP ---
-echo "🌐 Usque WARP"
-echo "   Cloudflare WARP (MASQUE) клиент для Keenetic."
-echo "   Работает через /opt/etc/init.d/S51usque."
-echo ""
-printf "   Установить? (Y/n): "
-read ANS_USQUE
-if [ "$ANS_USQUE" != "n" ] && [ "$ANS_USQUE" != "N" ]; then
-    ENABLED="$ENABLED,usque_keenetic"
-    echo "   ✅ Usque WARP будет установлен"
-else
-    echo "   ⏭  Usque WARP пропущен"
-fi
-echo ""
-echo "🛡 AWG Manager"
-echo "   Управление AmneziaWG / Sing-box туннелями."
-echo "   Веб-интерфейс, MCP-сервер, WireGuard пиры."
-echo ""
-printf "   Установить? (Y/n): "
-read ANS_AWG
-if [ "$ANS_AWG" != "n" ] && [ "$ANS_AWG" != "N" ]; then
-    ENABLED="$ENABLED,awg_manager"
-    echo "   ✅ AWG Manager будет установлен"
-else
-    echo "   ⏭  AWG Manager пропущен"
-fi
-echo ""
-
-# убираем ведущую запятую
-fi
+rm -f "$_MODS_FILE"
 
 ENABLED=$(echo "$ENABLED" | sed 's/^,//')
 
@@ -17703,6 +17681,7 @@ echo "  Управление:  /opt/etc/init.d/S98routerbot {start|stop|restart}
 echo "  Логи:        tail -f $LOG_DIR/router_bot.log"
 echo "  Удаление:    $BASE_DIR/uninstall.sh"
 echo ""
+
 RB_INSTALL_SH_EOF
 
 echo "  → uninstall.sh"
@@ -17742,14 +17721,14 @@ for p in $(ps w | grep "flashkeen" | grep -v grep | awk '{print $1}'); do
 done
 sleep 1
 
-# ---------- 2b. Остановка сервисов модулей ----------
+# ---------- 2b. Остановка сервисов (auto) ----------
 echo "→ Останавливаю сервисы модулей..."
-for svc in S51usque S69neofit S70bird S99awg-manager S99keen-pbr \
-           S99hrneo S99hrweb S99xkeen S99tg-ws-proxy; do
-    if [ -x "$INIT_DIR/$svc" ]; then
-        "$INIT_DIR/$svc" stop 2>/dev/null || true
-    fi
-done
+if [ -x /opt/bin/python3 ] && [ -f /opt/router_bot/core/uninstall_helper.py ]; then
+    /opt/bin/python3 /opt/router_bot/core/uninstall_helper.py --init 2>/dev/null | while IFS= read -r svc; do
+        [ -z "$svc" ] && continue
+        [ -x "$INIT_DIR/$svc" ] && "$INIT_DIR/$svc" stop 2>/dev/null || true
+    done
+fi
 sleep 1
 # Fallback: kill по имени процесса для модулей без надёжного init
 for proc in "[h]rneo" "[h]rweb" "[t]g-ws-proxy" "[n]eofit" \
@@ -17792,50 +17771,28 @@ echo ""
 echo "Файлы программы:"
 echo "  • $BASE_DIR (модули, конфиг, данные)"
 echo "  • $LOG_DIR/router_bot.log"
-# --- Чистка новых модулей ---
-echo "→ Очищаю данные модулей BIRD и XKeen..."
-
-# BIRD
-if [ -f "/opt/etc/init.d/S70bird" ]; then
-    /opt/etc/init.d/S70bird stop 2>/dev/null || true
+# --- Чистка файлов модулей (auto) ---
+if [ -x /opt/bin/python3 ] && [ -f /opt/router_bot/core/uninstall_helper.py ]; then
+    /opt/bin/python3 /opt/router_bot/core/uninstall_helper.py --init 2>/dev/null | while IFS= read -r svc; do
+        [ -z "$svc" ] && continue
+        [ -x "$INIT_DIR/$svc" ] && "$INIT_DIR/$svc" stop 2>/dev/null || true
+        rm -f "$INIT_DIR/$svc"
+    done
+    /opt/bin/python3 /opt/router_bot/core/uninstall_helper.py --paths 2>/dev/null | while IFS= read -r _p; do
+        [ -z "$_p" ] && continue
+        [ -e "$_p" ] && rm -rf "$_p"
+    done
+    echo "OK: внешние файлы очищены"
+else
+    echo "WARN: uninstall_helper.py не найден"
 fi
-for p in $(ps w | grep -v grep | grep -E "[b]ird " | awk '{print $1}'); do
-    kill -9 "$p" 2>/dev/null || true
-done
-rm -f /opt/etc/init.d/S70bird
-rm -f /opt/sbin/bird /opt/sbin/birdc /opt/bin/bird /opt/bin/birdc
-rm -f /opt/etc/bird.conf /opt/etc/bird.conf.bak
-rm -rf /opt/var/run/bird* /opt/var/log/bird*
-
-# XKeen
-if [ -f "/opt/sbin/xkeen" ]; then
-    xkeen -remove 2>/dev/null || true
+echo ""
+if [ -d "$BASE_DIR/data" ]; then
+    rm -rf "$BASE_DIR/data/"*
+    echo "OK: данные модулей очищены"
 fi
-rm -f /opt/sbin/xkeen /opt/bin/xkeen
-rm -rf /opt/sbin/.xkeen
-rm -rf /opt/etc/xkeen
-rm -rf /opt/var/log/xkeen* /opt/var/run/xkeen*
+echo ""
 
-# MTProxy
-if [ -f "/opt/etc/init.d/S99tg-ws-proxy" ]; then
-    /opt/etc/init.d/S99tg-ws-proxy stop 2>/dev/null || true
-fi
-for p in $(ps w | grep -v grep | grep -E "[t]g-ws-proxy" | awk '{print $1}'); do
-    kill -9 "$p" 2>/dev/null || true
-done
-rm -f /opt/etc/init.d/S99tg-ws-proxy
-rm -f /opt/bin/tg-ws-proxy
-rm -rf /opt/etc/tg-ws-proxy
-rm -f /opt/var/log/tg-ws-proxy.log
-rm -rf /opt/var/run/tg-ws-proxy*
-
-# Данные модулей
-rm -rf "$BASE_DIR/data/xkeen" "$BASE_DIR/data/bird" "$BASE_DIR/data/mtproxy" \
-       "$BASE_DIR/data/awg_manager" "$BASE_DIR/data/keen_pbr" \
-       "$BASE_DIR/data/neofit" "$BASE_DIR/data/usque_keenetic" \
-       "$BASE_DIR/data/hydraroute"
-
-echo "✅ Модули BIRD, XKeen, MTProxy очищены"
 echo ""
 
 echo ""
@@ -17857,14 +17814,13 @@ else
     echo "⚠️  Данные сохранены: $BASE_DIR"
 fi
 
-# ---------- 7b. Опциональное удаление /opt/etc/<module> ----------
+# ---------- 7b. Удаление /opt/etc/<module> (auto) ----------
 _etc_mods=""
-for d in /opt/etc/HydraRoute /opt/etc/awg-manager /opt/etc/usque \
-         /opt/etc/keen-pbr /opt/etc/neofit /opt/etc/xkeen \
-         /opt/etc/tg-ws-proxy; do
-    [ -d "$d" ] && _etc_mods="$_etc_mods $d"
-done
-
+if [ -x /opt/bin/python3 ] && [ -f /opt/router_bot/core/uninstall_helper.py ]; then
+    _etc_mods=$(/opt/bin/python3 /opt/router_bot/core/uninstall_helper.py --etc 2>/dev/null | while IFS= read -r _p; do
+        [ -e "$_p" ] && echo "$_p"
+    done | tr "\n" " ")
+fi
 if [ -n "$_etc_mods" ]; then
     echo ""
     echo "────────────────────────────────────────────"
@@ -17985,6 +17941,7 @@ echo ""
 echo "  Если отказались удалять зависимости —"
 echo "  они остались в системе."
 echo ""
+
 RB_UNINSTALL_SH_EOF
 
 echo "  → core/wrapper.sh"
