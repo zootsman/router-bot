@@ -10,7 +10,7 @@ set -e
 # и вернут дефолт. При интерактивном запуске работают как обычно.
 # Блок exec < /dev/tty УБРАН: при setsid() (Popen) /dev/tty не открывается.
 
-SETUP_VERSION="0.0.8-6"
+SETUP_VERSION="0.0.8-7"
 VERSION_FILE="/opt/router_bot/VERSION"
 INSTALLED_VERSION=""
 if [ -f "$VERSION_FILE" ]; then
@@ -187,7 +187,7 @@ RB_MAIN_PY_EOF
 
 echo "  → VERSION"
 cat > /opt/router_bot/VERSION << 'RB_VERSION_EOF'
-0.0.8-6
+0.0.8-7
 RB_VERSION_EOF
 
 echo "  → core/__init__.py"
@@ -1576,13 +1576,87 @@ def build_leftovers_message(leftovers, prefix):
 import subprocess as _sp
 import time as _time
 
-ENTWARE_MIRRORS = [
-    'http://bin.entware.net/mipselsf-k3.4',
-    'http://mirrors.nju.edu.cn/entware/mipselsf-k3.4',
-    'http://mirrors.bfsu.edu.cn/entware/mipselsf-k3.4',
-    'https://mirror.vinet.io/entware/mipselsf-k3.4',
-    'http://entware.mirror.digitalpacific.com.au/mipselsf-k3.4',
+# ============================================================
+#  Автоопределение архитектуры Entware + актуальные зеркала
+# ============================================================
+
+# Базовые URL зеркал (без /{arch}) — только живые на 2026-10
+# Базовые URL зеркал (без /{arch}).
+# Порядок = порядок проверки в install.sh и отображения в /mirrors.
+# Мёртвые зеркала тоже включены — пользователь должен их видеть
+# (check_mirrors() в реальном времени ставит ✅/❌).
+MIRROR_BASES = [
+    'http://bin.entware.net',
+    'https://mirrors.bfsu.edu.cn/entware',
+    'http://mirrors.nju.edu.cn/entware',
+    'https://mirror.vinet.io/entware',
+    'http://entware.mirror.digitalpacific.com.au',
 ]
+# Псевдоним для совместимости с внутренним кодом
+_MIRROR_BASES = MIRROR_BASES
+
+
+def detect_entware_arch() -> str:
+    """Определяет архитектуру Entware.
+
+    Источники (по приоритету):
+      1. opkg print-architecture — arch с максимальным приоритетом,
+         исключая 'all' и суффикс '_kn' (Keenetic-специфичный).
+      2. /opt/etc/opkg.conf — первая src/gz entware строка.
+      3. Fallback mipselsf-k3.4.
+    """
+    import subprocess as _sp
+    try:
+        r = _sp.run(['opkg', 'print-architecture'],
+                    capture_output=True, text=True, timeout=5)
+        if r.returncode == 0:
+            best_pri = -1
+            best_arch = ''
+            for line in (r.stdout or '').splitlines():
+                parts = line.split()
+                if len(parts) >= 3 and parts[0] == 'arch':
+                    arch = parts[1]
+                    try:
+                        pri = int(parts[2])
+                    except ValueError:
+                        continue
+                    if arch == 'all' or arch.endswith('_kn'):
+                        continue
+                    if pri > best_pri:
+                        best_pri = pri
+                        best_arch = arch
+            if best_arch:
+                return best_arch
+    except Exception:
+        pass
+
+    # Fallback — opkg.conf
+    try:
+        with open('/opt/etc/opkg.conf') as f:
+            for line in f:
+                if line.startswith('src/gz entware '):
+                    url = line.split()[-1]
+                    # http://host/entware/ARCH → ARCH
+                    arch = url.rstrip('/').rsplit('/', 1)[-1]
+                    if arch and '-' in arch:
+                        return arch
+    except Exception:
+        pass
+
+    return 'mipselsf-k3.4'
+
+
+def get_entware_mirrors() -> list:
+    """Возвращает полные URL зеркал с подставленной архитектурой."""
+    arch = detect_entware_arch()
+    return [f'{base}/{arch}' for base in _MIRROR_BASES]
+
+
+# Обратная совместимость: старый код импортирует ENTWARE_MIRRORS.
+# Теперь это функция-обёртка, но чтобы не ломать `from core.utils import ENTWARE_MIRRORS`,
+# оставляем список, который пересчитывается при импорте.
+ENTWARE_MIRRORS = get_entware_mirrors()
+
 
 OPKG_CONF = '/opt/etc/opkg.conf'
 
@@ -2043,7 +2117,7 @@ PYEOF
         case "$_r" in
             y|Y)
                 _tuns=$(ip -o link show 2>/dev/null | sed 's/@[^ :]*//g' | \
-                    awk -F': ' '$2 ~ /^(opkgtun[0-9]+|nwg[0-9]+|wg[0-9]+|ppp[0-9]+|tap[0-9]+)$/ { print $2 }')
+                    awk -F': ' '$2 ~ /^(opkgtun[0-9]+|nwg[0-9]+|wg[0-9]+|tap[0-9]+)$/ { print $2 }')
                 if [ -z "$_tuns" ]; then
                     echo "  Туннели не найдены — VPN не настроен"
                 else
@@ -2205,7 +2279,7 @@ do_config_tun() {
     echo ""
     echo "  Сканирую туннели..."
     _tuns=$(ip -o link show 2>/dev/null | sed 's/@[^ :]*//g' | \
-        awk -F': ' '$2 ~ /^(opkgtun[0-9]+|nwg[0-9]+|wg[0-9]+|ppp[0-9]+|tap[0-9]+)$/ { print $2 }')
+        awk -F': ' '$2 ~ /^(opkgtun[0-9]+|nwg[0-9]+|wg[0-9]+|tap[0-9]+)$/ { print $2 }')
 
     if [ -z "$_tuns" ]; then
         echo "  ⚠️  Туннели не найдены"
@@ -16035,10 +16109,45 @@ else
 
     if [ -n "$MISSING_OPKG" ]; then
         echo ""
-        echo "→ opkg update..."
-        opkg update >/dev/null 2>&1 || true
-        echo "→ opkg install$MISSING_OPKG"
-        opkg install --force-overwrite $MISSING_OPKG || { echo "❌ opkg install не удался"; exit 1; }
+        # --- Автоопределение архитектуры Entware ---
+_entware_arch=""
+if opkg print-architecture >/dev/null 2>&1; then
+    _entware_arch=$(opkg print-architecture 2>/dev/null \
+        | awk '$1=="arch" && $2!="all" && $2!~/_kn$/ && $3+0>max {max=$3+0; a=$2} END{print a}')
+fi
+if [ -z "$_entware_arch" ]; then
+    _entware_arch=$(grep '^src/gz entware ' /opt/etc/opkg.conf 2>/dev/null \
+        | awk '{print $NF}' | sed 's|.*/||')
+fi
+[ -z "$_entware_arch" ] && _entware_arch="mipselsf-k3.4"
+echo "  Архитектура Entware: $_entware_arch"
+
+# --- Fallback по зеркалам (живые на 2026-10) ---
+_MIRROR_BASES="http://bin.entware.net https://mirrors.bfsu.edu.cn/entware http://mirrors.nju.edu.cn/entware https://mirror.vinet.io/entware http://entware.mirror.digitalpacific.com.au"
+_OPKG_OK=0
+for _mb in $_MIRROR_BASES; do
+    _url="$_mb/$_entware_arch"
+    echo "  Проверяю зеркало: $_url"
+    if /opt/bin/curl -sI -o /dev/null -w "%{http_code}" --max-time 5 "$_url/Packages.gz" 2>/dev/null | grep -q '^200$'; then
+        echo "    ✅ доступно, применяю"
+        sed -i "s|^src/gz entware .*|src/gz entware $_url|" /opt/etc/opkg.conf
+        if opkg update >/dev/null 2>&1; then
+            _OPKG_OK=1
+            break
+        fi
+        echo "    ⚠️  opkg update не прошёл, пробую следующее"
+    else
+        echo "    ❌ недоступно"
+    fi
+done
+
+if [ "$_OPKG_OK" = "0" ]; then
+    echo "  ❌ Ни одно зеркало не отвечает. Пробую исходный opkg.conf..."
+    opkg update >/dev/null 2>&1 || true
+fi
+
+echo "→ opkg install$MISSING_OPKG"
+opkg install --force-overwrite $MISSING_OPKG || { echo "❌ opkg install не удался"; exit 1; }
     fi
 
     if [ -n "$MISSING_PIP" ]; then
@@ -16205,7 +16314,7 @@ if [ "$MODE" != "install" ]; then
         echo ""
         _TUNABLES=$(ip -o link show 2>/dev/null \
             | sed "s/@[^ :]*//g" \
-            | awk -F": " '$2 ~ /^(opkgtun[0-9]+|nwg[0-9]+|wg[0-9]+|ppp[0-9]+|tap[0-9]+)$/ { print $2 }')
+            | awk -F": " '$2 ~ /^(opkgtun[0-9]+|nwg[0-9]+|wg[0-9]+|tap[0-9]+)$/ { print $2 }')
         if [ -z "$_TUNABLES" ]; then
             echo "  Туннели не найдены, пропускаю."
         else
@@ -16428,19 +16537,56 @@ fi
 # ---------- 3. Автоопределение сети ----------
 echo "→ Определение параметров сети..."
 
-WAN_IF=$(ip route show default | awk '{
-    for(i=1;i<=NF;i++) if ($i=="dev") iface=$(i+1);
-    if (iface !~ /^(opkgtun|tun|wg|tap|ppp)/) { print iface; exit }
-}')
-if [ -z "$WAN_IF" ]; then
-    printf "  Не удалось определить WAN. Введите вручную: "
-    read WAN_IF
+# --- Универсальный детект WAN: default via <gw> dev <iface> ---
+detect_wan() {
+    # 1. Настоящий WAN: default route с "via" (значит есть gateway)
+    _line=$(ip route show default 2>/dev/null | grep " via " | head -1)
+    if [ -n "$_line" ]; then
+        _if=$(echo "$_line" | awk '{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}')
+        _src=$(ip -4 -o addr show dev "$_if" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
+        if [ -n "$_if" ] && [ -n "$_src" ]; then
+            echo "$_if|$_src"
+            return 0
+        fi
+    fi
+
+    # 2. Fallback: default dev <iface> без via (обычно br0)
+    _line=$(ip route show default 2>/dev/null | head -1)
+    if [ -n "$_line" ]; then
+        _if=$(echo "$_line" | awk '{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}')
+        _src=$(ip -4 -o addr show dev "$_if" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
+        if [ -n "$_if" ] && [ -n "$_src" ]; then
+            echo "$_if|$_src"
+            return 0
+        fi
+    fi
+    return 1
+}
+
+if _WAN_INFO=$(detect_wan); then
+    WAN_IF="${_WAN_INFO%%|*}"
+    WAN_SRC="${_WAN_INFO#*|}"
+    echo "  Определён WAN: $WAN_IF ($WAN_SRC)"
+else
+    echo "  ⚠️  Автодетект WAN не удался"
+    WAN_IF=""
+    WAN_SRC=""
 fi
 
-WAN_SRC=$(ip -4 -o addr show dev "$WAN_IF" 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
-if [ -z "$WAN_SRC" ]; then
-    printf "  Не удалось определить IP роутера. Введите вручную: "
-    read WAN_SRC
+printf "  Использовать этот WAN? (Y/n, n — ввести вручную): "
+read _ANS_WAN
+case "$_ANS_WAN" in
+    n|N)
+        printf "  WAN-интерфейс (ppp0/eth3/...): "
+        read WAN_IF
+        printf "  IP на $WAN_IF: "
+        read WAN_SRC
+        ;;
+esac
+
+if [ -z "$WAN_IF" ] || [ -z "$WAN_SRC" ]; then
+    echo "  ❌ WAN не задан"
+    exit 1
 fi
 
 WAN_TABLE=$(ip rule show 2>/dev/null | awk -v src="$WAN_SRC" '
@@ -16503,7 +16649,7 @@ else
     # Поиск туннелей (без tunl0, PPP, Tap и т.п.)
     TUNABLES=$(ip -o link show 2>/dev/null \
         | sed 's/@[^ :]*//g' \
-        | awk -F': ' '$2 ~ /^(opkgtun[0-9]+|nwg[0-9]+|wg[0-9]+|ppp[0-9]+|tap[0-9]+)$/ { print $2 }')
+        | awk -F': ' '$2 ~ /^(opkgtun[0-9]+|nwg[0-9]+|wg[0-9]+|tap[0-9]+)$/ { print $2 }')
 
     if [ -z "$TUNABLES" ]; then
         echo "  Туннелей не найдено."
@@ -16601,20 +16747,49 @@ else
 
     echo ""
     printf "→ Проверяю доступ к Telegram через $VPN_IF ($VPN_SRC)... "
-    ip route add 149.154.166.110 dev "$VPN_IF" src "$VPN_SRC" table "$WAN_TABLE" 2>/dev/null || true
+    # Удаляем конфликтующие маршруты из main (например, /32 через WAN)
+    ip route del 149.154.166.110 2>/dev/null || true
+    ip route del 149.154.160.0/20 2>/dev/null || true
+    ip route del 91.108.4.0/22 2>/dev/null || true
+    # Ставим через VPN — replace, чтобы гарантированно перезаписать
+    ip route replace 149.154.166.110 dev "$VPN_IF" src "$VPN_SRC" table "$WAN_TABLE" 2>/dev/null || true
+    ip route replace 149.154.160.0/20 dev "$VPN_IF" src "$VPN_SRC" table "$WAN_TABLE" 2>/dev/null || true
+    ip route replace 91.108.4.0/22 dev "$VPN_IF" src "$VPN_SRC" table "$WAN_TABLE" 2>/dev/null || true
+    # Удаляем старые правила для этих сетей — любой таблицы
+    for _net in 149.154.166.110 149.154.160.0/20 91.108.4.0/22; do
+        _j=0
+        while [ "$_j" -lt 10 ]; do
+            ip rule del to "$_net" 2>/dev/null || break
+            _j=$((_j+1))
+        done
+    done
+    # Добавляем правила
     ip rule add to 149.154.166.110 lookup "$WAN_TABLE" priority 1099 2>/dev/null || true
+    ip rule add to 149.154.160.0/20 lookup "$WAN_TABLE" priority 1100 2>/dev/null || true
+    ip rule add to 91.108.4.0/22 lookup "$WAN_TABLE" priority 1101 2>/dev/null || true
     ip rule add from "$WAN_SRC" lookup "$WAN_TABLE" priority 1152 2>/dev/null || true
 
+    _vpn_ok=no; _route_ok=no
+    if /opt/bin/curl $_curl_opts --interface "$VPN_IF" "https://api.telegram.org" >/dev/null 2>&1; then
+        _vpn_ok=yes
+    fi
     if /opt/bin/curl $_curl_opts "https://api.telegram.org" >/dev/null 2>&1; then
+        _route_ok=yes
+    fi
+    if [ "$_route_ok" = "yes" ]; then
         echo "✅ работает"
         USE_VPN="yes"
+    elif [ "$_vpn_ok" = "yes" ]; then
+        echo "⚠️  VPN работает, но маршрут пока не применяется"
+        echo "  Бот при старте применит маршруты повторно (S97tgroutes)."
+        USE_VPN="yes"
     else
-        echo "❌ не проходит"
+        echo "❌ VPN не работает (даже --interface)"
         printf "  Продолжить установку всё равно? (y/N): "
         read ANS
         if [ "$ANS" = "y" ] || [ "$ANS" = "Y" ]; then
             USE_VPN="yes"
-            echo "  ⚠️  VPN настроен, но пока не работает."
+            echo "  ⚠️  Продолжаем без рабочего VPN."
         else
             echo "  Отмена."
             exit 1
@@ -16622,8 +16797,8 @@ else
     fi
     # Маршрут НЕ удаляем — он нужен для проверки токена (urllib).
     # Дополнительно покрываем обе подсети Telegram.
-    for _tgnet in 149.154.160.0/20 91.108.4.0/22; do
-        ip route add "$_tgnet" dev "$VPN_IF" src "$VPN_SRC" table "$WAN_TABLE" 2>/dev/null || true
+    for _tgnet in 149.154.166.110 149.154.160.0/20 91.108.4.0/22; do
+        ip route replace "$_tgnet" dev "$VPN_IF" src "$VPN_SRC" table "$WAN_TABLE" 2>/dev/null || true
     done
 fi
 echo ""
@@ -17043,32 +17218,31 @@ cat > "$INIT_DIR/S97tgroutes" << 'EOF97'
 [ -n "$ROUTE_TABLE" ] || ROUTE_TABLE="16385"
 WAN_IF_CFG="${WAN_IF:-}"
 
-TG_NETS="149.154.160.0/20 91.108.4.0/22"
+TG_NETS="149.154.166.110 149.154.160.0/20 91.108.4.0/22"
 
 # Определяет активный WAN-интерфейс: сначала из config.env,
 # потом из default route (исключая VPN-туннели).
 get_wan_if() {
-    # 1. Из config.env — если интерфейс есть и имеет IPv4
+    # 1. Из config.env — если интерфейс есть, с IPv4 и не VPN
     if [ -n "$WAN_IF_CFG" ] && \
-       ip link show "$WAN_IF_CFG" >/dev/null 2>&1 && \
+       [ "$WAN_IF_CFG" != "$VPN_IF" ] && \
        ip -4 -o addr show dev "$WAN_IF_CFG" 2>/dev/null | grep -q ' inet '; then
         echo "$WAN_IF_CFG"
         return 0
     fi
-    # 2. Из default route — первый, не туннель
+    # 2. default via <gw> dev <iface> — настоящий WAN
     local ifc
     ifc=$(ip route show default 2>/dev/null \
-        | awk '/^default/ {for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}')
-    if [ -n "$ifc" ] && [ "$ifc" != "$VPN_IF" ] \
-       && ! echo "$ifc" | grep -qE '^(opkgtun|nwg|wg|tun)'; then
+        | grep " via " | head -1 \
+        | awk '{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}')
+    if [ -n "$ifc" ] && [ "$ifc" != "$VPN_IF" ]; then
         echo "$ifc"
         return 0
     fi
-    # 3. Через route get — обходит default
-    ifc=$(ip route get 1.1.1.1 2>/dev/null \
+    # 3. Fallback: default dev <iface> без via
+    ifc=$(ip route show default 2>/dev/null | head -1 \
         | awk '{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}')
-    if [ -n "$ifc" ] && [ "$ifc" != "$VPN_IF" ] \
-       && ! echo "$ifc" | grep -qE '^(opkgtun|nwg|wg|tun)'; then
+    if [ -n "$ifc" ] && [ "$ifc" != "$VPN_IF" ]; then
         echo "$ifc"
         return 0
     fi
@@ -17103,7 +17277,12 @@ rebuild_rules() {
         esac
     done
     for net in $TG_NETS; do
-        ip rule del to "$net" lookup "$ROUTE_TABLE" 2>/dev/null || true
+        _i=0
+        while [ "$_i" -lt 10 ]; do
+            ip rule del to "$net" 2>/dev/null || break
+            _i=$((_i+1))
+        done
+        ip route del "$net" 2>/dev/null || true
         ip route del "$net" table "$ROUTE_TABLE" 2>/dev/null || true
     done
 
@@ -17119,7 +17298,7 @@ rebuild_rules() {
 
     # маршруты
     for net in $TG_NETS; do
-        ip route add "$net" dev "$VPN_IF" src "$VPN_SRC" table "$ROUTE_TABLE" 2>/dev/null || true
+        ip route replace "$net" dev "$VPN_IF" src "$VPN_SRC" table "$ROUTE_TABLE" 2>/dev/null || true
     done
 }
 
@@ -17127,7 +17306,12 @@ case "$1" in
   start)   sleep 20; rebuild_rules || exit 0 ;;
   stop)
     for net in $TG_NETS; do
-        ip rule del to "$net" lookup "$ROUTE_TABLE" 2>/dev/null || true
+        _i=0
+        while [ "$_i" -lt 10 ]; do
+            ip rule del to "$net" 2>/dev/null || break
+            _i=$((_i+1))
+        done
+        ip route del "$net" 2>/dev/null || true
         ip route del "$net" table "$ROUTE_TABLE" 2>/dev/null || true
     done
     for src in $(ip rule show | awk -v tbl="$ROUTE_TABLE" '$0 ~ "lookup " tbl " " {for(i=1;i<=NF;i++) if($i=="from") print $(i+1)}'); do
@@ -17829,7 +18013,7 @@ cat > "$INIT_DIR/S97tgroutes" << 'EOF97'
 [ -n "$ROUTE_TABLE" ] || ROUTE_TABLE="16385"
 WAN_IF_CFG="${WAN_IF:-}"
 
-TG_NETS="149.154.160.0/20 91.108.4.0/22"
+TG_NETS="149.154.166.110 149.154.160.0/20 91.108.4.0/22"
 
 get_wan_if() {
     if [ -n "$WAN_IF_CFG" ] && \
@@ -17881,7 +18065,12 @@ rebuild_rules() {
         esac
     done
     for net in $TG_NETS; do
-        ip rule del to "$net" lookup "$ROUTE_TABLE" 2>/dev/null || true
+        _i=0
+        while [ "$_i" -lt 10 ]; do
+            ip rule del to "$net" 2>/dev/null || break
+            _i=$((_i+1))
+        done
+        ip route del "$net" 2>/dev/null || true
         ip route del "$net" table "$ROUTE_TABLE" 2>/dev/null || true
     done
 
@@ -17892,7 +18081,7 @@ rebuild_rules() {
         p=$((p+1))
     done
     for net in $TG_NETS; do
-        ip route add "$net" dev "$VPN_IF" src "$VPN_SRC" table "$ROUTE_TABLE" 2>/dev/null || true
+        ip route replace "$net" dev "$VPN_IF" src "$VPN_SRC" table "$ROUTE_TABLE" 2>/dev/null || true
     done
 }
 
@@ -17900,7 +18089,12 @@ case "$1" in
   start)   sleep 20; rebuild_rules || exit 0 ;;
   stop)
     for net in $TG_NETS; do
-        ip rule del to "$net" lookup "$ROUTE_TABLE" 2>/dev/null || true
+        _i=0
+        while [ "$_i" -lt 10 ]; do
+            ip rule del to "$net" 2>/dev/null || break
+            _i=$((_i+1))
+        done
+        ip route del "$net" 2>/dev/null || true
         ip route del "$net" table "$ROUTE_TABLE" 2>/dev/null || true
     done
     for src in $(ip rule show | awk -v tbl="$ROUTE_TABLE" '$0 ~ "lookup " tbl " " {for(i=1;i<=NF;i++) if($i=="from") print $(i+1)}'); do
