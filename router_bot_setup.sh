@@ -10,7 +10,7 @@ set -e
 # и вернут дефолт. При интерактивном запуске работают как обычно.
 # Блок exec < /dev/tty УБРАН: при setsid() (Popen) /dev/tty не открывается.
 
-SETUP_VERSION="0.0.8-3"
+SETUP_VERSION="0.0.8-4"
 VERSION_FILE="/opt/router_bot/VERSION"
 INSTALLED_VERSION=""
 if [ -f "$VERSION_FILE" ]; then
@@ -185,7 +185,7 @@ RB_MAIN_PY_EOF
 
 echo "  → VERSION"
 cat > /opt/router_bot/VERSION << 'RB_VERSION_EOF'
-0.0.8-3
+0.0.8-4
 RB_VERSION_EOF
 
 echo "  → core/__init__.py"
@@ -6854,10 +6854,6 @@ class HydraRouteModule:
                 if 'not modified' not in str(e).lower():
                     raise
             return
-
-        if action == 'ask:mcp_token':
-            await q.answer()
-            return await self._ask_mcp_token(q, ctx)
 
         if action.startswith('ask:'):
             key = action[4:]
@@ -15481,7 +15477,7 @@ class AwgManagerModule:
             )
 
         # Перерисовываем карточку с новым статусом
-        text, kb = await self._build_card()
+        text, kb = self._build_card()
         await ctx.bot.send_message(
             chat_id=self.chat_id,
             text=text,
@@ -15530,6 +15526,9 @@ class AwgManagerModule:
         if action.startswith('opt:'):
             return await self._handle_opt(q, ctx, action[4:])
 
+        if action == 'ask:mcp_token':
+            await q.answer()
+            return await self._ask_mcp_token(q, ctx)
         if action.startswith('ask:'):
             key = action[4:]
             await q.answer()
