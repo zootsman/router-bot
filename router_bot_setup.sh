@@ -10,7 +10,7 @@ set -e
 # и вернут дефолт. При интерактивном запуске работают как обычно.
 # Блок exec < /dev/tty УБРАН: при setsid() (Popen) /dev/tty не открывается.
 
-SETUP_VERSION="0.0.9-02"  # AUTO_DISCOVERY_PATCH_V1
+SETUP_VERSION="0.0.9-04"  # AUTO_DISCOVERY_PATCH_V1
 VERSION_FILE="/opt/router_bot/VERSION"
 INSTALLED_VERSION=""
 if [ -f "$VERSION_FILE" ]; then
@@ -187,7 +187,7 @@ RB_MAIN_PY_EOF
 
 echo "  → VERSION"
 cat > /opt/router_bot/VERSION << 'RB_VERSION_EOF'
-0.0.9-02
+0.0.9-04
 RB_VERSION_EOF
 
 echo "  → core/__init__.py"
@@ -799,13 +799,6 @@ async def _show_category(q, ctx, cat_name: str):
 
 
 
-    await show_card(update, ctx,
-        f'{icon} <b>{title}</b>\n\nНажмите кнопку ниже, чтобы открыть модуль.',
-        InlineKeyboardMarkup([[
-            InlineKeyboardButton(f'{icon} Открыть {title}',
-                                 callback_data=f'{mod_name}:main'),
-        ]]),
-    )
 
 
 # ============================================================================
@@ -5219,14 +5212,29 @@ class SSHControlModule:
         await self._edit(q, text, kb)
 
     async def _handle_text(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE):
-        log.info('ssh_control _handle_text CALLED: state=%s', self.state)
         if not update.message:
-            log.info('ssh_control _handle_text: no update.message')
+            return
+        if str(update.effective_chat.id) != self.chat_id:
             return
         text = (update.message.text or '').strip()
         if not text:
             return
-        log.info('ssh_control _handle_text: text=%r, state=%s', text, self.state)
+        if self.state == 'idle':
+            return
+
+        # Если есть живая интерактивная сессия — пишем в неё
+        if self.interactive and self.interactive.is_running():
+            try:
+                await self.interactive.send((text + '\n').encode())
+                try:
+                    await update.message.delete()
+                except Exception:
+                    pass
+                log.info('ssh_control: sent %r to interactive session', text[:40])
+            except Exception as e:
+                log.warning('ssh_control: send to interactive failed: %s', e)
+            return
+
         if self.state == 'wizard:ip':
             return await self._wizard_ip(update, ctx, text)
         if self.state == 'wizard:port':
@@ -5238,7 +5246,6 @@ class SSHControlModule:
         if self.state.startswith('exec:'):
             hid = self.state[5:]
             return await self._exec_command(update, ctx, hid, text)
-        log.info('ssh_control _handle_text: state %s ignored', self.state)
 
     async def _wizard_ip(self, update, ctx, text):
         self.temp['ip'] = text
@@ -6021,7 +6028,6 @@ class InteractiveSSH:
 
         self.proc = await asyncio.create_subprocess_exec(
             SSH,
-            '-tt',
             '-o', 'StrictHostKeyChecking=accept-new',
             '-o', f'UserKnownHostsFile={kh}',
             '-o', 'NumberOfPasswordPrompts=1',
