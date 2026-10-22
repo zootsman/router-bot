@@ -6,7 +6,7 @@
 
 Мониторинг сети, маршрутизация, VPN, Entware, SSH и обслуживание роутера в одном боте.
 
-[![Версия](https://img.shields.io/badge/версия-0.0.9--09-2563eb?style=flat-square)](https://github.com/zootsman/router-bot/blob/master/router_bot_setup_0.0.9-09.sh)
+[![Установщик](https://img.shields.io/badge/установщик-основной%20файл-2563eb?style=flat-square)](https://github.com/zootsman/router-bot/blob/master/router_bot_setup.sh)
 [![Платформа](https://img.shields.io/badge/платформа-Keenetic%20%2B%20Entware-208b66?style=flat-square)](https://github.com/zootsman/router-bot)
 [![Модули](https://img.shields.io/badge/модулей-12-6b7280?style=flat-square)](#-модули)
 [![GitHub stars](https://img.shields.io/github/stars/zootsman/router-bot?style=flat-square)](https://github.com/zootsman/router-bot/stargazers)
@@ -35,7 +35,7 @@
 - **Обслуживание Entware.** Установка, обновление компонентов, проверка доступности зеркал и работа с пакетами.
 - **Терминальное управление.** Команды `rb` для службы, журналов, конфигурации и проверки связи с Telegram.
 - **Контроль работоспособности.** Фоновый запуск, перезапуск после падений, healthcheck через cron и диагностика Telegram API.
-- **Сохранение настроек при обновлении.** Существующий `config.env` сохраняется; файлы кода модулей могут заменяться новой версией.
+- **Обновления без версионных файлов.** Всегда используется `router_bot_setup.sh`; существующий `config.env` сохраняется, а файлы кода модулей обновляются.
 
 > [!IMPORTANT]
 > Router Bot работает с сетевой конфигурацией и системными службами. Некоторые операции меняют маршрутизацию, удаляют пакеты или перезапускают роутер. Перед значительными изменениями рекомендуется сохранить рабочую конфигурацию Keenetic и соответствующих сервисов.
@@ -103,11 +103,11 @@
 ```sh
 opkg update
 opkg install curl ca-certificates
-curl -fsSL https://raw.githubusercontent.com/zootsman/router-bot/master/router_bot_setup_0.0.9-09.sh -o /tmp/router_bot_setup.sh
+curl -fsSL https://raw.githubusercontent.com/zootsman/router-bot/master/router_bot_setup.sh -o /tmp/router_bot_setup.sh
 sh /tmp/router_bot_setup.sh
 ```
 
-Команды загружают **опубликованный в репозитории** установщик с явным номером версии. Перед запуском стороннего shell-скрипта полезно просмотреть его содержимое.
+Команды загружают **единственный основной установщик** `router_bot_setup.sh`. При каждом обновлении изменяется содержимое файла, но ссылка и его имя остаются неизменными. Отдельные установщики с номерами версий в GitHub не нужны. Номер установленной версии можно посмотреть командой `rb version`. Перед запуском скачанного shell-скрипта полезно просмотреть его содержимое.
 
 ### 3. Завершите настройку
 
@@ -116,7 +116,8 @@ sh /tmp/router_bot_setup.sh
 После запуска бота откройте его чат и отправьте `/start`.
 
 > [!NOTE]
-> В репозитории также находятся `router_bot_setup.sh` и `quick-install.sh`. Эти файлы должны обновляться одновременно с версионным установщиком. Пока их версии различаются, для предсказуемой установки используйте приведённую выше ссылку на файл с конкретной версией.
+> [!NOTE]
+> Для публикации обновления достаточно заменить содержимое `router_bot_setup.sh` в ветке `master`. README, команда `rb update` и инструкции установки используют постоянный путь к этому файлу. Не требуется публиковать отдельные файлы с номером релиза.
 
 ## 📱 Команды Telegram
 
@@ -152,7 +153,7 @@ sh /tmp/router_bot_setup.sh
 | `rb config tun` | Перенастроить VPN-туннель к Telegram. |
 | `rb config backup` / `rb config restore` | Резервная копия и восстановление конфигурации бота. |
 | `rb reset` | Сбросить блокировку запуска после серии сбоев. |
-| `rb update` | Запустить обновление с основного установщика репозитория. |
+| `rb update` | Загрузить обновление из постоянного файла `router_bot_setup.sh`. |
 
 Все доступные команды можно посмотреть через `rb --help`.
 
