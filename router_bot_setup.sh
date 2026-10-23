@@ -1,7 +1,7 @@
 #!/bin/sh
 set -e
 
-SETUP_VERSION="0.0.9-09"
+SETUP_VERSION="0.0.10"
 VERSION_FILE="/opt/router_bot/VERSION"
 INSTALLED_VERSION=""
 if [ -f "$VERSION_FILE" ]; then
@@ -18,6 +18,9 @@ ver_cmp() {
     # Численно сопоставляем его с 0.0.16-1, сохраняя запрошенный ярлык.
     if [ "$v1" = '0.0.9-09' ]; then base1='0.0.16'; suf1='1'; fi
     if [ "$v2" = '0.0.9-09' ]; then base2='0.0.16'; suf2='1'; fi
+    # 0.0.10 comes after the legacy release 0.0.9-09 in upgrade ordering.
+    if [ "$v1" = '0.0.10' ]; then base1='0.0.16'; suf1='2'; fi
+    if [ "$v2" = '0.0.10' ]; then base2='0.0.16'; suf2='2'; fi
     a1=$(echo "$base1" | cut -d. -f1); b1=$(echo "$base1" | cut -d. -f2); c1=$(echo "$base1" | cut -d. -f3)
     a2=$(echo "$base2" | cut -d. -f1); b2=$(echo "$base2" | cut -d. -f2); c2=$(echo "$base2" | cut -d. -f3)
     a1=${a1:-0}; b1=${b1:-0}; c1=${c1:-0}
@@ -317,9 +320,11 @@ def _ver_cmp(v1: str, v2: str) -> int:
     """Сравнивает версии с поддержкой -N. -1/0/1."""
     def _split(v):
         # Release 0.0.9-09 is a deliberate newer label after 0.0.16.
-        # Rank it between 0.0.16 and 0.0.17 for update checks.
+        # 0.0.10 sorts after the legacy label even though its numeric prefix is 0.0.10.
         if v == '0.0.9-09':
             return [0, 0, 16], 1
+        if v == '0.0.10':
+            return [0, 0, 16], 2
         base, _, suf = v.partition('-')
         try:
             parts = [int(x) for x in base.split('.')]
@@ -3545,6 +3550,11 @@ async def ui_edit_or_send(bot, chat_id, message_id, text, kb=None,
         chat_id=chat_id, text=text,
         parse_mode=parse_mode, reply_markup=kb,
     )
+    if message_id and msg.message_id != message_id:
+        try:
+            await bot.delete_message(chat_id=chat_id, message_id=message_id)
+        except Exception:
+            pass
     return msg.message_id
 
 
@@ -3609,6 +3619,11 @@ async def show_card(update, ctx, text, kb=None, parse_mode='HTML'):
         chat_id=chat_id, text=text, parse_mode=parse_mode, reply_markup=kb,
     )
     set_last_msg(chat_id, msg.message_id)
+    if last_id and last_id != msg.message_id:
+        try:
+            await ctx.bot.delete_message(chat_id=chat_id, message_id=last_id)
+        except Exception:
+            pass
     return msg.message_id
 
 
@@ -3849,24 +3864,47 @@ cat > /opt/etc/logrotate.d/router_bot << 'LREOF'
 }
 LREOF
 
-# ============ cron healthcheck ============
-# Remove old Router Bot-only logrotate entries so upgrades do not duplicate jobs.
-for _cf in /opt/var/spool/cron/crontabs/root /opt/etc/crontabs/root /opt/etc/crontab; do
-    if [ -f "$_cf" ]; then
-        sed -i '\|/opt/bin/logrotate /opt/etc/logrotate.conf|d' "$_cf" 2>/dev/null || true
+# ============ cron healthcheck + logrotate ============
+# Entware может размещать logrotate в /opt/sbin или /opt/bin.
+# Используем исполняемый файл по фактическому абсолютному пути: cron имеет
+# ограниченное окружение и не должен зависеть от интерактивного PATH.
+LOGROTATE_BIN=''
+for _candidate in /opt/sbin/logrotate /opt/bin/logrotate; do
+    if [ -x "$_candidate" ]; then
+        LOGROTATE_BIN="$_candidate"
+        break
     fi
 done
-mkdir -p /opt/var/run
-if [ ! -x /opt/bin/logrotate ]; then
-    echo '  ⚠️ logrotate отсутствует: журнал не будет автоматически ротироваться до установки пакета logrotate'
+if [ -z "$LOGROTATE_BIN" ]; then
+    _candidate=$(command -v logrotate 2>/dev/null || true)
+    if [ -n "$_candidate" ] && [ -x "$_candidate" ]; then
+        LOGROTATE_BIN="$_candidate"
+    fi
+fi
+if [ -z "$LOGROTATE_BIN" ]; then
+    echo '  ⚠️ logrotate: исполняемый файл не найден; проверьте opkg files logrotate'
+else
+    echo "  ✅ logrotate: $LOGROTATE_BIN"
 fi
 if [ ! -x /opt/bin/crond ] && ! command -v crond >/dev/null 2>&1; then
     echo '  ⚠️ crond отсутствует: cron-задачи не будут выполняться автоматически'
 fi
-# На Entware BusyBox crond часто читает /opt/var/spool/cron/crontabs/root,
-# а не /opt/etc/crontab. Поддерживаем оба распространённых варианта.
+
+# Убираем ТОЛЬКО старые задания ротации Router Bot с неправильным путём.
+# Остальные задания cron и logrotate не трогаем.
+for _cf in /opt/var/spool/cron/crontabs/root /opt/etc/crontabs/root /opt/etc/crontab; do
+    if [ -f "$_cf" ]; then
+        sed -i '\|/opt/etc/logrotate.d/router_bot|d' "$_cf" 2>/dev/null || true
+    fi
+done
+mkdir -p /opt/var/run
 CRON_LINE="* * * * * /opt/etc/init.d/S99routerbot_health"
+CRON_ROTATE=""
+if [ -n "$LOGROTATE_BIN" ]; then
+    CRON_ROTATE="17 3 * * * $LOGROTATE_BIN -s /opt/var/run/routerbot-logrotate.status /opt/etc/logrotate.d/router_bot >/dev/null 2>&1"
+fi
 CRON_OK=0
+# В файлах пользовательского crontab используется формат из пяти полей.
 for _cf in /opt/var/spool/cron/crontabs/root /opt/etc/crontabs/root; do
     _cd=${_cf%/*}
     mkdir -p "$_cd" 2>/dev/null || continue
@@ -3874,18 +3912,18 @@ for _cf in /opt/var/spool/cron/crontabs/root /opt/etc/crontabs/root; do
     if ! grep -Fq '/opt/etc/init.d/S99routerbot_health' "$_cf"; then
         echo "$CRON_LINE" >> "$_cf"
     fi
-    if ! grep -Fq '/opt/etc/logrotate.d/router_bot' "$_cf"; then
-        echo '17 3 * * * /opt/bin/logrotate -s /opt/var/run/routerbot-logrotate.status /opt/etc/logrotate.d/router_bot >/dev/null 2>&1' >> "$_cf"
+    if [ -n "$CRON_ROTATE" ]; then
+        echo "$CRON_ROTATE" >> "$_cf"
     fi
     CRON_OK=1
- done
-# Совместимость со сборками, использующими общий /opt/etc/crontab.
+done
+# Legacy Entware crontab тоже может быть пользовательским (пять полей).
 if [ -f /opt/etc/crontab ]; then
     if ! grep -Fq '/opt/etc/init.d/S99routerbot_health' /opt/etc/crontab; then
         echo "$CRON_LINE" >> /opt/etc/crontab
     fi
-    if ! grep -Fq '/opt/etc/logrotate.d/router_bot' /opt/etc/crontab; then
-        echo '17 3 * * * /opt/bin/logrotate -s /opt/var/run/routerbot-logrotate.status /opt/etc/logrotate.d/router_bot >/dev/null 2>&1' >> /opt/etc/crontab
+    if [ -n "$CRON_ROTATE" ]; then
+        echo "$CRON_ROTATE" >> /opt/etc/crontab
     fi
     CRON_OK=1
 fi
@@ -8110,9 +8148,22 @@ class AwgManagerModule(ModuleBase):
                         [self._nav_button('❌ Отмена', 'mcp:ux:cancel')],
                         [self._nav_button('⬅️ Назад', 'mcp:ux:back')]]))
         except Exception as e:
-            await ctx.bot.send_message(chat_id=self.chat_id,
-                text='❌ ' + str(e)[:240] + '\nПопробуйте ещё раз или отмените действие.')
+            await self._mcp_input_error_card(ctx, str(e))
         return True
+
+    async def _mcp_input_error_card(self, ctx, message):
+        """Reuse MCP wizard card for validation failures, not a new message."""
+        from core.utils import set_last_msg
+        keyboard = InlineKeyboardMarkup([
+            [self._nav_button('⬅️ Назад', 'mcp:ux:back')],
+            [self._nav_button('❌ Отмена', 'mcp:ux:cancel')],
+        ])
+        msg_id = await ui_edit_or_send(
+            ctx.bot, self.chat_id, get_last_msg(self.chat_id),
+            '❌ <b>Ошибка ввода</b>\n\n' + _esc(str(message)[:450]) +
+            '\n\n<i>Исправьте данные или вернитесь назад.</i>',
+            kb=keyboard, parse_mode='HTML')
+        set_last_msg(self.chat_id, msg_id)
 
     async def _mcp_handle_document(self, update, ctx):
         if str(update.effective_chat.id) != self.chat_id or not self._wizard or self._wizard.get('stage') != 'config':
@@ -8121,7 +8172,7 @@ class AwgManagerModule(ModuleBase):
         if not doc:
             return
         if not doc.file_name.lower().endswith('.conf') or doc.file_size and doc.file_size > 65536:
-            await ctx.bot.send_message(chat_id=self.chat_id, text='❌ Нужен файл .conf размером до 64 КБ')
+            await self._mcp_input_error_card(ctx, 'Нужен файл .conf размером до 64 КБ')
             return
         try:
             file = await doc.get_file()
@@ -8131,7 +8182,7 @@ class AwgManagerModule(ModuleBase):
         except ApplicationHandlerStop:
             raise
         except Exception as e:
-            await ctx.bot.send_message(chat_id=self.chat_id, text='❌ Не удалось прочитать .conf: ' + str(e)[:160])
+            await self._mcp_input_error_card(ctx, 'Не удалось прочитать .conf: ' + str(e)[:160])
 
     async def _mcp_export(self, q, ctx, typ, idx):
         if not self._mcp_can_write():
@@ -12033,32 +12084,205 @@ def neo_running():
         return False
 
 
-def apply_change(filename, transform, root=HR_HOME, backup_root=BACKUP_HOME,
-                 service_runner=neo_command, was_running=None):
-    """Транзакция: правка, перезапуск работающего демона, откат при ошибке."""
-    previous = read_lines(filename, root)
-    changed = transform(list(previous))
-    if changed == previous:
+def _semantic_lines(filename, lines):
+    """Canonical representation for deciding whether Neo must reload.
+
+    The TEXT of an existing ## group title is ignored by Neo. Its position
+    is not: in ip.list ## also bounds a block. Preserve separators, empty
+    lines and disabled rules; only normalize title text, never their location.
+    """
+    return tuple('##' if line.lstrip().startswith('##') else line.strip()
+                 for line in lines)
+
+
+def apply_batch(changes, root=HR_HOME, backup_root=BACKUP_HOME,
+                service_runner=neo_command, was_running=None):
+    """Apply [(filename, transform), ...] atomically from UI perspective.
+
+    All transforms are validated in memory before the first write. A single
+    neo restart follows all writes; on failed restart every touched file is
+    restored, including files that did not exist beforehand.
+    """
+    if not changes:
+        return 'Очередь изменений пуста.'
+    originals = {}
+    updated = {}
+    existed = {}
+    for filename, transform in changes:
+        if filename not in (DOMAIN_NAME, CIDR_NAME, CONF_NAME):
+            raise ValueError('Недопустимый конфигурационный файл')
+        if filename not in originals:
+            target = _safe_path(filename, root)
+            existed[filename] = target.exists()
+            originals[filename] = read_lines(filename, root)
+            updated[filename] = list(originals[filename])
+        updated[filename] = transform(list(updated[filename]))
+        if not isinstance(updated[filename], list) or not all(
+                isinstance(line, str) for line in updated[filename]):
+            raise ValueError('Редактор вернул некорректные данные')
+    changed = [name for name in updated if updated[name] != originals[name]]
+    if not changed:
         return 'Изменений нет'
+    reload_needed = any(_semantic_lines(name, updated[name]) !=
+                        _semantic_lines(name, originals[name]) for name in changed)
     running = neo_running() if was_running is None else was_running
-    write_lines(filename, changed, root, backup_root)
-    if not running:
-        return 'Сохранено. Neo остановлен: изменения вступят в силу после запуска.'
+    written = []
     try:
+        for name in changed:
+            write_lines(name, updated[name], root, backup_root)
+            written.append(name)
+        if not reload_needed:
+            return 'Сохранено без перезапуска Neo: изменены только комментарии.'
+        if not running:
+            return 'Сохранено. Neo остановлен: правила вступят в силу при запуске.'
         ok, info = service_runner('restart')
         if not ok:
             raise RuntimeError(info)
-    except Exception as e:
-        # Вернуть исходное содержимое независимо от наличия/отсутствия файла.
-        if previous:
-            write_lines(filename, previous, root, backup_root)
+    except Exception as err:
+        failures = []
+        for name in reversed(written):
+            try:
+                if existed[name]:
+                    write_lines(name, originals[name], root, backup_root)
+                else:
+                    path = _safe_path(name, root)
+                    if path.exists():
+                        path.unlink()
+            except Exception as rollback_err:
+                failures.append(f'{name}: {rollback_err}')
+        if running and reload_needed and written:
+            try: service_runner('restart')
+            except Exception: pass
+        extra = (' Ошибки отката: ' + '; '.join(failures)) if failures else ''
+        raise RuntimeError(f'Не удалось применить: {err}. Выполнен откат.{extra}') from err
+    return 'Сохранено. Neo перезапущен один раз. ' + info[:180]
+
+
+def apply_change(filename, transform, root=HR_HOME, backup_root=BACKUP_HOME,
+                 service_runner=neo_command, was_running=None):
+    """Backward compatible one-file edit through the transactional batch path."""
+    return apply_batch([(filename, transform)], root, backup_root,
+                       service_runner, was_running)
+
+
+def edit_cidr_group_add_many(lines, block_index, values):
+    """Add multiple CIDRs/GeoIP tags in one file write and one service restart."""
+    tokens = [check_cidr(v) for v in values]
+    if not tokens or len(tokens) > 500 or len(tokens) != len(set(tokens)):
+        raise ValueError('Укажите 1–500 разных CIDR/GeoIP-записей')
+    output = list(lines)
+    for value in tokens:
+        output = edit_cidr_group_add(output, block_index, value)
+    return output
+
+
+
+def edit_domain_group_remove_many(lines, group_id, values):
+    """Remove multiple domains from one selected group in one transformation.
+
+    Validate all entries before touching any line, including disabled rules.
+    """
+    tokens = _domain_tokens(','.join(values))
+    if len(tokens) > 500:
+        raise ValueError('За один раз можно удалить до 500 доменов')
+    group = _find_group(lines, group_id)
+    found = {name: [] for name in tokens}
+    for entry in group['entries']:
+        for name in entry['domains']:
+            if name in found:
+                found[name].append(entry['index'])
+    missing = [name for name, locations in found.items() if len(locations) != 1]
+    if missing:
+        raise ValueError('Домены не найдены или неоднозначны в группе: ' + ', '.join(missing[:5]))
+    removed = set(tokens)
+    output = list(lines)
+    deletion = set()
+    for entry in group['entries']:
+        remaining = [name for name in entry['domains'] if name not in removed]
+        if remaining:
+            output[entry['index']] = ('#' if not entry['enabled'] else '') + \
+                ','.join(remaining) + '/' + entry['target'] + '\n'
         else:
-            target = _safe_path(filename, root)
-            if target.exists(): target.unlink()
-        try: service_runner('restart')
-        except Exception: pass
-        raise RuntimeError(f'Не удалось применить: {e}. Конфигурация восстановлена.') from e
-    return 'Сохранено, Neo перезапущен. ' + info[:180]
+            deletion.add(entry['index'])
+    if len(deletion) == len(group['entries']) and group['header_index'] is not None:
+        deletion.add(group['header_index'])
+    return [line for i, line in enumerate(output) if i not in deletion]
+
+
+def edit_cidr_group_remove_many(lines, block_index, values):
+    """Remove several CIDR/GeoIP records strictly inside one block."""
+    tokens = [check_cidr(value) for value in values]
+    if not tokens or len(tokens) > 500 or len(set(tokens)) != len(tokens):
+        raise ValueError('Укажите 1–500 различных CIDR/GeoIP-записей')
+    block = _cidr_block_lines(lines, block_index)
+    indices = set()
+    for token in tokens:
+        matches = [r['index'] for r in block['entries'] if r['value'] == token]
+        if len(matches) != 1:
+            raise ValueError('CIDR/GeoIP отсутствует или повторяется в блоке: ' + token)
+        indices.add(matches[0])
+    return [line for i, line in enumerate(lines) if i not in indices]
+
+
+def edit_cidr_add_many(lines, values, target, name=None):
+    """Create one named CIDR/GeoIP block containing the entire batch."""
+    tokens = [check_cidr(value) for value in values]
+    target = check_target(target)
+    if name is not None:
+        name = check_group_name(name)
+    if not tokens or len(tokens) > 500 or len(set(tokens)) != len(tokens):
+        raise ValueError('Укажите 1–500 различных CIDR/GeoIP-записей')
+    existing = {r['value'] for r in _cidr_rows_lines(lines)
+                if not r['header'] and r['target'] == target}
+    duplicates = existing.intersection(tokens)
+    if duplicates:
+        raise ValueError('CIDR/GeoIP уже в политике: ' + ', '.join(sorted(duplicates)[:5]))
+    out = list(lines)
+    if out and out[-1].strip():
+        out.append('\n')
+    out.extend(['## ' + (name or 'Добавлено Router Bot') + '\n',
+                '/' + target + '\n'])
+    out.extend(token + '\n' for token in tokens)
+    out.append('\n')
+    return out
+
+
+def edit_geo_files(lines, key, paths, action):
+    """Edit multiple Geo .dat settings in one operation without blank-line drift."""
+    if key not in ('GeoIPFile', 'GeoSiteFile') or action not in ('add', 'remove'):
+        raise ValueError('Недопустимая Geo-операция')
+    values = [path.strip() for path in paths]
+    if not values or len(values) > 16 or len(set(values)) != len(values):
+        raise ValueError('Укажите 1–16 уникальных путей .dat')
+    if action == 'add':
+        values = [check_setting(key, value) for value in values]
+    else:
+        for value in values:
+            if not value.startswith('/opt/') or '\n' in value or '\r' in value:
+                raise ValueError('Укажите полный путь под /opt/ к удаляемому файлу')
+    existing = {}
+    for index, line in enumerate(lines):
+        match = re.match(r'^\s*' + key + r'\s*=(.*)$', line.strip())
+        if match:
+            existing.setdefault(match.group(1).strip(), []).append(index)
+    if action == 'remove':
+        deletion = set()
+        for value in values:
+            matches = existing.get(value, [])
+            if len(matches) != 1:
+                raise ValueError('Путь не найден или повторяется: ' + value)
+            deletion.add(matches[0])
+        return [line for index, line in enumerate(lines) if index not in deletion]
+    duplicates = [value for value in values if value in existing]
+    if duplicates:
+        raise ValueError('Geo-файл уже добавлен: ' + ', '.join(duplicates))
+    if sum(len(indices) for indices in existing.values()) + len(values) > 16:
+        raise ValueError('Превышен лимит 16 файлов для ' + key)
+    out = list(lines)
+    if out and out[-1].strip():
+        out.append('\n')
+    out.extend(key + '=' + value + '\n' for value in values)
+    return out
 
 
 def interfaces():
@@ -12147,6 +12371,8 @@ import hashlib
 import html
 import os
 import subprocess
+import re
+from core.utils import get_last_msg, set_last_msg, ui_edit_or_send
 from collections import Counter
 
 from telegram import InlineKeyboardButton as Button, InlineKeyboardMarkup as Markup
@@ -12176,6 +12402,97 @@ def kb(*rows):
     return Markup([list(row) for row in rows])
 
 
+
+def batch_items(text, kind='domain', limit=500):
+    """Safely parse Telegram text with one item per line or comma.
+
+    str.splitlines handles not only LF/CRLF but also Unicode line separators
+    copied from some Android keyboards and messengers. Validate *after*
+    splitting, never send a multiline string directly to check_domain().
+    """
+    validate = m.check_domain if kind == 'domain' else m.check_cidr
+    raw = []
+    for line_no, line in enumerate(str(text).splitlines(), 1):
+        for cell in line.split(','):
+            item = cell.strip().strip('\ufeff')
+            if item:
+                raw.append((line_no, item))
+    if not raw or len(raw) > limit:
+        raise ValueError(f'Нужно от 1 до {limit} записей, по одной на строку')
+    result = []
+    seen = set()
+    for line_no, item in raw:
+        try:
+            value = validate(item)
+        except ValueError as error:
+            shown = item if len(item) < 100 else item[:97] + '...'
+            raise ValueError(f'Строка {line_no} ({shown}): {error}') from None
+        if value in seen:
+            raise ValueError(f'Строка {line_no}: запись {value} уже встречалась в сообщении')
+        seen.add(value)
+        result.append(value)
+    return result
+
+
+def parse_new_domain_group(text):
+    """Legacy `Name | domains/Policy` and multiline `Name | Policy\ndomain...`."""
+    chunks = [line.strip() for line in text.splitlines() if line.strip()]
+    if not chunks:
+        raise ValueError('Список доменов пуст')
+    if len(chunks) == 1:
+        raw = chunks[0]
+        title = None
+        if '|' in raw:
+            title, raw = raw.split('|', 1)
+            title = m.check_group_name(title)
+        rule = m.check_domain_rule(raw.strip(), max_domains=None)
+        return title, rule
+    title = None
+    prefix = chunks[0]
+    if '|' in prefix:
+        title, prefix = prefix.split('|', 1)
+        title = m.check_group_name(title)
+        target = m.check_target(prefix)
+        values = batch_items('\n'.join(chunks[1:]))
+    elif '/' not in prefix and '.' not in prefix and ':' not in prefix:
+        target = m.check_target(prefix)
+        values = batch_items('\n'.join(chunks[1:]))
+    else:
+        # Legacy format extended with newlines: example.com\nexample.org/All
+        raw = '\n'.join(chunks)
+        if '/' not in raw:
+            raise ValueError('Для НОВОЙ группы сначала укажите «Название | Политика», '
+                             'затем домены по одному на строку. Для добавления в '
+                             'существующую группу откройте её карточку.')
+        domains, policy = raw.rsplit('/', 1)
+        target = m.check_target(policy)
+        values = batch_items(domains)
+    return title, ','.join(values) + '/' + target
+
+
+def parse_new_cidr_group(text):
+    """Legacy `CIDR/Policy` and multiline `Name | Policy\nCIDR...`."""
+    chunks = [line.strip() for line in text.splitlines() if line.strip()]
+    if not chunks:
+        raise ValueError('Список CIDR/GeoIP пуст')
+    if len(chunks) == 1:
+        value, sep, target = chunks[0].rpartition('/')
+        if not sep:
+            raise ValueError('Укажите запись и политику: 8.8.8.0/24/All')
+        return None, m.check_target(target), [m.check_cidr(value)]
+    title = None
+    prefix = chunks[0]
+    if '|' in prefix:
+        title, prefix = prefix.split('|', 1)
+        title = m.check_group_name(title)
+        target = m.check_target(prefix)
+        values = batch_items('\n'.join(chunks[1:]), 'cidr')
+    else:
+        # The first line is the policy; each following line is a CIDR/GeoIP.
+        target = m.check_target(prefix)
+        values = batch_items('\n'.join(chunks[1:]), 'cidr')
+    return title, target, values
+
 class NeoUI:
     def __init__(self, parent):
         self.parent = parent
@@ -12187,18 +12504,75 @@ class NeoUI:
         self._domain_page = 0
         self._cidr_page = 0
         self._input_group_id = None
+        self._current_view = 'home'
+        self._return_action = 'home'
+        self._domain_detail_page = 0
+        self._cidr_detail_page = 0
+        # Entries are (filename, SHA-256 at staging, transformation, label).
+        # Staging never writes disk; apply_batch commits all at once.
+        self._queue = []
+        self._repeat_input = None
 
-    def cancel(self):
+    def cancel(self, discard_queue=False):
         self.input_mode = None
         self._input_group_id = None
         self.pending = None
         self.pending_service = None
+        self._repeat_input = None
+        if discard_queue:
+            self._queue.clear()
+
+    def _queue_button(self):
+        return btn(f'📦 Отложенные изменения ({len(self._queue)})', 'queue:show')
+
+    async def _render_view(self, q, route):
+        """Return to the immediate parent screen, retaining list/detail page."""
+        try:
+            if route.startswith('d:page:'):
+                _, _, gid, page = route.split(':')
+                self._remember(m.DOMAIN_NAME)
+                return await self._domain_detail(q, int(gid), int(page))
+            if route.startswith('c:page:'):
+                _, _, gid, page = route.split(':')
+                self._remember(m.CIDR_NAME)
+                return await self._cidr_detail(q, int(gid), int(page))
+            if route.startswith('domains:'):
+                return await self._domains(q, int(route.split(':')[-1]))
+            if route.startswith('cidr:'):
+                return await self._cidr(q, int(route.split(':')[-1]))
+            mapping = {
+                'home': self._home, 'geo': self._geo,
+                'service': self._service, 'policies': self._policies,
+                'interfaces': self._interfaces, 'settings': self._settings,
+                'l7': lambda q: self._settings(q, l7=True),
+                'backups': self._backups,
+            }
+            return await mapping.get(route, self._home)(q)
+        except (ValueError, IndexError):
+            if route.startswith('d:'):
+                return await self._domains(q, self._domain_page)
+            if route.startswith('c:'):
+                return await self._cidr(q, self._cidr_page)
+            raise
+
+    def _virtual_lines(self, filename):
+        """Preview queued changes without modifying any live Neo file."""
+        original = m.read_lines(filename)
+        base_sig = hashlib.sha256(''.join(original).encode('utf-8')).hexdigest()
+        for name, sig, fn, _ in self._queue:
+            if name == filename:
+                if base_sig != sig:
+                    raise ValueError('Файл изменён с момента добавления в очередь')
+                original = fn(list(original))
+        return original
 
     async def _edit(self, q, text, keyboard):
         text = text[:3700]
         try:
             await q.edit_message_text(text, parse_mode='HTML', reply_markup=keyboard,
                                       disable_web_page_preview=True)
+            if getattr(q, 'message', None):
+                set_last_msg(q.message.chat_id, q.message.message_id)
         except Exception as e:
             if 'not modified' not in str(e).lower():
                 raise
@@ -12215,16 +12589,18 @@ class NeoUI:
             raise ValueError('Файл уже изменён. Откройте карточку заново.')
 
     async def _home(self, q):
+        self._current_view = 'home'
         await self._edit(q, '🐍 <b>HydraRoute Neo — управление</b>\n\n'
                          'Здесь редактируются реальные файлы Neo. Изменения '
                          'проверяются и сохраняются с резервной копией.\n'
-                         'Если Neo запущен, конфигурация применяется перезапуском.',
+                         'Изменения правил требуют перезапуска Neo; названия групп сохраняются без него.',
                          kb([btn('🟢 Служба', 'service')],
                             [btn('🌐 Домены', 'domains'), btn('🧩 CIDR / Geo', 'cidr')],
                             [btn('🧭 Политики', 'policies'), btn('🔌 Интерфейсы', 'interfaces')],
                             [btn('⚙️ Настройки', 'settings'), btn('🔬 L7', 'l7')],
                             [btn('🩺 Диагностика', 'diag'), btn('📜 Журнал', 'logs')],
                             [btn('💾 Резервные копии', 'backups')],
+                            [self._queue_button()],
                             [btn('⬅️ К HydraRoute', 'back')]))
 
     async def _domains(self, q, page=0):
@@ -12233,6 +12609,7 @@ class NeoUI:
         total = len(groups)
         page = max(0, min(page, (max(total, 1)-1)//7))
         self._domain_page = page
+        self._current_view = f'domains:{page}'
         shown = groups[page*7:page*7+7]
         lines = ['🌐 <b>Группы доменов</b>',
                  f'Групп: {total} · страница {page+1}/{max(1,(total+6)//7)}',
@@ -12253,6 +12630,7 @@ class NeoUI:
         if (page+1)*7 < total: nav.append(btn('Далее ▶', f'domains:{page+1}'))
         if nav: buttons.append(nav)
         buttons.extend([[btn('➕ Новая группа', 'd:add'), btn('🔀 Перенести домен', 'd:move')],
+                        [self._queue_button()],
                         [btn('⬅️ Разделы', 'home')]])
         await self._edit(q, '\n'.join(lines), Markup(buttons))
 
@@ -12264,6 +12642,8 @@ class NeoUI:
                  for entry in group['entries'] for name in entry['domains']]
         page = max(0, min(page, (max(len(items),1)-1)//20))
         display_name = group['name'] or ('Без названия: ' + group['entries'][0]['first_domain'])
+        self._domain_detail_page = page
+        self._current_view = f'd:page:{group_id}:{page}'
         active = sum(e['enabled'] for e in group['entries'])
         lines = ['🌐 <b>' + esc(display_name[:120]) + '</b>',
                  f'Строк правил: {len(group["entries"])} · активных: {active}',
@@ -12289,6 +12669,7 @@ class NeoUI:
             [btn('✏️ Название', f'd:grename:{group_id}'), btn('🎯 Политика', f'd:gtarget:{group_id}')],
             [btn('🔁 Вкл/выкл всю группу', f'd:gtoggle:{group_id}')],
             [btn('🗑 Удалить всю группу', f'd:gdelete:{group_id}')],
+            [self._queue_button()],
             [btn('⬅️ К группам', f'domains:{self._domain_page}'), btn('🏠 Разделы', 'home')]])
         await self._edit(q, '\n'.join(lines), Markup(buttons))
 
@@ -12299,6 +12680,7 @@ class NeoUI:
         self._remember(m.CIDR_NAME)
         page = max(0, min(page, (max(len(blocks), 1)-1)//8))
         self._cidr_page = page
+        self._current_view = f'cidr:{page}'
         shown = blocks[page*8:page*8+8]
         counts = Counter(x['block_index'] for x in entries if not x['header'])
         lines = ['🧩 <b>CIDR и GeoIP</b>',
@@ -12318,6 +12700,7 @@ class NeoUI:
         if nav: buttons.append(nav)
         buttons.extend([[btn('➕ Создать CIDR-блок', 'c:add')],
                         [btn('📦 Geo-файлы', 'geo')],
+                        [self._queue_button()],
                         [btn('⬅️ Разделы', 'home')]])
         await self._edit(q, '\n'.join(lines), Markup(buttons))
 
@@ -12327,6 +12710,8 @@ class NeoUI:
         header = block['header']
         items = block['entries']
         name = header['name'] or ('Без названия: ' + header['target'])
+        self._cidr_detail_page = page
+        self._current_view = f'c:page:{block_index}:{page}'
         page = max(0, min(page, (max(len(items), 1)-1)//16))
         lines = ['🧩 <b>' + esc(name[:120]) + '</b>',
                  'Состояние: ' + ('✅ включён' if header['enabled'] else '⏸ отключён'),
@@ -12355,10 +12740,12 @@ class NeoUI:
              btn('🎯 Политика', f'c:gtarget:{block_index}')],
             [btn('🔁 Вкл/выкл блок', f'c:gtoggle:{block_index}')],
             [btn('🗑 Удалить весь блок', f'c:gdelete:{block_index}')],
+            [self._queue_button()],
             [btn('⬅️ К блокам', f'cidr:{self._cidr_page}'), btn('🏠 Разделы', 'home')]])
         await self._edit(q, '\n'.join(lines), Markup(buttons))
 
     async def _policies(self, q):
+        self._current_view = 'policies'
         conf = m.read_config()
         domains = Counter(r['target'] for r in m.domain_rows())
         cidrs = Counter(r['target'] for r in m.cidr_rows() if not r['header'])
@@ -12374,6 +12761,7 @@ class NeoUI:
                                                    [btn('⬅️ Разделы', 'home')]))
 
     async def _interfaces(self, q):
+        self._current_view = 'interfaces'
         cfg = m.read_config()
         interfaces = m.interfaces()
         awgm = [i for i in interfaces if i.startswith('awgm')]
@@ -12394,6 +12782,7 @@ class NeoUI:
         await self._edit(q, '\n'.join(text), Markup(buttons))
 
     async def _settings(self, q, l7=False):
+        self._current_view = 'l7' if l7 else 'settings'
         cfg = m.read_config()
         keys = (['l7CaptureEnabled', 'l7EnableTLS', 'l7EnableHTTP', 'l7EnableQUIC',
                  'l7TcpReasmEnabled'] if l7 else
@@ -12415,6 +12804,7 @@ class NeoUI:
         await self._edit(q, '\n'.join(lines), Markup(buttons))
 
     async def _geo(self, q):
+        self._current_view = 'geo'
         config = m.read_config_multi()
         lines = ['📦 <b>GeoIP / GeoSite</b>',
                  'Показываются все повторяющиеся параметры, а не только последний.', '']
@@ -12429,10 +12819,11 @@ class NeoUI:
         await self._edit(q, '\n'.join(lines), kb(
             [btn('➕ GeoIP', 'geo:add:GeoIPFile'), btn('➖ GeoIP', 'geo:remove:GeoIPFile')],
             [btn('➕ GeoSite', 'geo:add:GeoSiteFile'), btn('➖ GeoSite', 'geo:remove:GeoSiteFile')],
-            [btn('🌐 К доменам', 'domains:0'), btn('🧩 К CIDR', 'cidr:0')],
-            [btn('⬅️ Разделы', 'home')]))
+            [btn('⬅️ К CIDR', f'cidr:{self._cidr_page}')],
+            [btn('🏠 Разделы', 'home')]))
 
     async def _backups(self, q):
+        self._current_view = 'backups'
         files = m.list_backups()
         self._backup_names = [f.name for f in files[:8]]
         text = ['💾 <b>Резервные копии</b>', 'Автоматически создаются при каждом изменении. Хранятся локально на роутере.', '']
@@ -12445,46 +12836,136 @@ class NeoUI:
         await self._edit(q, '\n'.join(text), Markup(buttons))
 
     async def _input(self, q, mode, label, sample, group_id=None):
+        self._return_action = self._current_view
         self.input_mode = mode
         self._input_group_id = group_id
         self.pending = None
+        self._repeat_input = (mode, group_id)
         await self._edit(q, f'✏️ <b>{esc(label)}</b>\n\n'
                          f'Отправь следующим сообщением:\n<code>{esc(sample)}</code>\n\n'
                          'Для очистки списков и путей отправь символ <code>-</code>.\n'
                          'Текущее состояние не изменится до подтверждения.',
-                         kb([btn('❌ Отмена', 'home')]))
+                         kb([btn('❌ Отмена', 'cancel')]))
 
     async def _propose(self, q, filename, change, label):
         self._assert_fresh(filename)
-        before = m.read_lines(filename)
+        before = self._virtual_lines(filename)
+        # A staged insertion can shift numerical group IDs. Do not silently
+        # edit a neighboring block selected from the on-disk (old) card.
+        route = self._return_action
+        actual = m.read_lines(filename)
+        if before != actual and route.startswith(('d:page:', 'c:page:')):
+            gid = int(route.split(':')[2])
+            if filename == m.DOMAIN_NAME and route.startswith('d:page:'):
+                old = next((g for g in m._domain_groups_lines(actual) if g['id'] == gid), None)
+                new = next((g for g in m._domain_groups_lines(before) if g['id'] == gid), None)
+                if not old or not new or (old['name'], old['entries'][0]['first_domain']) != (new['name'], new['entries'][0]['first_domain']):
+                    raise ValueError('Очередь сдвинула группу. Примените её перед новым действием.')
+            if filename == m.CIDR_NAME and route.startswith('c:page:'):
+                old = m._cidr_block_lines(actual, gid)['header']
+                try: new = m._cidr_block_lines(before, gid)['header']
+                except ValueError: new = None
+                if not new or (old['name'], old['target']) != (new['name'], new['target']):
+                    raise ValueError('Очередь сдвинула CIDR-блок. Примените её перед новым действием.')
         after = change(list(before))
         if before == after:
             raise ValueError('Изменений нет')
         self.input_mode = None
-        self.pending = (filename, self._sig(filename), change)
+        # Keep the source screen so Cancel returns exactly one level.
+        self.pending = (filename, self._sig(filename), change, label)
+        pending_count = len(self._queue) + 1
         await self._edit(q, '🔎 <b>Подтвердить изменение</b>\n\n' + esc(label) +
                          '\n\nФайл: <code>' + esc(filename) + '</code>\n'
-                         'Будет создан бэкап. Если Neo запущен, после записи '
-                         'он перезапустится. При ошибке конфигурация откатится.',
-                         kb([btn('✅ Применить', 'commit')], [btn('❌ Отмена', 'home')]))
+                         f'Изменений к применению: {pending_count}. '
+                         'Сохранение создаёт бэкап. При изменении правил работающий '
+                         'Neo перезапустится <b>один раз</b> для всей очереди.',
+                         kb([btn('✅ Применить сейчас', 'commit')],
+                            [btn('📥 Добавить в очередь', 'queue:add')],
+                            [btn('❌ Отмена', 'cancel')]))
+
+    def _validate_queue(self, entries):
+        checked = {}
+        for filename, digest, fn, _ in entries:
+            if filename not in checked:
+                checked[filename] = (self._sig(filename), m.read_lines(filename))
+            current, lines = checked[filename]
+            if current != digest:
+                raise ValueError('Файл изменён. Очередь нельзя применить без обновления.')
+            checked[filename] = (current, fn(list(lines)))
+        return checked
+
+    async def _queue_show(self, q):
+        self._current_view = 'queue:show'
+        lines = ['📦 <b>Отложенные изменения</b>',
+                 f'Операций: {len(self._queue)}',
+                 'Список ещё не записан на диск.', '']
+        if self.input_mode:
+            lines.extend(['✍️ <b>Можно прислать следующую порцию записей прямо сейчас.</b>',
+                          'По одной записи на строку. Следующая порция также попадёт в очередь.', ''])
+        for i, (_, _, _, label) in enumerate(self._queue[:15], 1):
+            lines.append(f'{i}. {esc(label[:160])}')
+        if len(self._queue) > 15:
+            lines.append(f'…и ещё {len(self._queue)-15}')
+        buttons = []
+        if self._queue:
+            buttons.extend([[btn('✅ Применить всё (1 перезапуск)', 'queue:apply')],
+                            [btn('🗑 Очистить очередь', 'queue:clear')]])
+        buttons.append([btn('⬅️ Вернуться', 'cancel')])
+        await self._edit(q, '\n'.join(lines), Markup(buttons))
+
+    async def _queue_add(self, q):
+        if not self.pending:
+            raise ValueError('Изменение больше недоступно')
+        if len(self._queue) >= 20:
+            raise ValueError('Очередь заполнена (20 действий)')
+        items = self._queue + [self.pending]
+        self._validate_queue(items)
+        self._queue = items
+        self.pending = None
+        # A newly created group only exists in the staged (virtual) file.
+        # Subsequent bare domain/CIDR lists must append to THAT group, not be
+        # parsed again as a brand-new group requiring a Name | Policy header.
+        # Derive its stable-for-this-queue index from the staged content.
+        if self._repeat_input and self._repeat_input[0] == 'domain_add':
+            staged = self._virtual_lines(m.DOMAIN_NAME)
+            groups = m._domain_groups_lines(staged)
+            if not groups:
+                raise ValueError('Новая группа не найдена в очереди')
+            self._repeat_input = ('domain_gadd', groups[-1]['id'])
+        elif self._repeat_input and self._repeat_input[0] == 'cidr_add':
+            staged = self._virtual_lines(m.CIDR_NAME)
+            blocks = [row for row in m._cidr_rows_lines(staged) if row['header']]
+            if not blocks:
+                raise ValueError('Новый CIDR-блок не найден в очереди')
+            self._repeat_input = ('cidr_gadd', blocks[-1]['index'])
+        # Keep accepting subsequent text messages in the same group.
+        if self._repeat_input is not None:
+            self.input_mode, self._input_group_id = self._repeat_input
+        await self._queue_show(q)
+
+    async def _apply_entries(self, q, items):
+        self._validate_queue(items)
+        await self._edit(q, '⏳ <b>Применяю изменения...</b>', None)
+        edits = [(filename, change) for filename, _, change, _ in items]
+        result = await asyncio.to_thread(m.apply_batch, edits)
+        for filename, _, _, _ in items:
+            self._remember(filename)
+        self._queue.clear()
+        self.pending = None
+        back = self._return_action if self._return_action != 'queue:show' else 'home'
+        await self._edit(q, '✅ <b>Результат</b>\n\n' + esc(result),
+                         kb([btn('⬅️ К предыдущей странице', 'go:' + back)],
+                            [btn('🏠 Разделы', 'home')]))
 
     async def _commit(self, q):
         pending = self.pending
-        self.pending = None
         if not pending:
             await q.answer('Изменение устарело', show_alert=True)
             return
-        filename, digest, edit = pending
-        if self._sig(filename) != digest:
-            raise ValueError('Файл изменён после подтверждения. Операция отменена.')
-        await self._edit(q, '⏳ <b>Применяю изменение...</b>', None)
-        result = await asyncio.to_thread(m.apply_change, filename, edit)
-        back = ('domains:0' if filename == m.DOMAIN_NAME else
-                'cidr:0' if filename == m.CIDR_NAME else 'settings')
-        await self._edit(q, '✅ <b>Результат</b>\n\n' + esc(result),
-                         kb([btn('⬅️ К списку', back), btn('🏠 Разделы', 'home')]))
+        await self._apply_entries(q, self._queue + [pending])
 
     async def _service(self, q):
+        self._current_view = 'service'
         running = await asyncio.to_thread(m.neo_running)
         await self._edit(q, '🟢 <b>Служба HydraRoute Neo</b>\n\n'
                          f'Демон: <b>{"работает" if running else "остановлен"}</b>\n'
@@ -12500,17 +12981,45 @@ class NeoUI:
         a = action[4:]
         self.parent._match_editing = False
         self.parent._token_editing = False
+        # Any navigation action leaves the continuous text-input mode.
+        # queue:add explicitly restores it after staging.
+        if a not in ('queue:add', 'queue:show'):
+            self.input_mode = None
+            self._input_group_id = None
+            self._repeat_input = None
         if self.parent._running and a not in ('home', 'back'):
             await self._edit(q, '⌛ <b>Сначала завершите текущую операцию HydraRoute.</b>',
                              kb([btn('⬅️ К HydraRoute', 'back')]))
             return True
         try:
+            if a not in ('home', 'back', 'cancel', 'commit', 'queue:add',
+                         'queue:apply', 'queue:clear', 'queue:show') and not a.startswith('go:'):
+                self._return_action = self._current_view
             if a in ('home', 'back'):
                 self.cancel()
                 if a == 'back':
+                    self._current_view = 'back'
                     text, keyboard = self.parent._build_card()
                     await self._edit(q, text, keyboard)
                 else: await self._home(q)
+            elif a == 'cancel':
+                route = self._return_action
+                self.cancel()
+                await self._render_view(q, route if route != 'queue:show' else 'home')
+            elif a.startswith('go:'):
+                await self._render_view(q, a[3:])
+            elif a == 'queue:show':
+                if self._current_view != 'queue:show':
+                    self._return_action = self._current_view
+                await self._queue_show(q)
+            elif a == 'queue:add': await self._queue_add(q)
+            elif a == 'queue:clear':
+                self._queue.clear()
+                await self._queue_show(q)
+            elif a == 'queue:apply':
+                if not self._queue:
+                    raise ValueError('Очередь пуста')
+                await self._apply_entries(q, list(self._queue))
             elif a == 'commit': await self._commit(q)
             elif a == 'service': await self._service(q)
             elif a.startswith('service:ask:'):
@@ -12533,8 +13042,8 @@ class NeoUI:
                 await self._domains(q, page)
             elif a == 'd:add': await self._input(
                 q, 'domain_add', 'Добавить группу доменов',
-                'YouTube | youtube.com,googlevideo.com/HydraRoute\n'
-                'Либо отправьте только домены/политика, если название не требуется.')
+                'YouTube | HydraRoute\nyoutube.com\ngoogle.com\nyandex.ru\n'
+                'Также допустимо: YouTube | youtube.com,google.com/HydraRoute')
             elif a == 'd:move': await self._input(q, 'domain_move', 'Перенести один домен', 'youtube.com/nwg0')
             elif a.startswith('d:view:'):
                 await self._domain_detail(q, int(a.split(':')[-1]))
@@ -12550,8 +13059,8 @@ class NeoUI:
                 if not found: raise ValueError('Группа изменилась')
                 title = found['name'] or found['entries'][0]['first_domain']
                 examples = {
-                    'gadd': ('Добавить домены в «' + title + '»', 'example.com,example.org\nили example.com/nwg0'),
-                    'gremove': ('Удалить домен из «' + title + '»', 'example.com'),
+                    'gadd': ('Добавить домены в «' + title + '»', 'youtube.com\ngoogle.com\nyandex.ru'),
+                    'gremove': ('Удалить домены из «' + title + '»', 'youtube.com\ngoogle.com'),
                     'grename': ('Переименовать «' + title + '»', 'Мои видеосервисы'),
                     'gtarget': ('Изменить политику для всей группы «' + title + '»', 'HydraRoute'),
                 }
@@ -12588,7 +13097,7 @@ class NeoUI:
             elif a.startswith('cidr'):
                 page = int(a.split(':')[1]) if ':' in a else 0
                 await self._cidr(q, page)
-            elif a == 'c:add': await self._input(q, 'cidr_add', 'Добавить CIDR или GeoIP', '2606:4700::/32/HydraRoute')
+            elif a == 'c:add': await self._input(q, 'cidr_add', 'Создать CIDR/GeoIP-блок', 'Telegram | All\n149.154.0.0/16\ngeoip:ru')
             elif a.startswith('c:view:'):
                 await self._cidr_detail(q, int(a.split(':')[-1]))
             elif a.startswith('c:page:'):
@@ -12602,8 +13111,8 @@ class NeoUI:
                 block = m._cidr_block_lines(m.read_lines(m.CIDR_NAME), block_index)
                 title = block['header']['name'] or block['header']['target']
                 labels = {
-                    'gadd': ('Добавить CIDR/GeoIP в «' + title + '»', '8.8.8.0/24 или geoip:ru'),
-                    'gremove': ('Удалить запись из «' + title + '»', '8.8.8.0/24 или geoip:ru'),
+                    'gadd': ('Добавить CIDR/GeoIP в «' + title + '»', '8.8.8.0/24\ngeoip:ru\n2606:4700::/32'),
+                    'gremove': ('Удалить CIDR/GeoIP из «' + title + '»', '8.8.8.0/24\ngeoip:ru'),
                     'grename': ('Переименовать «' + title + '»', 'Telegram'),
                     'gtarget': ('Изменить политику «' + title + '»', 'All'),
                 }
@@ -12693,7 +13202,7 @@ class NeoUI:
         except Exception as e:
             self.pending = None
             await self._edit(q, '❌ <b>Не удалось выполнить действие</b>\n\n' + esc(str(e))[:1800],
-                             kb([btn('⬅️ Разделы', 'home')]))
+                             kb([btn('⬅️ Назад', 'cancel'), btn('🏠 Разделы', 'home')]))
         return True
 
     async def handle_text(self, update, ctx):
@@ -12704,12 +13213,19 @@ class NeoUI:
         self.input_mode = None
         self._input_group_id = None
         text = (update.message.text or '').strip()
-        if not text: return True
+        if not text:
+            self.input_mode = mode
+            self._input_group_id = group_id
+            return True
         # Удаляем сообщение с потенциальными конфигурационными данными.
         try: await update.message.delete()
         except Exception: pass
         if self.parent._running:
-            await ctx.bot.send_message(chat_id=self.parent.chat_id, text='⌛ Дождитесь завершения операции HydraRoute.')
+            message_id = await ui_edit_or_send(
+                ctx.bot, self.parent.chat_id, get_last_msg(self.parent.chat_id),
+                '⌛ Дождитесь завершения операции HydraRoute.',
+                parse_mode='HTML', kb=kb([btn('⬅️ Назад', 'cancel')]))
+            set_last_msg(self.parent.chat_id, message_id)
             return True
         filename = (m.CONF_NAME if mode.startswith('setting:') or mode.startswith('geo_')
                     else m.DOMAIN_NAME if mode.startswith('domain_') else m.CIDR_NAME)
@@ -12722,13 +13238,13 @@ class NeoUI:
                 if group_id is None:
                     raise ValueError('CIDR-блок не выбран')
                 if mode == 'cidr_gadd':
-                    value = m.check_cidr(text)
-                    edit = lambda lines: m.edit_cidr_group_add(lines, group_id, value)
-                    summary = 'Добавить в CIDR-блок: ' + value
+                    values = batch_items(text, 'cidr')
+                    edit = lambda lines: m.edit_cidr_group_add_many(lines, group_id, values)
+                    summary = 'Добавить в CIDR-блок: ' + ', '.join(values)[:230]
                 elif mode == 'cidr_gremove':
-                    value = m.check_cidr(text)
-                    edit = lambda lines: m.edit_cidr_group_remove(lines, group_id, value)
-                    summary = 'Удалить из CIDR-блока: ' + value
+                    values = batch_items(text, 'cidr')
+                    edit = lambda lines: m.edit_cidr_group_remove_many(lines, group_id, values)
+                    summary = f'Удалить из CIDR-блока ({len(values)}): ' + ', '.join(values)[:160]
                 elif mode == 'cidr_grename':
                     name = m.check_group_name(text)
                     edit = lambda lines: m.edit_cidr_group_rename(lines, group_id, name)
@@ -12743,12 +13259,19 @@ class NeoUI:
                 if group_id is None: raise ValueError('Группа не выбрана')
                 if mode == 'domain_gadd':
                     normalized = text.strip()
+                    if '/' in normalized:
+                        names, target = normalized.rsplit('/', 1)
+                        tokens = batch_items(names)
+                        normalized = ','.join(tokens) + '/' + m.check_target(target)
+                    else:
+                        tokens = batch_items(normalized)
+                        normalized = ','.join(tokens)
                     edit = lambda lines: m.edit_domain_group_add(lines, group_id, normalized)
-                    summary = 'Добавить домены в группу: ' + normalized[:160]
+                    summary = f'Добавить в группу ({len(tokens)}): ' + ', '.join(tokens)[:160]
                 elif mode == 'domain_gremove':
-                    name = m.check_domain(text)
-                    edit = lambda lines: m.edit_domain_group_remove_domain(lines, group_id, name)
-                    summary = 'Удалить домен из группы: ' + name
+                    values = batch_items(text)
+                    edit = lambda lines: m.edit_domain_group_remove_many(lines, group_id, values)
+                    summary = f'Удалить из группы ({len(values)}): ' + ', '.join(values)[:160]
                 elif mode == 'domain_grename':
                     name = m.check_group_name(text)
                     edit = lambda lines: m.edit_domain_group_rename(lines, group_id, name)
@@ -12763,31 +13286,27 @@ class NeoUI:
                 operation = operation[4:]
                 if key not in ('GeoIPFile', 'GeoSiteFile'):
                     raise ValueError('Неизвестный Geo-параметр')
-                value = text.strip()
-                edit = lambda lines: m.edit_geo_file(lines, key, value, operation)
-                summary = ('Добавить ' if operation == 'add' else 'Удалить ') + key + ': ' + value[:150]
+                values = [p.strip() for p in re.split(r'[,\n\r]+', text) if p.strip()]
+                if not values or len(values) > 16 or len(set(values)) != len(values):
+                    raise ValueError('Укажите от 1 до 16 разных путей .dat, построчно')
+                edit = lambda lines: m.edit_geo_files(lines, key, values, operation)
+                summary = ('Добавить ' if operation == 'add' else 'Удалить ') + key + f' ({len(values)}): ' + ', '.join(values)[:140]
             elif mode == 'domain_add':
-                group_name = None
-                if '|' in text:
-                    group_name, text = text.split('|', 1)
-                    group_name = m.check_group_name(group_name)
-                    text = text.strip()
-                rule = m.check_domain_rule(text)
-                edit = lambda l: m.edit_domain_add(l, rule, group_name)
-                summary = 'Добавить ' + (group_name + ': ' if group_name else '') + rule
+                group_name, rule = parse_new_domain_group(text)
+                edit = lambda lines: m.edit_domain_add(lines, rule, group_name)
+                summary = 'Создать группу ' + (group_name + ': ' if group_name else '') + rule[:180]
             elif mode == 'domain_move':
                 if '/' not in text: raise ValueError('Формат: домен/новая_политика')
                 domain, target = text.rsplit('/', 1)
                 domain, target = m.check_domain(domain), m.check_target(target)
                 edit = lambda l: m.edit_domain_move(l, domain, target)
                 summary = f'Перенести {domain} в {target}'
-            elif mode in ('cidr_add', 'cidr_remove'):
-                if '/' not in text: raise ValueError('Формат: CIDR/политика')
-                value, target = text.rsplit('/', 1)
-                value, target = m.check_cidr(value), m.check_target(target)
-                edit = ((lambda l: m.edit_cidr_add(l, value, target)) if mode == 'cidr_add' else
-                        (lambda l: m.edit_cidr_remove(l, value, target)))
-                summary = ('Добавить ' if mode == 'cidr_add' else 'Удалить ') + value + '/' + target
+            elif mode == 'cidr_add':
+                group_name, target, values = parse_new_cidr_group(text)
+                edit = lambda lines: m.edit_cidr_add_many(lines, values, target, group_name)
+                summary = f'Создать CIDR-блок ({len(values)}) для {target}'
+            elif mode == 'cidr_remove':
+                raise ValueError('Для удаления откройте нужный CIDR-блок')
             elif mode.startswith('setting:'):
                 key = mode.split(':', 1)[1]
                 if text == '-' and key in ('PolicyOrder', 'ForceInterface', 'GeoIPFile', 'GeoSiteFile', 'l7WanInterface'):
@@ -12797,19 +13316,36 @@ class NeoUI:
                 summary = key + '=' + value
             else:
                 raise ValueError('Неизвестный режим ввода')
-            # Текстовый ввод не имеет активного callback q; вместо этого создаём
-            # карточку и вызываем тот же безопасный _propose для подтверждения.
-            msg = await ctx.bot.send_message(chat_id=self.parent.chat_id, text='Проверяю данные...')
             chat_id = self.parent.chat_id
+            last_id = get_last_msg(chat_id)
+            # Text messages have no callback query. Reuse the visible editor
+            # card instead of creating a second untracked message.
             class Q:
                 async def edit_message_text(self, content, **kwargs):
-                    await ctx.bot.edit_message_text(chat_id=chat_id, message_id=msg.message_id,
-                                                    text=content, **kwargs)
+                    msg_id = await ui_edit_or_send(ctx.bot, chat_id,
+                                                    get_last_msg(chat_id),
+                                                    content,
+                                                    kb=kwargs.get('reply_markup'),
+                                                    parse_mode=kwargs.get('parse_mode', 'HTML'))
+                    set_last_msg(chat_id, msg_id)
             await self._propose(Q(), filename, edit, summary)
         except Exception as e:
-            await ctx.bot.send_message(chat_id=self.parent.chat_id,
-                text='❌ Не удалось подготовить изменение: ' + str(e)[:900],
-                reply_markup=kb([btn('⬅️ Разделы', 'home')]))
+            self.pending = None
+            self.input_mode = mode
+            self._input_group_id = group_id
+            message_id = await ui_edit_or_send(
+                ctx.bot, self.parent.chat_id, get_last_msg(self.parent.chat_id),
+                '❌ <b>Не удалось подготовить изменение</b>\n\n' +
+                '<i>Операция: ' + esc({
+                    'domain_gadd': 'добавление доменов в группу',
+                    'domain_gremove': 'удаление доменов из группы',
+                    'domain_add': 'создание новой группы доменов',
+                    'cidr_gadd': 'добавление CIDR/GeoIP в блок',
+                    'cidr_gremove': 'удаление CIDR/GeoIP из блока',
+                }.get(mode, mode)) + '</i>\n' + esc(str(e))[:900] +
+                '\n\nИсправьте список и отправьте его ещё раз. Режим ввода сохранён.',
+                kb=kb([btn('⬅️ Назад', 'cancel')]), parse_mode='HTML')
+            set_last_msg(self.parent.chat_id, message_id)
         return True
 RB_HYDRA_NEO_UI_EOFM
 mkdir -p '/opt/router_bot/modules/hydraroute'
@@ -19115,10 +19651,20 @@ class SSHControlModule(ModuleBase):
         self.active_hid = hid
 
     async def _send_block(self, update, text):
+        """Send a readable SSH result; do not pass chat_id as a PTB context."""
         try:
-            await show_card(update, update.message.chat_id, f"<pre>{_esc(text)}</pre>")
-        except Exception:
-            pass
+            if not update.effective_chat:
+                return
+            chat_id = update.effective_chat.id
+            bot = update.get_bot()
+            payload = f"<pre>{_esc(text)}</pre>"
+            last_id = get_last_msg(chat_id)
+            from core.utils import ui_edit_or_send
+            msg_id = await ui_edit_or_send(bot, chat_id, last_id, payload,
+                                            parse_mode='HTML')
+            set_last_msg(chat_id, msg_id)
+        except Exception as exc:
+            log.warning('SSH result card failed: %s', exc)
 
     async def _edit(self, q, text, kb):
         try:
