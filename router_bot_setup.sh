@@ -14,13 +14,17 @@ ver_cmp() {
     case "$v1" in *-*) suf1="${v1#*-}" ;; esac
     base2="${v2%%-*}"; suf2=""
     case "$v2" in *-*) suf2="${v2#*-}" ;; esac
-    # Пользовательский релиз 0.0.9-09 идёт после 0.0.16.
-    # Численно сопоставляем его с 0.0.16-1, сохраняя запрошенный ярлык.
-    if [ "$v1" = '0.0.9-09' ]; then base1='0.0.16'; suf1='1'; fi
-    if [ "$v2" = '0.0.9-09' ]; then base2='0.0.16'; suf2='1'; fi
-    # 0.0.10 comes after the legacy release 0.0.9-09 in upgrade ordering.
-    if [ "$v1" = '0.0.10' ]; then base1='0.0.16'; suf1='2'; fi
-    if [ "$v2" = '0.0.10' ]; then base2='0.0.16'; suf2='2'; fi
+    # Исторические сборки 0.0.15/0.0.16 вышли раньше 0.0.9-09.
+    # Начиная с 0.0.10, используем обычное числовое сравнение.
+    # Не приравниваем 0.0.10 к 0.0.16-2: иначе 0.0.11 не будет обнаружена.
+    case "$v1" in
+        0.0.15) base1='0.0.9'; suf1='7' ;;
+        0.0.16) base1='0.0.9'; suf1='8' ;;
+    esac
+    case "$v2" in
+        0.0.15) base2='0.0.9'; suf2='7' ;;
+        0.0.16) base2='0.0.9'; suf2='8' ;;
+    esac
     a1=$(echo "$base1" | cut -d. -f1); b1=$(echo "$base1" | cut -d. -f2); c1=$(echo "$base1" | cut -d. -f3)
     a2=$(echo "$base2" | cut -d. -f1); b2=$(echo "$base2" | cut -d. -f2); c2=$(echo "$base2" | cut -d. -f3)
     a1=${a1:-0}; b1=${b1:-0}; c1=${c1:-0}
@@ -317,33 +321,29 @@ _UPDATE_SNOOZE_DAYS = 7
 
 
 def _ver_cmp(v1: str, v2: str) -> int:
-    """Сравнивает версии с поддержкой -N. -1/0/1."""
-    def _split(v):
-        # Release 0.0.9-09 is a deliberate newer label after 0.0.16.
-        # 0.0.10 sorts after the legacy label even though its numeric prefix is 0.0.10.
-        if v == '0.0.9-09':
-            return [0, 0, 16], 1
-        if v == '0.0.10':
-            return [0, 0, 16], 2
-        base, _, suf = v.partition('-')
-        try:
-            parts = [int(x) for x in base.split('.')]
-        except ValueError:
-            parts = [0, 0, 0]
-        while len(parts) < 3:
-            parts.append(0)
-        try:
-            n = int(suf) if suf else 0
-        except ValueError:
-            n = 0
-        return parts[:3], n
-    p1, n1 = _split(v1)
-    p2, n2 = _split(v2)
-    if p1 < p2: return -1
-    if p1 > p2: return 1
-    if n1 < n2: return -1
-    if n1 > n2: return 1
-    return 0
+    """Compare releases in actual order, including the three legacy labels.
+
+    0.0.15 and 0.0.16 were historical build labels before 0.0.9-09.
+    Since 0.0.10, versions follow their ordinary numeric ordering.  In
+    particular, 0.0.11 must be NEWER than 0.0.10, not older than 0.0.16-2.
+    """
+    legacy = {
+        '0.0.15': (0, 0, 9, 7),
+        '0.0.16': (0, 0, 9, 8),
+        '0.0.9-09': (0, 0, 9, 9),
+    }
+
+    def _key(raw: str):
+        v = str(raw).strip()
+        if v in legacy:
+            return legacy[v]
+        m = re.fullmatch(r'(\d+)\.(\d+)\.(\d+)(?:-(\d+))?', v)
+        if not m:
+            raise ValueError(f'Некорректная версия: {v!r}')
+        return tuple(int(x) for x in m.group(1, 2, 3)) + (int(m.group(4) or 0),)
+
+    left, right = _key(v1), _key(v2)
+    return (left > right) - (left < right)
 
 
 def _read_current_version() -> str:
@@ -474,7 +474,7 @@ async def _check_and_notify_self_update(app) -> bool:
         st.pop('snoozed_until', None)
         st.pop('never_notify_version', None)
         _save_update_state(st)
-        log.info('self-update: up to date (%s)', current)
+        log.info('self-update: up to date (installed=%s, github=%s)', current, latest)
         return False
 
     if st.get('never_notify_version') == latest:
@@ -1133,7 +1133,11 @@ async def _cmd_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     except Exception as e:
         await _edit(f'\u274c Не удалось проверить: <code>{e}</code>')
         return
-    if _ver_cmp(latest, current) <= 0:
+    # Manual /update never uses the automatic notification/snooze cache.
+    comparison = _ver_cmp(latest, current)
+    log.info('self-update: manual check installed=%s github=%s comparison=%d',
+             current, latest, comparison)
+    if comparison <= 0:
         await _edit(
             f'\u2705 <b>Актуальная версия</b>\n\n'
             f'Текущая: <code>{current}</code>\n'
