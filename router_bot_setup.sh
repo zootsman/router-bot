@@ -90,7 +90,91 @@ fi
 export RB_MODE="$MODE"
 export RB_VERSION="$SETUP_VERSION"
 
-echo "→ Создаю структуру /opt/router_bot/..."
+# ========== Atomic-ish application source deployment with failure rollback ==========
+# This snapshot covers ONLY Router Bot code/config/init files, not third-party
+# components, HydraRoute state or Entware packages. Installed dependencies are
+# deliberately not uninstalled during rollback because they may be shared.
+mkdir -p /opt/tmp
+_RB_SAVE="/opt/tmp/routerbot-rollback.$$"
+mkdir -p "$_RB_SAVE"
+chmod 700 "$_RB_SAVE" || exit 1
+_RB_EXISTED=no
+[ -f /opt/router_bot/VERSION ] && _RB_EXISTED=yes
+_RB_OLD_RUNNING=no
+if [ -s /var/run/routerbot.pid ]; then
+    _rb_old_pid=$(cat /var/run/routerbot.pid 2>/dev/null || true)
+    case "$_rb_old_pid" in ''|*[!0-9]*) : ;; *)
+        kill -0 "$_rb_old_pid" 2>/dev/null && _RB_OLD_RUNNING=yes || true ;;
+    esac
+fi
+_RB_MANAGED='/opt/router_bot/core /opt/router_bot/modules /opt/router_bot/init
+/opt/router_bot/main.py /opt/router_bot/install.sh /opt/router_bot/uninstall.sh
+/opt/router_bot/ensure_init.sh /opt/router_bot/restore_init.sh
+/opt/router_bot/VERSION /opt/router_bot/config.env /opt/router_bot/config.env.bak
+/opt/bin/rb /opt/bin/routerbot_wrapper.sh
+/opt/etc/init.d/S97tgroutes /opt/etc/init.d/S98routerbot /opt/etc/init.d/S99routerbot_health
+/opt/etc/logrotate.d/router_bot'
+_RB_CRON_FILES='/opt/var/spool/cron/crontabs/root /opt/etc/crontabs/root /opt/etc/crontab'
+_RB_OLD_CRON="$_RB_SAVE/cron"
+mkdir -p "$_RB_OLD_CRON"
+for _rb_file in $_RB_MANAGED; do
+    if [ -e "$_rb_file" ]; then
+        mkdir -p "$_RB_SAVE${_rb_file%/*}"
+        cp -Rp "$_rb_file" "$_RB_SAVE$_rb_file" || exit 1
+    fi
+done
+for _rb_file in $_RB_CRON_FILES; do
+    if [ -f "$_rb_file" ]; then
+        mkdir -p "$_RB_SAVE${_rb_file%/*}"
+        cp -p "$_rb_file" "$_RB_SAVE$_rb_file" || exit 1
+    fi
+done
+_rb_rollback() {
+    _rb_rc="$1"
+    trap - 0 HUP INT TERM
+    if [ "$_rb_rc" = 0 ]; then
+        rm -rf "$_RB_SAVE"
+        return 0
+    fi
+    echo '❌ Router Bot: установка не завершена, восстанавливаю предыдущие файлы...'
+    if [ "$_RB_OLD_RUNNING" = yes ] && [ -x /opt/etc/init.d/S98routerbot ]; then
+        /opt/etc/init.d/S98routerbot stop >/dev/null 2>&1 || true
+    fi
+    # Remove only owned executable/config files. NEVER touch data/, /opt/etc
+    # of other programs, external module binaries or user files.
+    for _rb_file in $_RB_MANAGED; do
+        if [ -e "$_RB_SAVE$_rb_file" ]; then
+            rm -rf "$_rb_file"
+            mkdir -p "${_rb_file%/*}"
+            cp -Rp "$_RB_SAVE$_rb_file" "$_rb_file" || echo "WARNING: cannot restore $_rb_file"
+        else
+            case "$_rb_file" in
+                /opt/router_bot/config.env|/opt/router_bot/config.env.bak)
+                    # Preserve newly created user secrets instead of deleting.
+                    : ;;
+                *) rm -rf "$_rb_file" ;;
+            esac
+        fi
+    done
+    for _rb_file in $_RB_CRON_FILES; do
+        if [ -f "$_RB_SAVE$_rb_file" ]; then
+            mkdir -p "${_rb_file%/*}"
+            cp -p "$_RB_SAVE$_rb_file" "$_rb_file" || true
+        fi
+    done
+    if [ "$_RB_OLD_RUNNING" = yes ] && [ -x /opt/etc/init.d/S98routerbot ]; then
+        /opt/etc/init.d/S98routerbot start >/dev/null 2>&1 || true
+    fi
+    echo 'Предыдущие файлы Router Bot восстановлены. Пакеты Entware не удалялись.'
+    rm -rf "$_RB_SAVE"
+    return "$_rb_rc"
+}
+trap '_rb_rollback $?' 0
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+
+ echo "→ Создаю структуру /opt/router_bot/..."
 mkdir -p /opt/router_bot/core /opt/bin /opt/router_bot/modules /opt/router_bot/init /opt/router_bot/data /opt/var/log
 mkdir -p '/opt/router_bot/core'
 echo "  → /opt/router_bot/core/__init__.py"
@@ -121,7 +205,11 @@ def load_config():
                 v = ' '.join(parsed) if parsed else ''
             except ValueError:
                 continue
-            os.environ.setdefault(k.strip(), v)
+            # config.env is the explicit source of truth for Router Bot settings.
+            # Do not silently retain stale environment inherited by a wrapper.
+            key = k.strip()
+            if key and key.isidentifier():
+                os.environ[key] = v
 
 def get(key: str, default: str = '') -> str:
     return os.environ.get(key, default)
@@ -172,6 +260,9 @@ import subprocess
 import urllib.error
 import urllib.request
 import ssl
+import fcntl
+import re
+import time
 from datetime import datetime, timedelta
 
 # Entware may keep its CA bundle outside the system Python's default paths.
@@ -296,56 +387,52 @@ def _fetch_latest_version(timeout=10) -> str:
 
 
 def _download_and_verify(timeout=60) -> str:
-    """Скачивает setup.sh в /tmp и проверяет. Возвращает путь."""
+    """Скачивает установщик по HTTPS и проверяет формат и синтаксис."""
     data = None
     last_err = None
     for url in _UPDATE_URLS:
+        if not url.startswith('https://'):
+            continue
         try:
             req = urllib.request.Request(url, headers={'User-Agent': 'RouterBot-selfupdate'})
             with urllib.request.urlopen(req, timeout=timeout) as r:
-                data = r.read()
-            if len(data) > 100_000:
-                log.debug('download OK via %s', url)
-                break
+                data = r.read(2_000_001)
+            if not 100_000 <= len(data) <= 2_000_000:
+                raise ValueError('недопустимый размер установщика')
+            break
         except Exception as e:
             last_err = e
-            log.debug('download failed via %s: %s', url, e)
+            log.warning('self-update: download failed via %s: %s', url, e)
             data = None
-            continue
     if not data:
-        raise RuntimeError(f'Все зеркала недоступны. Последняя ошибка: {last_err}')
-    if len(data) < 100_000:
-        raise RuntimeError(f'слишком маленький: {len(data)} байт')
+        raise RuntimeError(f'Не удалось скачать корректный установщик: {last_err}')
 
-    with open(_UPDATE_SCRIPT, 'wb') as f:
-        f.write(data)
-    os.chmod(_UPDATE_SCRIPT, 0o755)
-
-    checks = []
-    r1 = subprocess.run(['sh', '-n', _UPDATE_SCRIPT], capture_output=True, timeout=10)
-    if r1.returncode != 0:
-        checks.append(f'sh -n: {(r1.stderr or b"").decode(errors="replace")[:120]}')
+    # Ensure invalid payloads never replace the previously downloaded script.
+    staging = _UPDATE_SCRIPT + '.part'
     try:
-        with open(_UPDATE_SCRIPT, 'rb') as f:
-            head = f.read(200).decode('utf-8', errors='replace')
-            f.seek(0)
-            body = f.read().decode('utf-8', errors='replace')
+        with open(staging, 'wb') as f:
+            f.write(data)
+        checks = []
+        r1 = subprocess.run(['sh', '-n', staging], capture_output=True, timeout=15)
+        if r1.returncode != 0:
+            checks.append('sh -n: ' + (r1.stderr or b'').decode(errors='replace')[:150])
+        head = data[:200].decode('utf-8', errors='replace')
         if not head.startswith('#!/bin/sh'):
             checks.append('shebang не #!/bin/sh')
-        if 'SETUP_VERSION=' not in body[:4096]:
+        if b'SETUP_VERSION=' not in data[:4096]:
             checks.append('SETUP_VERSION не найден')
-        if 'RB_MAIN_PY_EOF' not in body:
-            checks.append('RB_MAIN_PY_EOF не найден (не установщик?)')
-    except Exception as e:
-        checks.append(f'содержимое: {e}')
-
-    if checks:
+        if b'RB_MAIN_PY_EOF' not in data:
+            checks.append('неполный установщик')
+        if checks:
+            raise RuntimeError('; '.join(checks))
+        os.chmod(staging, 0o700)
+        os.replace(staging, _UPDATE_SCRIPT)
+        return _UPDATE_SCRIPT
+    finally:
         try:
-            os.unlink(_UPDATE_SCRIPT)
-        except Exception:
+            os.unlink(staging)
+        except FileNotFoundError:
             pass
-        raise RuntimeError('; '.join(checks))
-    return _UPDATE_SCRIPT
 
 
 def _spawn_self_update():
@@ -412,17 +499,18 @@ async def _check_and_notify_self_update(app) -> bool:
         '\U0001f195 <b>Доступно обновление Router Bot</b>\n\n'
         f'Сейчас: <code>{current}</code>\n'
         f'Новое:  <code>{latest}</code>\n\n'
-        '<i>Обновление скачается с GitHub и установится автоматически. '
-        'Бот перезапустится через 5–10 секунд.</i>'
     )
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton('\u2b06\ufe0f Обновить сейчас',
-                              callback_data='router:update_now')],
+    text += ('\n\n<i>Установщик будет загружен по HTTPS; '
+             'перед запуском проверяются формат и синтаксис.</i>')
+    kb_rows = [[InlineKeyboardButton('\u2b06\ufe0f Обновить сейчас',
+                                    callback_data='router:update_now')]]
+    kb_rows += [
         [InlineKeyboardButton('\u23f0 Позже (7 дней)',
                               callback_data='router:update_later')],
         [InlineKeyboardButton('\u274c Не напоминать про эту версию',
                               callback_data='router:update_never')],
-    ])
+    ]
+    kb = InlineKeyboardMarkup(kb_rows)
     try:
         msg = await app.bot.send_message(chat_id=chat_id, text=text,
                                    parse_mode='HTML', reply_markup=kb)
@@ -542,7 +630,7 @@ async def _build_main_menu(router):
     # Кнопка управления модулями
     _enabled_now = {m.name for m in router.all()}
     kb.append([InlineKeyboardButton(
-        f'\U0001f9e9 Модули ({len(_enabled_now)} из {len(_ALL_MODULE_META)})',
+        f'\U0001f9e9 Модули ({len(_enabled_now)} из {len(_available_module_meta())})',
         callback_data='router:modules',
     )])
 
@@ -673,6 +761,14 @@ _MODULE_PKG_DEPS = {
 }
 
 
+def _available_module_meta():
+    """Actual installed Router Bot module classes (not third-party packages)."""
+    from core.module_loader import discover_module_classes
+    found = discover_module_classes()
+    return tuple(m for m in _ALL_MODULE_META if m[0] in found)
+
+
+
 def _read_enabled_modules() -> set:
     try:
         with open('/opt/router_bot/config.env') as f:
@@ -701,7 +797,7 @@ def _build_modules_menu(pending: set):
         '',
     ]
     rows = []
-    for name, icon, title, desc in _ALL_MODULE_META:
+    for name, icon, title, desc in _available_module_meta():
         mark = '\u2705' if name in pending else '\u2b1c'
         suffix = ''
         if name in pending:
@@ -714,16 +810,16 @@ def _build_modules_menu(pending: set):
             callback_data=f'router:mod:t:{name}',
         )])
 
-    n_on = sum(1 for m, _, _, _ in _ALL_MODULE_META if m in pending)
-    lines.append(f'<i>Включено: {n_on} из {len(_ALL_MODULE_META)}</i>')
+    n_on = sum(1 for m, _, _, _ in _available_module_meta() if m in pending)
+    lines.append(f'<i>Включено: {n_on} из {len(_available_module_meta())}</i>')
 
     conflict_pairs = {(tuple(sorted((a, b)))) for a in pending
                       for b in _MODULE_CONFLICTS.get(a, []) if b in pending}
     if conflict_pairs:
         lines.append(
             '\u26a0\ufe0f <i>Внимание: включено несколько '
-            'конфликтующих модулей. Одновременно будет работать '
-            'конфликтов при работе.</i>'
+            'сетевых модулей. Проверьте совместимость маршрутов и '
+            'политик.</i>'
         )
 
     rows.append([
@@ -774,7 +870,7 @@ async def _on_module_bulk(q, ctx, mode):
     await q.answer()
     if mode == 'all':
         ctx.chat_data['pending_modules'] = {
-            m for m, _, _, _ in _ALL_MODULE_META
+            m for m, _, _, _ in _available_module_meta()
         }
     else:
         ctx.chat_data['pending_modules'] = {'net_watch'}
@@ -792,7 +888,11 @@ async def _on_modules_apply(q, ctx):
     if not pending:
         await q.answer('Нечего применять', show_alert=True)
         return
+    available = {name for name, _, _, _ in _available_module_meta()}
     actual = _read_enabled_modules()
+    # Preserve unknown/custom names already in config.env; this menu must not
+    # silently delete user's manually provisioned modules.
+    pending = (set(pending) & available) | (actual - available)
     added = pending - actual
     removed = actual - pending
     if not added and not removed:
@@ -862,7 +962,7 @@ async def _on_modules_apply(q, ctx):
     try:
         await q.edit_message_text(
             '\u2705 <b>Модули сохранены</b>\n\n'
-            f'Включено: <b>{len(pending)}</b> из {len(_ALL_MODULE_META)}\n'
+            f'Включено: <b>{len(pending)}</b> из {len(_available_module_meta())}\n'
             f'<code>{enabled_str}</code>\n\n'
             '\U0001f504 <i>Бот перезапустится через 3 секунды. '
             'Когда вернётся — напишите /start.</i>',
@@ -893,6 +993,10 @@ async def _on_modules_cancel(q, ctx):
 
 
 async def _cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    # A /start command must open a VISIBLE fresh menu at the end of the chat.
+    # Reusing show_card() edits the old message and can silently return when
+    # Telegram says "message is not modified", making /start appear broken.
+    log.info('/start received; opening a fresh main menu')
     router = ctx.application.bot_data['router']
     for mod in router.all():
         if hasattr(mod, 'on_leave'):
@@ -901,7 +1005,19 @@ async def _cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             except Exception as e:
                 log.warning('on_leave %s failed: %s', mod.name, e)
     text, kb = await _build_main_menu(router)
-    await show_card(update, ctx, text, kb)
+    chat_id = update.effective_chat.id
+    previous_id = get_last_msg(chat_id)
+    message = await ctx.bot.send_message(
+        chat_id=chat_id, text=text, parse_mode='HTML', reply_markup=kb,
+    )
+    set_last_msg(chat_id, message.message_id)
+    log.info('/start main menu sent successfully')
+    # Keep one active menu. Failure to delete a stale/older card is harmless.
+    if previous_id and previous_id != message.message_id:
+        try:
+            await ctx.bot.delete_message(chat_id=chat_id, message_id=previous_id)
+        except Exception as e:
+            log.debug('Could not delete preceding main menu: %s', e)
 
 
 async def _cmd_restart(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
@@ -1024,14 +1140,15 @@ async def _cmd_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f'Новое:  <code>{latest}</code>\n\n'
         f'Обновить?'
     )
-    kb = InlineKeyboardMarkup([
-        [InlineKeyboardButton('\u2b06\ufe0f Обновить сейчас',
-                              callback_data='router:update_now')],
+    kb_rows = [[InlineKeyboardButton('\u2b06\ufe0f Обновить сейчас',
+                                    callback_data='router:update_now')]]
+    kb_rows += [
         [InlineKeyboardButton('\u23f0 Позже',
                               callback_data='router:update_later')],
         [InlineKeyboardButton('\u274c Отмена',
                               callback_data='router:main')],
-    ])
+    ]
+    kb = InlineKeyboardMarkup(kb_rows)
     await _edit(text, kb)
 
 
@@ -1248,6 +1365,28 @@ def _register_module_open_handler(app, mod, cmd_name):
     app.add_handler(CommandHandler(cmd_name, _open))
 
 
+async def _router_error_handler(update, context):
+    """Always log unhandled PTB errors; notify owner without leaking tokens."""
+    err = context.error
+    log.error('Unhandled Telegram handler error (%s)', type(err).__name__,
+              exc_info=(type(err), err, err.__traceback__) if err else None)
+    now = time.monotonic()
+    last = context.application.bot_data.get('_last_error_report', 0)
+    if now - last < 900:
+        return
+    context.application.bot_data['_last_error_report'] = now
+    try:
+        owner = cfg('TG_CHAT_ID', '')
+        if owner:
+            await context.bot.send_message(
+                chat_id=owner,
+                text=('⚠️ Router Bot: ошибка обработчика (' +
+                      type(err).__name__ + '). Подробности: rb logs 80.'),
+            )
+    except Exception:
+        log.debug('Cannot notify owner about handler error')
+
+
 async def post_init(app):
     router = app.bot_data['router']
     for mod in router.all():
@@ -1326,6 +1465,16 @@ def main():
     for noisy in ('httpx', 'httpcore', 'telegram.request'):
         logging.getLogger(noisy).setLevel(logging.WARNING)
     logging.getLogger('telegram.ext.Updater').setLevel(logging.INFO)
+
+    # Kernel-backed lifetime lock; survives abrupt SIGKILL without stale lock state.
+    os.makedirs('/var/run', exist_ok=True)
+    instance_lock = open('/var/run/routerbot.instance.lock', 'a+')
+    try:
+        fcntl.flock(instance_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        log.error('Router Bot already running: second polling instance refused')
+        instance_lock.close()
+        raise SystemExit(75)  # EX_TEMPFAIL: tell wrapper not to retry
 
     load_config()
 
@@ -1407,6 +1556,7 @@ def main():
         log.warning('Custom HTTPXRequest unavailable; using builder defaults: %s', _e)
         app = ApplicationBuilder().token(token).post_init(post_init).post_stop(post_stop).build()
     app.bot_data['router'] = router
+    app.add_error_handler(_router_error_handler)
 
     # Авторизация выполняется раньше всех команд, callback и обработчиков модулей.
     from telegram.ext import TypeHandler
@@ -1497,7 +1647,11 @@ def main():
     app.add_handler(_MH(_f.TEXT | _f.COMMAND, _delete_incoming), group=-999)
 
     log.info('Starting router bot...')
-    app.run_polling(drop_pending_updates=False)
+    try:
+        app.run_polling(drop_pending_updates=False)
+    finally:
+        fcntl.flock(instance_lock.fileno(), fcntl.LOCK_UN)
+        instance_lock.close()
 RB_CORE_MAIN_PY_EOF
 mkdir -p '/opt/router_bot/core'
 mkdir -p '/opt/router_bot/core'
@@ -2607,6 +2761,16 @@ case "$1" in
             fi
         done
         if [ "$OK" = "1" ]; then
+            # Простая проверка размера, структуры и синтаксиса установщика.
+            _sz=$(wc -c < "$TMP" | tr -d '[:space:]')
+            case "$_sz" in ''|*[!0-9]*) echo '❌ Не удалось определить размер установщика'; exit 1 ;; esac
+            if [ "$_sz" -lt 100000 ] || [ "$_sz" -gt 2000000 ] || \
+               ! grep -q '^SETUP_VERSION=' "$TMP" || \
+               ! grep -q '^RB_MAIN_PY_EOF$' "$TMP"; then
+                echo '❌ Установщик имеет неверный размер или формат'
+                exit 1
+            fi
+            sh -n "$TMP" || { echo '❌ Ошибка синтаксиса установщика'; exit 1; }
             chmod +x "$TMP"
             echo ""
             exec sh "$TMP"
@@ -3619,6 +3783,11 @@ while true; do
     echo "$(date '+%F %T') wrapper: Starting bot..." >> "$LOG"
     T0=$(date +%s)
     /opt/bin/python3 /opt/router_bot/main.py >> "$LOG" 2>&1
+    _RB_PY_EXIT=$?
+    if [ "$_RB_PY_EXIT" -eq 75 ]; then
+        echo "$(date '+%F %T') wrapper: another instance owns lock; stop duplicate wrapper" >> "$LOG"
+        exit 0
+    fi
     T1=$(date +%s)
     RUNTIME=$((T1 - T0))
 
@@ -3681,6 +3850,19 @@ cat > /opt/etc/logrotate.d/router_bot << 'LREOF'
 LREOF
 
 # ============ cron healthcheck ============
+# Remove old Router Bot-only logrotate entries so upgrades do not duplicate jobs.
+for _cf in /opt/var/spool/cron/crontabs/root /opt/etc/crontabs/root /opt/etc/crontab; do
+    if [ -f "$_cf" ]; then
+        sed -i '\|/opt/bin/logrotate /opt/etc/logrotate.conf|d' "$_cf" 2>/dev/null || true
+    fi
+done
+mkdir -p /opt/var/run
+if [ ! -x /opt/bin/logrotate ]; then
+    echo '  ⚠️ logrotate отсутствует: журнал не будет автоматически ротироваться до установки пакета logrotate'
+fi
+if [ ! -x /opt/bin/crond ] && ! command -v crond >/dev/null 2>&1; then
+    echo '  ⚠️ crond отсутствует: cron-задачи не будут выполняться автоматически'
+fi
 # На Entware BusyBox crond часто читает /opt/var/spool/cron/crontabs/root,
 # а не /opt/etc/crontab. Поддерживаем оба распространённых варианта.
 CRON_LINE="* * * * * /opt/etc/init.d/S99routerbot_health"
@@ -3692,8 +3874,8 @@ for _cf in /opt/var/spool/cron/crontabs/root /opt/etc/crontabs/root; do
     if ! grep -Fq '/opt/etc/init.d/S99routerbot_health' "$_cf"; then
         echo "$CRON_LINE" >> "$_cf"
     fi
-    if ! grep -Fq '/opt/bin/logrotate /opt/etc/logrotate.conf' "$_cf"; then
-        echo '17 3 * * * /opt/bin/logrotate /opt/etc/logrotate.conf >/dev/null 2>&1' >> "$_cf"
+    if ! grep -Fq '/opt/etc/logrotate.d/router_bot' "$_cf"; then
+        echo '17 3 * * * /opt/bin/logrotate -s /opt/var/run/routerbot-logrotate.status /opt/etc/logrotate.d/router_bot >/dev/null 2>&1' >> "$_cf"
     fi
     CRON_OK=1
  done
@@ -3702,8 +3884,8 @@ if [ -f /opt/etc/crontab ]; then
     if ! grep -Fq '/opt/etc/init.d/S99routerbot_health' /opt/etc/crontab; then
         echo "$CRON_LINE" >> /opt/etc/crontab
     fi
-    if ! grep -Fq '/opt/bin/logrotate /opt/etc/logrotate.conf' /opt/etc/crontab; then
-        echo '17 3 * * * /opt/bin/logrotate /opt/etc/logrotate.conf >/dev/null 2>&1' >> /opt/etc/crontab
+    if ! grep -Fq '/opt/etc/logrotate.d/router_bot' /opt/etc/crontab; then
+        echo '17 3 * * * /opt/bin/logrotate -s /opt/var/run/routerbot-logrotate.status /opt/etc/logrotate.d/router_bot >/dev/null 2>&1' >> /opt/etc/crontab
     fi
     CRON_OK=1
 fi
@@ -3893,90 +4075,59 @@ mkdir -p '/opt/router_bot/init'
 echo "  → /opt/router_bot/init/S99routerbot_health"
 cat > '/opt/router_bot/init/S99routerbot_health' << 'RB_INIT_S99ROUTERBOT_HEALTH_EOF'
 #!/bin/sh
-. /opt/router_bot/config.env
-
-[ -f /var/run/routerbot.giveup ] && exit 0
-
+# Router Bot healthcheck: DO NOT restart healthy process on external API outage.
+# Only Router Bot's own files, process and route diagnostics are touched.
+CONF=/opt/router_bot/config.env
 PIDFILE=/var/run/routerbot.pid
-STATE=/var/run/routerbot.fail
+STATE=/var/run/routerbot.telegram_health
+[ -f /var/run/routerbot.giveup ] && exit 0
+[ -f "$CONF" ] || { echo 'WARNING: config.env missing'; exit 0; }
+. "$CONF"
 
-# 0. Автодетект WAN IP
-if [ "$USE_VPN" = "yes" ] && [ -n "$VPN_IF" ]; then
-    WAN_IF_NOW=""
-    if [ -n "$WAN_IF" ] && ip -4 -o addr show dev "$WAN_IF" 2>/dev/null | grep -q ' inet '; then
-        WAN_IF_NOW="$WAN_IF"
+# Restore Telegram route if a managed VPN route actually exists. No DNS edits.
+if [ "$USE_VPN" = 'yes' ] && [ -n "$VPN_IF" ]; then
+    # Network self-healing is deliberately separate from bot process supervision.
+    if ! ip -4 route get 149.154.166.110 2>/dev/null | grep -Fq "dev $VPN_IF"; then
+        echo "WARNING: Telegram route does not use $VPN_IF; check rb routes"
+        # Do not blindly rebuild policy rules owned by other components.
+    fi
+fi
+
+# Check process first, regardless of whether Telegram is reachable.
+if [ -s "$PIDFILE" ]; then
+    _pid=$(cat "$PIDFILE" 2>/dev/null)
+    case "$_pid" in ''|*[!0-9]*) _pid='' ;; esac
+    if [ -n "$_pid" ] && kill -0 "$_pid" 2>/dev/null; then
+        : # wrapper alive; it will restart Python on a local process crash
     else
-        WAN_IF_NOW=$(ip route show default 2>/dev/null \
-            | awk '/^default/ {for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}')
-        [ -n "$WAN_IF_NOW" ] && [ "$WAN_IF_NOW" = "$VPN_IF" ] && WAN_IF_NOW=""
-        echo "$WAN_IF_NOW" | grep -qE '^(opkgtun|nwg|wg|tun)' && WAN_IF_NOW=""
+        echo 'Router Bot PID missing/dead; restarting wrapper'
+        /opt/etc/init.d/S98routerbot restart
+        exit $?
     fi
-    WAN_SRC_NOW=""
-    [ -n "$WAN_IF_NOW" ] && WAN_SRC_NOW=$(ip -4 -o addr show dev "$WAN_IF_NOW" 2>/dev/null \
-        | awk '{print $4}' | cut -d/ -f1 | head -1)
-    if [ -n "$WAN_SRC_NOW" ] && [ "$WAN_SRC_NOW" != "$WAN_SRC" ]; then
-        echo "WAN IP changed: $WAN_SRC -> $WAN_SRC_NOW"
-        sed -i "s|^WAN_SRC=.*|WAN_SRC='$WAN_SRC_NOW'|" /opt/router_bot/config.env 2>/dev/null || true
-        sed -i "s|^WAN_IF=.*|WAN_IF='$WAN_IF_NOW'|" /opt/router_bot/config.env 2>/dev/null || true
-        WAN_SRC="$WAN_SRC_NOW"
-        /opt/etc/init.d/S97tgroutes rebuild >/dev/null 2>&1 || true
-    fi
+else
+    echo 'Router Bot PID file missing; restarting wrapper'
+    /opt/etc/init.d/S98routerbot restart
+    exit $?
 fi
 
-# 1. Маршруты Telegram
-if [ "$USE_VPN" = "yes" ] && [ -n "$VPN_IF" ] && [ -n "$WAN_SRC" ]; then
-    if ! ip route get 149.154.166.110 from "$WAN_SRC" 2>/dev/null | grep -q "$VPN_IF"; then
-        echo "Restoring Telegram routes via $VPN_IF..."
-        /opt/etc/init.d/S97tgroutes rebuild >/dev/null 2>&1 || true
-    fi
-fi
-
-# 2. DNS принадлежит KeeneticOS, ничего не перезаписываем.
-if ! grep -q nameserver /etc/resolv.conf 2>/dev/null; then
-    echo 'WARNING: /etc/resolv.conf не содержит nameserver (без изменения настроек DNS)'
-fi
-
-# 3. Проверка связи с Telegram
-TG=$(sed -n "s/^TG_BOT_TOKEN='\(.*\)'/\1/p" /opt/router_bot/config.env)
-_c4=""
-if [ "$DISABLE_IPV6" = "yes" ]; then
-    _c4="-4"
-fi
-_http_code=$(/opt/bin/curl $_c4 -s -o /dev/null -w "%{http_code}" --connect-timeout 5 --max-time 10 "https://api.telegram.org/bot${TG}/getMe" 2>/dev/null)
-case "$DISABLE_IPV6" in
-    yes|1|true|on) : ;; # IPv6 намеренно отключён: проверяем только IPv4.
-    *)
-        # При разрешённом IPv6 проверяем оба семейства независимо,
-        # чтобы сбой одного стека не считался полным отсутствием связи.
-        case "$_http_code" in ''|000)
-            _code4=$(/opt/bin/curl -4 -s -o /dev/null -w "%{http_code}" --connect-timeout 4 --max-time 8 "https://api.telegram.org/bot${TG}/getMe" 2>/dev/null)
-            _code6=$(/opt/bin/curl -6 -s -o /dev/null -w "%{http_code}" --connect-timeout 4 --max-time 8 "https://api.telegram.org/bot${TG}/getMe" 2>/dev/null)
-            case "$_code4" in [234][0-9][0-9]) _http_code="$_code4" ;; *) case "$_code6" in [234][0-9][0-9]) _http_code="$_code6" ;; esac ;; esac
-            ;;
-        esac
-        ;;
-esac
-
-if [ "$_http_code" -ge 200 ] 2>/dev/null && [ "$_http_code" -lt 500 ] 2>/dev/null; then
+# Independent observation only. Connection failure/401 is NOT a restart trigger.
+[ -n "$TG_BOT_TOKEN" ] || { echo 'WARNING: Telegram token missing'; exit 0; }
+command -v /opt/bin/curl >/dev/null 2>&1 || exit 0
+_case_v4=''
+case "$DISABLE_IPV6" in yes|1|true|on) _case_v4='-4' ;; esac
+# HTTP status 200 alone is insufficient; check Bot API JSON ok=true.
+_reply=$(/opt/bin/curl $_case_v4 -sS --connect-timeout 5 --max-time 10     -w '\nHTTP_CODE:%{http_code}' "https://api.telegram.org/bot${TG_BOT_TOKEN}/getMe" 2>/dev/null)
+_code=${_reply##*HTTP_CODE:}
+_json=${_reply%HTTP_CODE:*}
+if [ "$_code" = '200' ] && printf '%s' "$_json" | grep -Eq '"ok"[[:space:]]*:[[:space:]]*true'; then
     rm -f "$STATE"
 else
-    COUNT=$(cat "$STATE" 2>/dev/null || echo 0)
-    COUNT=$((COUNT + 1))
-    echo "$COUNT" > "$STATE"
-    echo "Telegram unreachable (HTTP code: $_http_code, failure $COUNT)"
-    if [ "$COUNT" -ge 3 ]; then
-        rm -f "$STATE"
-        /opt/etc/init.d/S98routerbot restart
-    fi
-    exit 0
+    # Never print the full URL/body: it may include the bot token.
+    [ -n "$_code" ] || _code=000
+    echo "WARNING: Telegram getMe is unavailable or unauthorized (HTTP=$_code); Router Bot is not restarted"
+    printf '%s\n' "$_code" > "$STATE"
 fi
-
-if [ -f "$PIDFILE" ] && kill -0 "$(cat $PIDFILE)" 2>/dev/null; then
-    exit 0
-fi
-
-echo "Bot process is dead, restarting..."
-/opt/etc/init.d/S98routerbot restart
+exit 0
 RB_INIT_S99ROUTERBOT_HEALTH_EOF
 chmod +x '/opt/router_bot/init/S99routerbot_health'
 mkdir -p '/opt/router_bot'
@@ -5464,25 +5615,8 @@ echo "✅ logrotate"
 # ---------- 13b. ensure_init (перезапись с case status) ----------
 sh /opt/router_bot/ensure_init.sh
 
-# ---------- 13. cron ----------
-CRON_LINE="* * * * * /opt/etc/init.d/S99routerbot_health"
-CRON_OK=0
-for CRON_FILE in /opt/var/spool/cron/crontabs/root /opt/etc/crontabs/root; do
-    mkdir -p "${CRON_FILE%/*}" 2>/dev/null || continue
-    touch "$CRON_FILE" 2>/dev/null || continue
-    if ! grep -Fq '/opt/etc/init.d/S99routerbot_health' "$CRON_FILE"; then echo "$CRON_LINE" >> "$CRON_FILE"; fi
-    if ! grep -Fq '/opt/bin/logrotate /opt/etc/logrotate.conf' "$CRON_FILE"; then echo '17 3 * * * /opt/bin/logrotate /opt/etc/logrotate.conf >/dev/null 2>&1' >> "$CRON_FILE"; fi
-    CRON_OK=1
-done
-if [ -f /opt/etc/crontab ]; then
-    grep -v 'S99routerbot_health' /opt/etc/crontab > /opt/etc/crontab.tmp 2>/dev/null || true
-    mv /opt/etc/crontab.tmp /opt/etc/crontab 2>/dev/null || true
-    echo "$CRON_LINE" >> /opt/etc/crontab
-    if ! grep -Fq '/opt/bin/logrotate /opt/etc/logrotate.conf' /opt/etc/crontab; then echo '17 3 * * * /opt/bin/logrotate /opt/etc/logrotate.conf >/dev/null 2>&1' >> /opt/etc/crontab; fi
-    CRON_OK=1
-fi
-if [ -x /opt/etc/init.d/S10cron ]; then /opt/etc/init.d/S10cron restart >/dev/null 2>&1 || /opt/etc/init.d/S10cron start >/dev/null 2>&1 || true; fi
-[ "$CRON_OK" = "1" ] && echo "✅ cron: healthcheck зарегистрирован" || echo "⚠️ cron не найден; healthcheck доступен вручную"
+# ---------- 13. Cron jobs managed exclusively by ensure_init.sh ----------
+# The old implementation appended a second legacy logrotate job here.
 
 # Удаляем устаревший вспомогательный удалятор: актуальный интерфейс — uninstall.sh.
 rm -f "$BASE_DIR/uninstall_helper.py" /opt/router_bot/uninstall_helper.py
@@ -5793,6 +5927,7 @@ mkdir -p '/opt/router_bot/modules/awg_manager'
 echo "  → /opt/router_bot/modules/awg_manager/module.py"
 cat > '/opt/router_bot/modules/awg_manager/module.py' << 'RB_MODULES_AWG_MANAGER_MODULE_PY_EOF'
 """Модуль AWG Manager — управление AmneziaWG / Sing-box."""
+from core.module_base import ModuleBase
 import asyncio
 import html
 import json
@@ -6022,7 +6157,7 @@ def InlineKeyboardMarkup(rows):
     return _TelegramMarkup(result)
 
 
-class AwgManagerModule:
+class AwgManagerModule(ModuleBase):
     name = 'awg_manager'
     title = 'AWG Manager'
     icon = '🛡'
@@ -8920,6 +9055,7 @@ mkdir -p '/opt/router_bot/modules/bird'
 echo "  → /opt/router_bot/modules/bird/module.py"
 cat > '/opt/router_bot/modules/bird/module.py' << 'RB_MODULES_BIRD_MODULE_PY_EOF'
 """Модуль BIRD — динамическая маршрутизация (BGP/OSPF)."""
+from core.module_base import ModuleBase
 import asyncio
 import html
 import logging
@@ -8984,7 +9120,7 @@ def _split(text, size=MAX_MSG):
     return chunks
 
 
-class BirdModule:
+class BirdModule(ModuleBase):
     name = 'bird'
     title = 'BIRD'
     icon = '\U0001f426'  # 🐦
@@ -9816,6 +9952,7 @@ mkdir -p '/opt/router_bot/modules/flashkeen'
 echo "  → /opt/router_bot/modules/flashkeen/module.py"
 cat > '/opt/router_bot/modules/flashkeen/module.py' << 'RB_MODULES_FLASHKEEN_MODULE_PY_EOF'
 """Модуль Flashkeen — интерактивный терминал в Telegram."""
+from core.module_base import ModuleBase
 import asyncio
 import fcntl
 import html
@@ -9901,7 +10038,7 @@ def _detect_menu_items(text: str):
     return [n for n in nums if 0 <= n <= 12]
 
 
-class FlashkeenModule:
+class FlashkeenModule(ModuleBase):
     name = 'flashkeen'
     title = 'Flashkeen'
     icon = '\U0001f4be'
@@ -12679,6 +12816,7 @@ mkdir -p '/opt/router_bot/modules/hydraroute'
 echo "  → /opt/router_bot/modules/hydraroute/module.py"
 cat > '/opt/router_bot/modules/hydraroute/module.py' << 'RB_MODULES_HYDRAROUTE_MODULE_PY_EOF'
 """Модуль HydraRoute — установка/управление через бота."""
+from core.module_base import ModuleBase
 import asyncio
 import html
 import logging
@@ -12749,7 +12887,7 @@ def _split(text, size=MAX_MSG):
     return chunks
 
 
-class HydraRouteModule:
+class HydraRouteModule(ModuleBase):
     name = 'hydraroute'
     title = 'HydraRoute'
     icon = '🐍'
@@ -13939,6 +14077,7 @@ mkdir -p '/opt/router_bot/modules/keen_pbr'
 echo "  → /opt/router_bot/modules/keen_pbr/module.py"
 cat > '/opt/router_bot/modules/keen_pbr/module.py' << 'RB_MODULES_KEEN_PBR_MODULE_PY_EOF'
 """Модуль keen-pbr — policy-based routing."""
+from core.module_base import ModuleBase
 import asyncio
 import html
 import logging
@@ -14004,7 +14143,7 @@ def _split(text, size=MAX_MSG):
     return chunks
 
 
-class KeenPbrModule:
+class KeenPbrModule(ModuleBase):
     name = 'keen_pbr'
     title = 'Keen-PBR'
     icon = '\U0001f6e4'  # 🛤
@@ -14997,6 +15136,7 @@ mkdir -p '/opt/router_bot/modules/mtproxy'
 echo "  → /opt/router_bot/modules/mtproxy/module.py"
 cat > '/opt/router_bot/modules/mtproxy/module.py' << 'RB_MODULES_MTPROXY_MODULE_PY_EOF'
 """Модуль MTProxy — MTProto-прокси для Telegram."""
+from core.module_base import ModuleBase
 import asyncio
 import html
 import logging
@@ -15064,7 +15204,7 @@ def _split(text, size=MAX_MSG):
     return chunks
 
 
-class MTProxyModule:
+class MTProxyModule(ModuleBase):
     name = 'mtproxy'
     title = 'MTProxy'
     icon = '\U0001f310'  # 🌐
@@ -16109,6 +16249,7 @@ mkdir -p '/opt/router_bot/modules/neofit'
 echo "  → /opt/router_bot/modules/neofit/module.py"
 cat > '/opt/router_bot/modules/neofit/module.py' << 'RB_MODULES_NEOFIT_MODULE_PY_EOF'
 """Модуль NeoFit — веб-панель управления прокси на Keenetic."""
+from core.module_base import ModuleBase
 import asyncio
 import html
 import logging
@@ -16149,7 +16290,7 @@ def _strip_ansi(s):
     return s
 
 
-class NeoFitModule:
+class NeoFitModule(ModuleBase):
     name = 'neofit'
     title = 'NeoFit'
     icon = '\U0001f500'
@@ -16737,6 +16878,7 @@ mkdir -p '/opt/router_bot/modules/net_watch'
 echo "  → /opt/router_bot/modules/net_watch/module.py"
 cat > '/opt/router_bot/modules/net_watch/module.py' << 'RB_MODULES_NET_WATCH_MODULE_PY_EOF'
 #!/opt/bin/python3
+from core.module_base import ModuleBase
 import asyncio
 import html
 import json
@@ -16777,15 +16919,20 @@ log = logging.getLogger(__name__)
 
 # ---------- ndmc ----------
 async def run_ndmc(cmd: str, timeout: float = 5) -> str:
+    # Avoid inheriting incompatible Entware/shared library paths into ndmc.
+    ndmc_env = os.environ.copy()
+    ndmc_env.pop('LD_LIBRARY_PATH', None)
     proc = await asyncio.create_subprocess_exec(
         NDMC_PATH, '-c', cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
+        env=ndmc_env,
     )
     try:
         out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
         proc.kill()
+        await proc.communicate()  # reap child; prevent zombie processes
         log.warning('ndmc timeout: %s', cmd)
         return ''
     return out.decode(errors='replace')
@@ -17642,7 +17789,7 @@ _log = _logging.getLogger('net_watch')
 CHAT_ID = os.environ.get('TG_CHAT_ID', '')  # перезагружаем актуальный
 
 
-class NetWatchModule:
+class NetWatchModule(ModuleBase):
     name = 'net_watch'
     title = 'Net Watch'
     icon = '📡'
@@ -18143,6 +18290,7 @@ mkdir -p '/opt/router_bot/modules/ssh_control'
 echo "  → /opt/router_bot/modules/ssh_control/module.py"
 cat > '/opt/router_bot/modules/ssh_control/module.py' << 'RB_MODULES_SSH_CONTROL_MODULE_PY_EOF'
 """Модуль SSH Control: управление устройствами по SSH."""
+from core.module_base import ModuleBase
 import asyncio
 import html
 import logging
@@ -18221,7 +18369,7 @@ def _filter_ssh_noise(err: str) -> str:
         lines.append(line)
     return '\n'.join(lines).strip()
 
-class SSHControlModule:
+class SSHControlModule(ModuleBase):
     name = 'ssh_control'
     title = 'SSH Control'
     icon = '💻'
@@ -19540,6 +19688,7 @@ mkdir -p '/opt/router_bot/modules/system'
 echo "  → /opt/router_bot/modules/system/module.py"
 cat > '/opt/router_bot/modules/system/module.py' << 'RB_MODULES_SYSTEM_MODULE_PY_EOF'
 """Модуль System — состояние роутера."""
+from core.module_base import ModuleBase
 import asyncio
 import json
 import logging
@@ -20187,7 +20336,7 @@ def _save_update_state(data):
         pass
 
 
-class SystemModule:
+class SystemModule(ModuleBase):
     name = 'system'
     title = 'System'
     icon = '\U0001f5a5'
@@ -20765,6 +20914,7 @@ mkdir -p '/opt/router_bot/modules/usque_keenetic'
 echo "  → /opt/router_bot/modules/usque_keenetic/module.py"
 cat > '/opt/router_bot/modules/usque_keenetic/module.py' << 'RB_MODULES_USQUE_KEENETIC_MODULE_PY_EOF'
 """Модуль usque-keenetic — Cloudflare WARP (MASQUE) для Keenetic."""
+from core.module_base import ModuleBase
 import asyncio, html, logging, os, pty, re, time
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.ext import (
@@ -20796,7 +20946,7 @@ def _strip_ansi(s):
     return re.sub(r'\x1b[=>]', '', s)
 
 
-class UsqueKeeneticModule:
+class UsqueKeeneticModule(ModuleBase):
     name = 'usque_keenetic'
     title = 'Usque WARP'
     icon = '\u2601\ufe0f'
@@ -21717,6 +21867,7 @@ mkdir -p '/opt/router_bot/modules/xkeen'
 echo "  → /opt/router_bot/modules/xkeen/module.py"
 cat > '/opt/router_bot/modules/xkeen/module.py' << 'RB_MODULES_XKEEN_MODULE_PY_EOF'
 """Модуль XKeen — установка/управление XKeen."""
+from core.module_base import ModuleBase
 import asyncio
 import html
 import logging
@@ -21834,7 +21985,7 @@ def _menu_row_buttons(items):
     return rows
 
 
-class XKeenModule:
+class XKeenModule(ModuleBase):
     name = 'xkeen'
     title = 'XKeen'
     icon = '\U0001f43e'  # 🐾
@@ -22665,24 +22816,9 @@ if [ -f /opt/router_bot/core/wrapper.sh ] && [ ! -x /opt/bin/routerbot_wrapper.s
     RESTORE_ANY=1
 fi
 
-mkdir -p /opt/etc/logrotate.d
-cat > /opt/etc/logrotate.d/router_bot << 'LREOF'
-/opt/var/log/router_bot.log {
-    weekly
-    rotate 4
-    compress
-    delaycompress
-    missingok
-    notifempty
-    copytruncate
-}
-LREOF
-echo "  + /opt/etc/logrotate.d/router_bot (обновлён)"
-RESTORE_ANY=1
-
-if [ -f /opt/etc/crontab ] && ! grep -q "S99routerbot_health" /opt/etc/crontab; then
-    echo "*/1 * * * * /opt/etc/init.d/S99routerbot_health" >> /opt/etc/crontab
-    echo "  + cron healthcheck"
+# Single source of truth for logrotate and scheduled healthcheck.
+if [ -f /opt/router_bot/ensure_init.sh ]; then
+    sh /opt/router_bot/ensure_init.sh || exit 1
     RESTORE_ANY=1
 fi
 
