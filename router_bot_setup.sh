@@ -1,7 +1,7 @@
 #!/bin/sh
 set -e
 
-SETUP_VERSION="0.0.10"
+SETUP_VERSION="0.0.10-01"
 VERSION_FILE="/opt/router_bot/VERSION"
 INSTALLED_VERSION=""
 if [ -f "$VERSION_FILE" ]; then
@@ -117,6 +117,7 @@ fi
 _RB_MANAGED='/opt/router_bot/core /opt/router_bot/modules /opt/router_bot/init
 /opt/router_bot/main.py /opt/router_bot/install.sh /opt/router_bot/uninstall.sh
 /opt/router_bot/ensure_init.sh /opt/router_bot/restore_init.sh
+/opt/router_bot/telegram_routes_persist.sh
 /opt/router_bot/VERSION /opt/router_bot/config.env /opt/router_bot/config.env.bak
 /opt/bin/rb /opt/bin/routerbot_wrapper.sh
 /opt/etc/init.d/S97tgroutes /opt/etc/init.d/S98routerbot /opt/etc/init.d/S99routerbot_health
@@ -1779,9 +1780,9 @@ show_help() {
     tgtest           Диагностика сети Telegram
     config, c        Конфиг: показать/править/восстановить
     modules, m       Включённые модули
-    routes           Маршруты Telegram (table 16385)
+    routes           Таблицы и статические маршруты Telegram
     health           Запустить healthcheck
-    rebuild          Перестроить маршруты Telegram
+    rebuild          Проверить и восстановить маршруты Telegram
     procs            Дерево процессов бота
 
   ── Обслуживание ───────────────────────────────────
@@ -2082,7 +2083,7 @@ PYEOF
         case "$_r" in
             y|Y)
                 _tuns=$(ip -o link show 2>/dev/null | sed 's/@[^ :]*//g' | \
-                    awk -F': ' '$2 ~ /^(opkgtun[0-9]+|nwg[0-9]+|wg[0-9]+|tap[0-9]+)$/ { print $2 }')
+                    awk -F': ' '$2 ~ /^(opkgtun[0-9]+|opkgtap[0-9]+|nwg[0-9]+|awg[0-9]+|wg[0-9]+|ovpn[0-9]+|tun[0-9]+|tap[0-9]+|l2tp[0-9]+|pptp[0-9]+|sstp[0-9]+)$/ { print $2 }')
                 if [ -z "$_tuns" ]; then
                     echo "  Туннели не найдены — VPN не настроен"
                 else
@@ -2196,6 +2197,8 @@ PYEOF
     if [ "$_ci_use_vpn" = "yes" ] && [ -x /opt/etc/init.d/S97tgroutes ]; then
         echo "  → Перестраиваю маршруты Telegram через $_ci_vpn_if..."
         /opt/etc/init.d/S97tgroutes rebuild >/dev/null 2>&1 || true
+        [ ! -x "$BOT_DIR/telegram_routes_persist.sh" ] || \
+            "$BOT_DIR/telegram_routes_persist.sh" apply || true
         echo "  ✅ Готово"
         echo ""
     fi
@@ -2244,7 +2247,7 @@ do_config_tun() {
     echo ""
     echo "  Сканирую туннели..."
     _tuns=$(ip -o link show 2>/dev/null | sed 's/@[^ :]*//g' | \
-        awk -F': ' '$2 ~ /^(opkgtun[0-9]+|nwg[0-9]+|wg[0-9]+|tap[0-9]+)$/ { print $2 }')
+        awk -F': ' '$2 ~ /^(opkgtun[0-9]+|opkgtap[0-9]+|nwg[0-9]+|awg[0-9]+|wg[0-9]+|ovpn[0-9]+|tun[0-9]+|tap[0-9]+|l2tp[0-9]+|pptp[0-9]+|sstp[0-9]+)$/ { print $2 }')
 
     if [ -z "$_tuns" ]; then
         echo "  ⚠️  Туннели не найдены"
@@ -2341,15 +2344,9 @@ do_config_tun() {
     # --- Проверка доступа ---
     echo ""
     echo "  Проверяю доступ к api.telegram.org через $_new_vpn_if ($_new_vpn_src)..."
-    # Временно добавим маршруты
-    for _net in 149.154.160.0/20 91.108.4.0/22; do
-        ip route add "$_net" dev "$_new_vpn_if" src "$_new_vpn_src" table "$_cur_route_table" 2>/dev/null || true
-    done
-    ip rule add to 149.154.160.0/20 lookup "$_cur_route_table" priority 1100 2>/dev/null || true
-    ip rule add to 91.108.4.0/22 lookup "$_cur_route_table" priority 1101 2>/dev/null || true
-
+    # Проверяем именно выбранный VPN без создания конфликтующих ip rule.
     _CURL_OK=no
-    if /opt/bin/curl -sf --max-time 8 "https://api.telegram.org" >/dev/null 2>&1; then
+    if /opt/bin/curl -4 -sf --interface "$_new_vpn_if" --max-time 8 "https://api.telegram.org" >/dev/null 2>&1; then
         _CURL_OK=yes
     fi
 
@@ -2392,6 +2389,10 @@ do_config_tun() {
         echo "  → Применяю маршруты (S97tgroutes rebuild)..."
         $S97 rebuild >/dev/null 2>&1 && echo "  ✅ Маршруты применены" || \
             echo "  ⚠️  S97tgroutes rebuild вернул ошибку"
+        if [ -x "$BOT_DIR/telegram_routes_persist.sh" ]; then
+            "$BOT_DIR/telegram_routes_persist.sh" apply || \
+                echo "  ⚠️ Постоянные маршруты требуют ручной проверки"
+        fi
     else
         echo "  ⚠️  $S97 не найден — маршруты не применены"
     fi
@@ -2614,6 +2615,13 @@ do_modules() {
 }
 
 do_routes() {
+    echo ""
+    echo "  === Статические маршруты Telegram в KeeneticOS ==="
+    if [ -x "$BOT_DIR/telegram_routes_persist.sh" ]; then
+        "$BOT_DIR/telegram_routes_persist.sh" status || true
+    fi
+    /bin/ndmc -c "show running-config" 2>/dev/null | \
+        grep -E '^ip route (91\.108\.4\.0|149\.154\.160\.0|149\.154\.166\.110)' || true
     echo ""
     echo "  === ip rule (table 16385) ==="
     ip rule show 2>/dev/null | grep 16385 || echo "  (пусто)"
@@ -3944,103 +3952,19 @@ mkdir -p '/opt/router_bot/init'
 echo "  → /opt/router_bot/init/S97tgroutes"
 cat > '/opt/router_bot/init/S97tgroutes' << 'RB_INIT_S97TGROUTES_EOF'
 #!/bin/sh
-# Маршруты Telegram через VPN-туннель.
-# WAN_IF и WAN_SRC определяются автоматически.
-. /opt/router_bot/config.env
-
-[ "$USE_VPN" = "yes" ] || exit 0
-[ -n "$VPN_IF" ] || exit 0
-[ -n "$VPN_SRC" ] || exit 0
-[ -n "$ROUTE_TABLE" ] || ROUTE_TABLE="16385"
-WAN_IF_CFG="${WAN_IF:-}"
-
-TG_NETS="149.154.166.110 149.154.160.0/20 91.108.4.0/22"
-
-get_wan_if() {
-    if [ -n "$WAN_IF_CFG" ] && \
-       ip link show "$WAN_IF_CFG" >/dev/null 2>&1 && \
-       ip -4 -o addr show dev "$WAN_IF_CFG" 2>/dev/null | grep -q ' inet '; then
-        echo "$WAN_IF_CFG"
-        return 0
-    fi
-    local ifc
-    ifc=$(ip route show default 2>/dev/null \
-        | awk '/^default/ {for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}')
-    if [ -n "$ifc" ] && [ "$ifc" != "$VPN_IF" ] \
-       && ! echo "$ifc" | grep -qE '^(opkgtun|nwg|wg|tun)'; then
-        echo "$ifc"
-        return 0
-    fi
-    ifc=$(ip route get 1.1.1.1 2>/dev/null \
-        | awk '{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}')
-    if [ -n "$ifc" ] && [ "$ifc" != "$VPN_IF" ] \
-       && ! echo "$ifc" | grep -qE '^(opkgtun|nwg|wg|tun)'; then
-        echo "$ifc"
-        return 0
-    fi
-    return 1
-}
-
-get_wan_src() {
-    local iface="$1"
-    [ -n "$iface" ] || return 1
-    ip -4 -o addr show dev "$iface" 2>/dev/null \
-        | awk '{print $4}' | cut -d/ -f1 | head -1
-}
-
-rebuild_rules() {
-    local WAN_IF_NOW WAN_SRC_NOW
-    WAN_IF_NOW=$(get_wan_if) || return 1
-    WAN_SRC_NOW=$(get_wan_src "$WAN_IF_NOW")
-    [ -n "$WAN_SRC_NOW" ] || return 1
-
-    if [ "$WAN_IF_NOW" != "$WAN_IF_CFG" ] || [ "$WAN_SRC_NOW" != "$WAN_SRC" ]; then
-        sed -i "s|^WAN_IF=.*|WAN_IF='$WAN_IF_NOW'|" /opt/router_bot/config.env 2>/dev/null || true
-        sed -i "s|^WAN_SRC=.*|WAN_SRC='$WAN_SRC_NOW'|" /opt/router_bot/config.env 2>/dev/null || true
-        echo "WAN detected: $WAN_IF_NOW ($WAN_SRC_NOW)"
-    fi
-
-    # Delete only rules created by Router Bot at known priorities/table.
-    if ip rule show | grep -Eq "^1152:.*lookup ${ROUTE_TABLE}( |$)"; then
-        ip rule del priority 1152 lookup "$ROUTE_TABLE" 2>/dev/null || true
-    fi
-    p=1100
-    for net in $TG_NETS; do
-        if ip rule show | grep -F "to $net " | grep -Eq "^${p}:.*lookup ${ROUTE_TABLE}( |$)"; then
-            ip rule del to "$net" lookup "$ROUTE_TABLE" priority "$p" 2>/dev/null || true
-        fi
-        ip route del "$net" dev "$VPN_IF" table "$ROUTE_TABLE" 2>/dev/null || true
-        p=$((p+1))
-    done
-
-    ip rule add from "$WAN_SRC_NOW" lookup "$ROUTE_TABLE" priority 1152 2>/dev/null || true
-    p=1100
-    for net in $TG_NETS; do
-        ip rule add to "$net" lookup "$ROUTE_TABLE" priority $p 2>/dev/null || true
-        p=$((p+1))
-    done
-    for net in $TG_NETS; do
-        ip route replace "$net" dev "$VPN_IF" src "$VPN_SRC" table "$ROUTE_TABLE" 2>/dev/null || true
-    done
-}
-
-case "$1" in
-  start)   sleep 20; rebuild_rules || exit 0 ;;
-  stop)
-    p=1100
-    for net in $TG_NETS; do
-        if ip rule show | grep -F "to $net " | grep -Eq "^${p}:.*lookup ${ROUTE_TABLE}( |$)"; then
-            ip rule del to "$net" lookup "$ROUTE_TABLE" priority "$p" 2>/dev/null || true
-        fi
-        ip route del "$net" dev "$VPN_IF" table "$ROUTE_TABLE" 2>/dev/null || true
-        p=$((p+1))
-    done
-    if ip rule show | grep -Eq "^1152:.*lookup ${ROUTE_TABLE}( |$)"; then
-        ip rule del priority 1152 lookup "$ROUTE_TABLE" 2>/dev/null || true
-    fi
-    ;;
-  rebuild) rebuild_rules ;;
-  *) echo "Usage: $0 {start|stop|rebuild}"; exit 1 ;;
+# Router Bot Telegram route service. Uses the interface chosen in config.env.
+# Persistent NDM route where supported; NDM-event repair for standalone TUN.
+PERSIST=/opt/router_bot/telegram_routes_persist.sh
+case "${1:-start}" in
+    start|rebuild)
+        [ -x "$PERSIST" ] || exit 0
+        "$PERSIST" apply
+        ;;
+    stop)
+        # Routes are shared network configuration: never destroy them on bot stop.
+        exit 0
+        ;;
+    *) echo 'Использование: S97tgroutes {start|rebuild|stop}'; exit 2 ;;
 esac
 RB_INIT_S97TGROUTES_EOF
 chmod +x '/opt/router_bot/init/S97tgroutes'
@@ -4575,7 +4499,7 @@ if [ "$MODE" != "install" ]; then
         echo ""
         _TUNABLES=$(ip -o link show 2>/dev/null \
             | sed "s/@[^ :]*//g" \
-            | awk -F": " '$2 ~ /^(opkgtun[0-9]+|nwg[0-9]+|wg[0-9]+|tap[0-9]+)$/ { print $2 }')
+            | awk -F": " '$2 ~ /^(opkgtun[0-9]+|opkgtap[0-9]+|nwg[0-9]+|awg[0-9]+|wg[0-9]+|ovpn[0-9]+|tun[0-9]+|tap[0-9]+|l2tp[0-9]+|pptp[0-9]+|sstp[0-9]+)$/ { print $2 }')
         if [ -z "$_TUNABLES" ]; then
             echo "  Туннели не найдены, пропускаю."
         else
@@ -4633,11 +4557,8 @@ if [ "$MODE" != "install" ]; then
             _wt=$(sed -n "s/^ROUTE_TABLE='\(.*\)'/\1/p" /opt/router_bot/config.env 2>/dev/null)
             [ -z "$_wt" ] && _wt="16385"
             echo "  Проверяю $_new_vpn_if ($_new_vpn_src)... (до 8 сек)"
-            for _net in 149.154.160.0/20 91.108.4.0/22; do
-                ip route add "$_net" dev "$_new_vpn_if" src "$_new_vpn_src" table "$_wt" 2>/dev/null || true
-            done
             _CURL_OK=no
-            if /opt/bin/curl -sf --max-time 8 "https://api.telegram.org" >/dev/null 2>&1; then
+            if /opt/bin/curl -4 -sf --interface "$_new_vpn_if" --max-time 8 "https://api.telegram.org" >/dev/null 2>&1; then
                 _CURL_OK=yes
             fi
             if [ "$_CURL_OK" = "yes" ]; then
@@ -4781,6 +4702,12 @@ PYEOF
 
     echo "→ Обновляю init-скрипты..."
     sh /opt/router_bot/ensure_init.sh || exit 1
+    /opt/etc/init.d/S97tgroutes rebuild >/dev/null 2>&1 || true
+    if [ -x "$BASE_DIR/telegram_routes_persist.sh" ]; then
+        echo "→ Проверяю постоянные маршруты Telegram..."
+        "$BASE_DIR/telegram_routes_persist.sh" apply || \
+            echo "⚠️ Статические маршруты KeeneticOS требуют проверки"
+    fi
     rm -f /var/run/routerbot.giveup /var/run/routerbot.fail
     echo "→ Перезапускаю бота..."
     /opt/etc/init.d/S98routerbot restart || exit 1
@@ -4911,10 +4838,30 @@ if [ "$DISABLE_IPV6" = "yes" ]; then
     _curl_opts="$_curl_opts -4"
 fi
 
+# Если Telegram уже доступен через VPN, используем тот же туннель,
+# независимо от его технологии. Не путать с прямым доступом через WAN.
+_TG_EXISTING_IF=$(ip -4 route get 149.154.166.110 2>/dev/null | \
+    awk '{for (i=1;i<=NF;i++) if($i=="dev") {print $(i+1);exit}}')
+case "$_TG_EXISTING_IF" in
+    opkgtun[0-9]*|opkgtap[0-9]*|nwg[0-9]*|awg[0-9]*|wg[0-9]*|ovpn[0-9]*|tun[0-9]*|tap[0-9]*|l2tp[0-9]*|pptp[0-9]*|sstp[0-9]*)
+        # Защита от случайного совпадения названия без IPv4.
+        ip -4 -o addr show dev "$_TG_EXISTING_IF" 2>/dev/null | grep -q ' inet ' || _TG_EXISTING_IF=''
+        ;;
+    *) _TG_EXISTING_IF='' ;;
+esac
+
 printf "→ Проверяю доступность Telegram напрямую... "
-if /opt/bin/curl $_curl_opts "https://api.telegram.org" >/dev/null 2>&1; then
-    echo "✅ доступен"
-    echo "  VPN не нужен."
+if [ -n "$_TG_EXISTING_IF" ] && \
+    /opt/bin/curl $_curl_opts "https://api.telegram.org" >/dev/null 2>&1; then
+    echo "✅ доступен через $_TG_EXISTING_IF"
+    USE_VPN="yes"
+    VPN_IF="$_TG_EXISTING_IF"
+    VPN_SRC=$(ip -4 -o addr show dev "$VPN_IF" 2>/dev/null | \
+        awk '{print $4}' | cut -d/ -f1 | head -1)
+    echo "  Telegram-VPN будет сохранён через KeeneticOS или механизм восстановления Linux."
+elif /opt/bin/curl $_curl_opts "https://api.telegram.org" >/dev/null 2>&1; then
+    echo "✅ доступен без Telegram-VPN"
+    echo "  Маршрутизацию не меняю."
     USE_VPN="no"
     VPN_IF=""
     VPN_SRC=""
@@ -4926,7 +4873,7 @@ else
     # Поиск туннелей (без tunl0, PPP, Tap и т.п.)
     TUNABLES=$(ip -o link show 2>/dev/null \
         | sed 's/@[^ :]*//g' \
-        | awk -F': ' '$2 ~ /^(opkgtun[0-9]+|nwg[0-9]+|wg[0-9]+|tap[0-9]+)$/ { print $2 }')
+        | awk -F': ' '$2 ~ /^(opkgtun[0-9]+|opkgtap[0-9]+|nwg[0-9]+|awg[0-9]+|wg[0-9]+|ovpn[0-9]+|tun[0-9]+|tap[0-9]+|l2tp[0-9]+|pptp[0-9]+|sstp[0-9]+)$/ { print $2 }')
 
     if [ -z "$TUNABLES" ]; then
         echo "  Туннелей не найдено."
@@ -5024,27 +4971,16 @@ else
 
     echo ""
     printf "→ Проверяю доступ к Telegram через $VPN_IF ($VPN_SRC)... "
-    # Удаляем конфликтующие маршруты из main (например, /32 через WAN)
-    ip route del 149.154.166.110 2>/dev/null || true
-    ip route del 149.154.160.0/20 2>/dev/null || true
-    ip route del 91.108.4.0/22 2>/dev/null || true
-    # Ставим через VPN — replace, чтобы гарантированно перезаписать
-    ip route replace 149.154.166.110 dev "$VPN_IF" src "$VPN_SRC" table "$WAN_TABLE" 2>/dev/null || true
-    ip route replace 149.154.160.0/20 dev "$VPN_IF" src "$VPN_SRC" table "$WAN_TABLE" 2>/dev/null || true
-    ip route replace 91.108.4.0/22 dev "$VPN_IF" src "$VPN_SRC" table "$WAN_TABLE" 2>/dev/null || true
-    # Удаляем старые правила для этих сетей — любой таблицы
+    # До записи config.env нужны временные маршруты для проверки токена.
+    # Добавляем только отсутствующие маршруты в main без подмены чужих.
+    # Не создаём ip rule lookup WAN_TABLE: такие правила могут обходить
+    # сохранённые KeeneticOS маршруты после добавления новых VPN.
     for _net in 149.154.166.110 149.154.160.0/20 91.108.4.0/22; do
-        _j=0
-        while [ "$_j" -lt 10 ]; do
-            ip rule del to "$_net" 2>/dev/null || break
-            _j=$((_j+1))
-        done
+        _route_dst=${_net%/32}
+        if ! ip -4 route show table main 2>/dev/null | awk '{print $1}' | grep -Eq "^(${_net}|${_route_dst})$"; then
+            ip -4 route add "$_net" dev "$VPN_IF" src "$VPN_SRC" table main 2>/dev/null || true
+        fi
     done
-    # Добавляем правила
-    ip rule add to 149.154.166.110 lookup "$WAN_TABLE" priority 1099 2>/dev/null || true
-    ip rule add to 149.154.160.0/20 lookup "$WAN_TABLE" priority 1100 2>/dev/null || true
-    ip rule add to 91.108.4.0/22 lookup "$WAN_TABLE" priority 1101 2>/dev/null || true
-    ip rule add from "$WAN_SRC" lookup "$WAN_TABLE" priority 1152 2>/dev/null || true
 
     _vpn_ok=no; _route_ok=no
     if /opt/bin/curl $_curl_opts --interface "$VPN_IF" "https://api.telegram.org" >/dev/null 2>&1; then
@@ -5072,11 +5008,8 @@ else
             exit 1
         fi
     fi
-    # Маршрут НЕ удаляем — он нужен для проверки токена (urllib).
-    # Дополнительно покрываем обе подсети Telegram.
-    for _tgnet in 149.154.166.110 149.154.160.0/20 91.108.4.0/22; do
-        ip route replace "$_tgnet" dev "$VPN_IF" src "$VPN_SRC" table "$WAN_TABLE" 2>/dev/null || true
-    done
+    # Сохраняем временные маршруты до проверки токена (urllib).
+    # После создания config.env их закрепит KeeneticOS либо NDM-хуки.
 fi
 echo ""
 
@@ -5183,25 +5116,8 @@ echo "────────────────────────�
 echo ""
 
 while true; do
-    # Перед первым вводом токена — применить правила для подсетей Telegram,
-    # чтобы urllib-запрос getMe не ушёл в мёртвую таблицу.
-    if [ "$_TG_RULES_APPLIED" != "yes" ] && [ "$USE_VPN" = "yes" ] && [ -n "$VPN_IF" ] && [ -n "$VPN_SRC" ]; then
-        echo "-> Применяю правила Telegram через $VPN_IF для проверки токена..."
-        _p=1100
-        for _tgnet in 149.154.160.0/20 91.108.4.0/22; do
-            ip rule add to "$_tgnet" lookup "$WAN_TABLE" priority $_p 2>/dev/null || true
-            ip route add "$_tgnet" dev "$VPN_IF" src "$VPN_SRC" table "$WAN_TABLE" 2>/dev/null || true
-            _p=$((_p+1))
-        done
-        ip rule add from "$WAN_SRC" lookup "$WAN_TABLE" priority 1152 2>/dev/null || true
-        if ip route get 149.154.166.110 from "$WAN_SRC" 2>/dev/null | grep -q "$VPN_IF"; then
-            echo "  OK: маршрут через $VPN_IF активен"
-        else
-            echo "  ВНИМАНИЕ: маршрут через $VPN_IF не активен"
-        fi
-        echo ""
-        _TG_RULES_APPLIED=yes
-    fi
+    # При проверке токена используем уже созданные временные маршруты main.
+    # Не добавляем дублирующие ip rule и не перехватываем пользовательские политики.
     printf "Токен бота (от @BotFather): "
     read TOKEN
     TOKEN=$(echo "$TOKEN" | tr -d ' ')
@@ -5343,127 +5259,10 @@ echo "✅ config.env сохранён/создан (+ backup)"
 # =================== продолжение в следующей части ===================
 
 # ---------- 9. init: S97tgroutes ----------
-cat > "$INIT_DIR/S97tgroutes" << 'EOF97'
-#!/bin/sh
-# Маршруты Telegram через VPN-туннель.
-# WAN_IF и WAN_SRC определяются автоматически.
-. /opt/router_bot/config.env
-
-[ "$USE_VPN" = "yes" ] || exit 0
-[ -n "$VPN_IF" ] || exit 0
-[ -n "$VPN_SRC" ] || exit 0
-[ -n "$ROUTE_TABLE" ] || ROUTE_TABLE="16385"
-WAN_IF_CFG="${WAN_IF:-}"
-
-TG_NETS="149.154.166.110 149.154.160.0/20 91.108.4.0/22"
-
-# Определяет активный WAN-интерфейс: сначала из config.env,
-# потом из default route (исключая VPN-туннели).
-get_wan_if() {
-    # 1. Из config.env — если интерфейс есть, с IPv4 и не VPN
-    if [ -n "$WAN_IF_CFG" ] && \
-       [ "$WAN_IF_CFG" != "$VPN_IF" ] && \
-       ip -4 -o addr show dev "$WAN_IF_CFG" 2>/dev/null | grep -q ' inet '; then
-        echo "$WAN_IF_CFG"
-        return 0
-    fi
-    # 2. default via <gw> dev <iface> — настоящий WAN
-    local ifc
-    ifc=$(ip route show default 2>/dev/null \
-        | grep " via " | head -1 \
-        | awk '{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}')
-    if [ -n "$ifc" ] && [ "$ifc" != "$VPN_IF" ]; then
-        echo "$ifc"
-        return 0
-    fi
-    # 3. Fallback: default dev <iface> без via
-    ifc=$(ip route show default 2>/dev/null | head -1 \
-        | awk '{for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}')
-    if [ -n "$ifc" ] && [ "$ifc" != "$VPN_IF" ]; then
-        echo "$ifc"
-        return 0
-    fi
-    return 1
-}
-
-get_wan_src() {
-    local iface="$1"
-    [ -n "$iface" ] || return 1
-    ip -4 -o addr show dev "$iface" 2>/dev/null \
-        | awk '{print $4}' | cut -d/ -f1 | head -1
-}
-
-rebuild_rules() {
-    local WAN_IF_NOW WAN_SRC_NOW
-
-    WAN_IF_NOW=$(get_wan_if) || return 1
-    WAN_SRC_NOW=$(get_wan_src "$WAN_IF_NOW")
-    [ -n "$WAN_SRC_NOW" ] || return 1
-
-    # обновляем config.env если WAN_IF/ WAN_SRC изменились
-    if [ "$WAN_IF_NOW" != "$WAN_IF_CFG" ] || [ "$WAN_SRC_NOW" != "$WAN_SRC" ]; then
-        sed -i "s|^WAN_IF=.*|WAN_IF='$WAN_IF_NOW'|" /opt/router_bot/config.env 2>/dev/null || true
-        sed -i "s|^WAN_SRC=.*|WAN_SRC='$WAN_SRC_NOW'|" /opt/router_bot/config.env 2>/dev/null || true
-        echo "WAN detected: $WAN_IF_NOW ($WAN_SRC_NOW)"
-    fi
-
-    # чистка старых правил
-    for src in $(ip rule show | awk -v tbl="$ROUTE_TABLE" '$0 ~ "lookup " tbl " " {for(i=1;i<=NF;i++) if($i=="from") print $(i+1)}'); do
-        case "$src" in
-            [0-9]*) ip rule del from "$src" lookup "$ROUTE_TABLE" 2>/dev/null || true ;;
-        esac
-    done
-    for net in $TG_NETS; do
-        _i=0
-        while [ "$_i" -lt 10 ]; do
-            ip rule del to "$net" 2>/dev/null || break
-            _i=$((_i+1))
-        done
-        ip route del "$net" 2>/dev/null || true
-        ip route del "$net" table "$ROUTE_TABLE" 2>/dev/null || true
-    done
-
-    # source-based
-    ip rule add from "$WAN_SRC_NOW" lookup "$ROUTE_TABLE" priority 1152 2>/dev/null || true
-
-    # to-based (независимо от source)
-    p=1100
-    for net in $TG_NETS; do
-        ip rule add to "$net" lookup "$ROUTE_TABLE" priority $p 2>/dev/null || true
-        p=$((p+1))
-    done
-
-    # маршруты
-    for net in $TG_NETS; do
-        ip route replace "$net" dev "$VPN_IF" src "$VPN_SRC" table "$ROUTE_TABLE" 2>/dev/null || true
-    done
-}
-
-case "$1" in
-  start)   sleep 20; rebuild_rules || exit 0 ;;
-  stop)
-    for net in $TG_NETS; do
-        _i=0
-        while [ "$_i" -lt 10 ]; do
-            ip rule del to "$net" 2>/dev/null || break
-            _i=$((_i+1))
-        done
-        ip route del "$net" 2>/dev/null || true
-        ip route del "$net" table "$ROUTE_TABLE" 2>/dev/null || true
-    done
-    for src in $(ip rule show | awk -v tbl="$ROUTE_TABLE" '$0 ~ "lookup " tbl " " {for(i=1;i<=NF;i++) if($i=="from") print $(i+1)}'); do
-        case "$src" in
-            [0-9]*) ip rule del from "$src" lookup "$ROUTE_TABLE" 2>/dev/null || true ;;
-        esac
-    done
-    ;;
-  rebuild) rebuild_rules ;;
-  *) echo "Usage: $0 {start|stop|rebuild}"; exit 1 ;;
-esac
-EOF97
-    chmod +x "$INIT_DIR/S97tgroutes"
-mkdir -p /opt/router_bot/init
-cp -f "$INIT_DIR/S97tgroutes" /opt/router_bot/init/S97tgroutes
+# Единый исходник init, без дублирующей устаревшей реализации.
+[ -f "$BASE_DIR/init/S97tgroutes" ] || { echo "Нет S97tgroutes"; exit 1; }
+cp -f "$BASE_DIR/init/S97tgroutes" "$INIT_DIR/S97tgroutes"
+chmod +x "$INIT_DIR/S97tgroutes"
 echo "✅ S97tgroutes"
 
 # ---------- 10. wrapper в /opt/bin ----------
@@ -5662,6 +5461,14 @@ sh /opt/router_bot/ensure_init.sh
 
 # Удаляем устаревший вспомогательный удалятор: актуальный интерфейс — uninstall.sh.
 rm -f "$BASE_DIR/uninstall_helper.py" /opt/router_bot/uninstall_helper.py
+
+# ---------- 14b. Постоянные маршруты через KeeneticOS ----------
+# Применяем до запуска бота, а не после: иначе Telegram API может быть недоступен.
+if [ "$USE_VPN" = "yes" ] && [ -x "$BASE_DIR/telegram_routes_persist.sh" ]; then
+    echo "→ Закрепляю Telegram-маршруты в KeeneticOS..."
+    "$BASE_DIR/telegram_routes_persist.sh" apply || \
+        echo "⚠️ Не все статические маршруты сохранены. Проверьте rb routes."
+fi
 
 # ---------- 15. Запуск ----------
 echo ""
@@ -23813,9 +23620,13 @@ if [ "$DO_BOT" = "1" ]; then
     [ -n "$USE_VPN" ] || USE_VPN="no"
     [ -n "$ROUTE_TABLE" ] || ROUTE_TABLE="main"
     if [ "$USE_VPN" = "yes" ] && [ -n "$VPN_IF" ]; then
-        echo "  ⚠️ Маршруты Telegram автоматически не удаляю: они могут быть общими с другими правилами."
+        echo "  ℹ️ Постоянные маршруты KeeneticOS оставляю: ими может пользоваться Telegram на других устройствах."
         echo "     При необходимости проверьте таблицу '$ROUTE_TABLE' вручную после удаления."
     fi
+    # Снимаем только хуки, созданные Router Bot. Пользовательские маршруты оставляем.
+    for _hd in ifcreated.d iflayerchanged.d ifipchanged.d; do
+        rm -f "/opt/etc/ndm/$_hd/95-routerbot-telegram-routes.sh"
+    done
     rm -f "$INIT_DIR/S98routerbot" "$INIT_DIR/S97tgroutes" "$INIT_DIR/S99routerbot_health"
     rm -f /opt/bin/routerbot_wrapper.sh
     rm -f /opt/etc/logrotate.d/router_bot
@@ -23864,8 +23675,240 @@ done
 sleep 1
 echo "→ Запускаю установщик..."
 echo ""
+# ROUTERBOT-KEENETIC-TG-STATIC-ROUTES-v1
+cat > /opt/router_bot/telegram_routes_persist.sh << 'RB_KEENETIC_TG_ROUTES_EOF'
+#!/bin/sh
+# Telegram routes for the VPN interface SELECTED by the user during Router Bot installation.
+# Keenetic-managed interfaces: persistent ndmc routes, saved to KeeneticOS configuration.
+# Unmanaged Linux TUN: conservative in-kernel routes restored on interface-change hooks.
+# Never overwrite an existing static route pointing elsewhere.
+CONF=/opt/router_bot/config.env
+NDMC=/bin/ndmc
+MARKER=/opt/router_bot/data/telegram_routes_linux_fallback
+HOOK=95-routerbot-telegram-routes.sh
+ACTION=${1:-apply}
+TG_NETS='149.154.166.110|32|255.255.255.255 149.154.160.0|20|255.255.240.0 91.108.4.0|22|255.255.252.0'
+
+case "$ACTION" in apply|status|fallback-repair) ;; *) echo 'Использование: telegram_routes_persist.sh {apply|status|fallback-repair}'; exit 2 ;; esac
+[ -f "$CONF" ] || { echo 'Telegram: config.env отсутствует'; exit 1; }
+
+read_key() {
+    sed -n "s/^$1=['\"]\{0,1\}\\([^'\"]*\\)['\"]\{0,1\}$/\\1/p" "$CONF" | head -1
+}
+USE_VPN=$(read_key USE_VPN)
+VPN_IF=$(read_key VPN_IF)
+VPN_SRC=$(read_key VPN_SRC)
+K_IF_CFG=$(read_key TG_KEENETIC_IF)
+[ "$USE_VPN" = yes ] || exit 0
+[ -n "$VPN_IF" ] || { echo 'Telegram: VPN_IF не выбран'; exit 1; }
+case "$VPN_IF" in *[!a-zA-Z0-9_.:-]*|'') echo 'Telegram: небезопасное имя интерфейса'; exit 1 ;; esac
+
+# Detect current tunnel IPv4 (do not rely on a stale VPN_SRC from old config).
+_live_src=$(ip -4 -o addr show dev "$VPN_IF" 2>/dev/null | awk '$3=="inet" {split($4,a,"/"); print a[1]; exit}')
+[ -n "$_live_src" ] && VPN_SRC=$_live_src
+case "$VPN_SRC" in *[!0-9.]*|'') echo "Telegram: нет IPv4 на выбранном $VPN_IF"; exit 1 ;; esac
+
+# Query Keenetic's own system-name resolver rather than inferring nwg/awg/ovpn/etc.
+# CLI since KeeneticOS 4.03: "show interface Wireguard4 system-name" -> "nwg4".
+resolve_keenetic_interface() {
+    [ -x "$NDMC" ] || return 1
+    /opt/bin/python3 - "$VPN_IF" "$K_IF_CFG" <<'PY'
+import re, subprocess, sys
+linux_name, manual = sys.argv[1:3]
+
+def cli(command):
+    try:
+        p = subprocess.run(['/bin/ndmc', '-c', command],
+                           capture_output=True, text=True, timeout=5)
+        return p.stdout if p.returncode == 0 else ''
+    except (OSError, subprocess.TimeoutExpired):
+        return ''
+
+def unique_candidates():
+    seen = set()
+    candidates = []
+    def add(x):
+        if x and re.fullmatch(r'[A-Za-z][A-Za-z0-9_/-]{0,95}', x) and x not in seen:
+            seen.add(x); candidates.append(x)
+    if manual: add(manual)
+    for prefix, ndm in (('opkgtun','OpkgTun'), ('opkgtap','OpkgTap'),
+                        ('nwg','Wireguard')):
+        m = re.fullmatch(re.escape(prefix) + r'(\d+)', linux_name, re.I)
+        if m: add(ndm + m.group(1))
+    listing = cli('show interface')
+    for line in listing.splitlines():
+        m = re.search(r'\bid\s*[:=]\s*["\']?([A-Za-z][A-Za-z0-9_/-]{0,95})', line)
+        if m: add(m.group(1))
+    # Other NDM ids are intentionally NOT guessed by interface prefix.
+    return candidates[:100]
+
+for ndm_name in unique_candidates():
+    result = cli('show interface ' + ndm_name + ' system-name')
+    m = re.search(r'(?i)["\']?system-name["\']?\s*[:=]\s*["\']?([a-zA-Z0-9_.:-]+)', result)
+    if m and m.group(1) == linux_name:
+        print(ndm_name)
+        sys.exit(0)
+    # Older CLI may lack system-name for OpkgTun; only accept exact verified id.
+    if re.fullmatch(r'opkgtun\d+', linux_name, re.I) and ndm_name.lower() == linux_name.lower():
+        detail = cli('show interface ' + ndm_name)
+        if re.search(r'\bid\s*[:=]\s*["\']?' + re.escape(ndm_name) + r'\b', detail):
+            print(ndm_name)
+            sys.exit(0)
+sys.exit(1)
+PY
+}
+
+get_running_config() { "$NDMC" -c 'show running-config' 2>/dev/null; }
+find_routes() {
+    awk -v dst="$1" -v prefix="$2" -v mask="$3" '
+    $1 == "ip" && $2 == "route" {
+        if ($3 == dst "/" prefix) { print; next }
+        if ($3 != dst) next
+        if (prefix == "32") { print; next }
+        if ($4 == mask || $4 == "/" prefix) { print; next }
+    }'
+}
+route_via_selected() {
+    awk -v target="$K_IF" '
+    {ok=0; for(i=4;i<=NF;i++) if(tolower($i)==tolower(target)) ok=1;
+     if(!ok) bad=1; found=1}
+    END { exit !(found && !bad) }'
+}
+
+remove_fallback_hooks() {
+    rm -f "$MARKER" \
+        "/opt/etc/ndm/ifcreated.d/$HOOK" \
+        "/opt/etc/ndm/iflayerchanged.d/$HOOK" \
+        "/opt/etc/ndm/ifipchanged.d/$HOOK"
+}
+install_fallback_hooks() {
+    mkdir -p /opt/router_bot/data /opt/etc/ndm/ifcreated.d \
+             /opt/etc/ndm/iflayerchanged.d /opt/etc/ndm/ifipchanged.d || return 1
+    printf '%s\n' "$VPN_IF" > "$MARKER" || return 1
+    for d in /opt/etc/ndm/ifcreated.d /opt/etc/ndm/iflayerchanged.d /opt/etc/ndm/ifipchanged.d; do
+        cat > "$d/$HOOK" <<'HOOKEOF'
+#!/bin/sh
+# Router Bot managed hook. Never touches unrelated software.
+[ "$1" = hook ] || exit 0
+[ -f /opt/router_bot/data/telegram_routes_linux_fallback ] || exit 0
+(
+    sleep 3
+    /opt/router_bot/telegram_routes_persist.sh fallback-repair >/dev/null 2>&1
+    sleep 4
+    /opt/router_bot/telegram_routes_persist.sh fallback-repair >/dev/null 2>&1
+) >/dev/null 2>&1 &
+exit 0
+HOOKEOF
+        chmod 755 "$d/$HOOK" || return 1
+    done
+}
+
+# Fallback for a kernel TUN without a KeeneticOS-managed interface.
+# ip route persists neither across reboot nor NDM route recalculation; hooks +
+# bot init/health repair it. Do not overwrite routes to other devices.
+repair_linux_routes() {
+    failed=0
+    for entry in $TG_NETS; do
+        dst=${entry%%|*}; rem=${entry#*|}; prefix=${rem%%|*}
+        net="$dst/$prefix"
+        existing=$(ip -4 route show table main 2>/dev/null | awk -v net="$net" -v dst="$dst" '$1==net || $1==dst')
+        if [ -n "$existing" ]; then
+            if printf '%s\n' "$existing" | awk -v dev="$VPN_IF" 'BEGIN{bad=0} {found=0; for(i=1;i<NF;i++) if($i=="dev" && $(i+1)==dev)found=1; if(!found)bad=1} END {exit bad}'; then
+                [ "$ACTION" = status ] || echo "✓ $net через $VPN_IF"
+            else
+                echo "⚠️ $net уже направлен через другой интерфейс, не трогаю"
+                failed=1
+            fi
+            continue
+        fi
+        [ "$ACTION" = status ] && { echo "· $net не установлен"; continue; }
+        if ip -4 route add "$net" dev "$VPN_IF" src "$VPN_SRC" table main 2>/dev/null; then
+            echo "✓ Временный маршрут $net через $VPN_IF"
+        else
+            echo "⚠️ Не удалось создать маршрут $net через $VPN_IF"
+            failed=1
+        fi
+    done
+    return "$failed"
+}
+
+if [ "$ACTION" = fallback-repair ]; then
+    [ -f "$MARKER" ] || exit 0
+    [ "$(cat "$MARKER" 2>/dev/null)" = "$VPN_IF" ] || exit 0
+    repair_linux_routes
+    exit $?
+fi
+
+K_IF=$(resolve_keenetic_interface 2>/dev/null) || K_IF=''
+if [ -z "$K_IF" ]; then
+    echo "ℹ️ $VPN_IF не зарегистрирован в KeeneticOS; использую Linux-маршруты с восстановлением по событиям."
+    if [ "$ACTION" = apply ]; then
+        install_fallback_hooks || { echo '⚠️ Не удалось включить восстановление маршрутов'; exit 1; }
+    fi
+    repair_linux_routes
+    exit $?
+fi
+
+echo "Telegram: $VPN_IF соответствует интерфейсу KeeneticOS $K_IF"
+[ "$ACTION" = status ] || remove_fallback_hooks
+BEFORE=$(get_running_config) || { echo '⚠️ Не удалось прочитать конфигурацию KeeneticOS'; exit 1; }
+[ -n "$BEFORE" ] || { echo '⚠️ Конфигурация KeeneticOS пуста'; exit 1; }
+
+# Check ALL conflicting routes before modifying anything.
+for entry in $TG_NETS; do
+    dst=${entry%%|*}; rem=${entry#*|}; prefix=${rem%%|*}; mask=${rem#*|}
+    existing=$(printf '%s\n' "$BEFORE" | find_routes "$dst" "$prefix" "$mask")
+    if [ -n "$existing" ] && ! printf '%s\n' "$existing" | route_via_selected; then
+        echo "⚠️ Статический маршрут $dst/$prefix уже ведёт через другой интерфейс. Ничего не меняю."
+        exit 1
+    fi
+done
+
+changed=0
+failed=0
+for entry in $TG_NETS; do
+    dst=${entry%%|*}; rem=${entry#*|}; prefix=${rem%%|*}; mask=${rem#*|}
+    existing=$(printf '%s\n' "$BEFORE" | find_routes "$dst" "$prefix" "$mask")
+    if [ -n "$existing" ]; then
+        echo "✓ $dst/$prefix уже закреплён за $K_IF"
+        continue
+    fi
+    [ "$ACTION" = status ] && { echo "· $dst/$prefix не настроен"; continue; }
+    if [ "$prefix" = 32 ]; then
+        cmd="ip route $dst $K_IF auto"
+    else
+        cmd="ip route $dst $mask $K_IF auto"
+    fi
+    if ! "$NDMC" -c "$cmd" >/dev/null 2>&1; then
+        echo "⚠️ KeeneticOS не принял маршрут $dst/$prefix"; failed=1; continue
+    fi
+    current=$(get_running_config) || { failed=1; continue; }
+    found=$(printf '%s\n' "$current" | find_routes "$dst" "$prefix" "$mask")
+    if [ -n "$found" ] && printf '%s\n' "$found" | route_via_selected; then
+        echo "✓ Создан постоянный маршрут $dst/$prefix через $K_IF"
+        changed=1; BEFORE=$current
+    else
+        echo "⚠️ Не удалось подтвердить маршрут $dst/$prefix"; failed=1
+    fi
+done
+if [ "$changed" = 1 ]; then
+    if "$NDMC" -c 'system configuration save' >/dev/null 2>&1; then
+        echo '✅ Маршруты Telegram сохранены в KeeneticOS'
+    else
+        echo '⚠️ KeeneticOS не сохранила конфигурацию'; failed=1
+    fi
+fi
+[ "$failed" = 0 ]
+RB_KEENETIC_TG_ROUTES_EOF
+chmod +x /opt/router_bot/telegram_routes_persist.sh
+
 sh /opt/router_bot/install.sh
 _RC=$?
+if [ "$_RC" -eq 0 ]; then
+    echo "→ Проверяю маршруты Telegram для выбранного интерфейса..."
+    /opt/router_bot/telegram_routes_persist.sh apply || \
+        echo '⚠️ Автоматическая защита маршрутов Telegram требует проверки'
+fi
 
 
 exit $_RC
