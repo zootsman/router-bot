@@ -1,7 +1,7 @@
 #!/bin/sh
 set -e
 
-SETUP_VERSION="0.0.10-02"
+SETUP_VERSION="0.0.10-03"
 VERSION_FILE="/opt/router_bot/VERSION"
 INSTALLED_VERSION=""
 if [ -f "$VERSION_FILE" ]; then
@@ -4053,13 +4053,12 @@ STATE=/var/run/routerbot.telegram_health
 [ -f "$CONF" ] || { echo 'WARNING: config.env missing'; exit 0; }
 . "$CONF"
 
-# Restore Telegram route if a managed VPN route actually exists. No DNS edits.
-if [ "$USE_VPN" = 'yes' ] && [ -n "$VPN_IF" ]; then
-    # Network self-healing is deliberately separate from bot process supervision.
-    if ! ip -4 route get 149.154.166.110 2>/dev/null | grep -Fq "dev $VPN_IF"; then
-        echo "WARNING: Telegram route does not use $VPN_IF; check rb routes"
-        # Do not blindly rebuild policy rules owned by other components.
-    fi
+# Self-healing of active Linux routes every minute through existing cron.
+# Never touch unrelated rules, DNS, or restart the bot due to Telegram outage.
+if [ "$USE_VPN" = 'yes' ] && [ -n "$VPN_IF" ] && \
+   [ -x /opt/router_bot/telegram_routes_persist.sh ]; then
+    /opt/router_bot/telegram_routes_persist.sh repair >/dev/null 2>&1 || \
+        echo "WARNING: Telegram routes not fully restored ($VPN_IF); check rb routes"
 fi
 
 # Check process first, regardless of whether Telegram is reachable.
@@ -5344,102 +5343,16 @@ cp -f "$INIT_DIR/S98routerbot" /opt/router_bot/init/S98routerbot
 echo "✅ S98routerbot"
 
 # ---------- 11. init: S99routerbot_health ----------
-cat > "$INIT_DIR/S99routerbot_health" << 'EOF99'
-#!/bin/sh
-. /opt/router_bot/config.env
-
-# Если wrapper сдался (много падений подряд) — не пинать
-[ -f /var/run/routerbot.giveup ] && exit 0
-
-PIDFILE=/var/run/routerbot.pid
-STATE=/var/run/routerbot.fail
-
-# 0. Автодетект WAN IP
-if [ "$USE_VPN" = "yes" ] && [ -n "$VPN_IF" ]; then
-    # автодетект WAN-интерфейса
-    WAN_IF_NOW=""
-    if [ -n "$WAN_IF" ] && ip -4 -o addr show dev "$WAN_IF" 2>/dev/null | grep -q ' inet '; then
-        WAN_IF_NOW="$WAN_IF"
-    else
-        WAN_IF_NOW=$(ip route show default 2>/dev/null \
-            | awk '/^default/ {for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}')
-        [ -n "$WAN_IF_NOW" ] && [ "$WAN_IF_NOW" = "$VPN_IF" ] && WAN_IF_NOW=""
-        echo "$WAN_IF_NOW" | grep -qE '^(opkgtun|nwg|wg|tun)' && WAN_IF_NOW=""
-    fi
-    WAN_SRC_NOW=""
-    [ -n "$WAN_IF_NOW" ] && WAN_SRC_NOW=$(ip -4 -o addr show dev "$WAN_IF_NOW" 2>/dev/null \
-        | awk '{print $4}' | cut -d/ -f1 | head -1)
-    if [ -n "$WAN_SRC_NOW" ] && [ "$WAN_SRC_NOW" != "$WAN_SRC" ]; then
-        echo "WAN IP changed: $WAN_SRC -> $WAN_SRC_NOW"
-        sed -i "s|^WAN_SRC=.*|WAN_SRC='$WAN_SRC_NOW'|" /opt/router_bot/config.env 2>/dev/null || true
-        sed -i "s|^WAN_IF=.*|WAN_IF='$WAN_IF_NOW'|" /opt/router_bot/config.env 2>/dev/null || true
-        WAN_SRC="$WAN_SRC_NOW"
-        /opt/etc/init.d/S97tgroutes rebuild >/dev/null 2>&1 || true
-    fi
-fi
-
-# 1. Маршруты Telegram. Путь in-kernel проверяется независимо от NDM config.
-# repair использует только локальный ip; тяжёлый ndmc не запускается ежеминутно.
-if [ "$USE_VPN" = "yes" ] && [ -n "$VPN_IF" ] && \
-   [ -x /opt/router_bot/telegram_routes_persist.sh ]; then
-    /opt/router_bot/telegram_routes_persist.sh repair >/dev/null 2>&1 || \
-        echo "WARNING: active Telegram routes need attention ($VPN_IF)"
-fi
-
-# 2. resolv.conf
-if ! grep -q nameserver /etc/resolv.conf 2>/dev/null; then
-    printf 'nameserver 127.0.0.1\nnameserver 8.8.8.8\noptions timeout:1 attempts:1 rotate\n' > /etc/resolv.conf
-fi
-
-# 3. Проверка связи с Telegram
-TG=$(sed -n "s/^TG_BOT_TOKEN='\(.*\)'/\1/p" /opt/router_bot/config.env)
-_c4=""
-if [ "$DISABLE_IPV6" = "yes" ]; then
-    _c4="-4"
-fi
-
-# Проверяем именно HTTP-код (любой ответ = сеть жива)
-_http_code=$(/opt/bin/curl $_c4 -s -o /dev/null -w "%{http_code}" --connect-timeout 5 --max-time 10 "https://api.telegram.org/bot${TG}/getMe" 2>/dev/null)
-case "$DISABLE_IPV6" in
-    yes|1|true|on) : ;; # IPv6 намеренно отключён: проверяем только IPv4.
-    *)
-        # При разрешённом IPv6 проверяем оба семейства независимо,
-        # чтобы сбой одного стека не считался полным отсутствием связи.
-        case "$_http_code" in ''|000)
-            _code4=$(/opt/bin/curl -4 -s -o /dev/null -w "%{http_code}" --connect-timeout 4 --max-time 8 "https://api.telegram.org/bot${TG}/getMe" 2>/dev/null)
-            _code6=$(/opt/bin/curl -6 -s -o /dev/null -w "%{http_code}" --connect-timeout 4 --max-time 8 "https://api.telegram.org/bot${TG}/getMe" 2>/dev/null)
-            case "$_code4" in [234][0-9][0-9]) _http_code="$_code4" ;; *) case "$_code6" in [234][0-9][0-9]) _http_code="$_code6" ;; esac ;; esac
-            ;;
-        esac
-        ;;
-esac
-
-if [ "$_http_code" -ge 200 ] 2>/dev/null && [ "$_http_code" -lt 500 ] 2>/dev/null; then
-    rm -f "$STATE"
-else
-    COUNT=$(cat "$STATE" 2>/dev/null || echo 0)
-    COUNT=$((COUNT + 1))
-    echo "$COUNT" > "$STATE"
-    echo "Telegram unreachable (HTTP code: $_http_code, failure $COUNT)"
-    if [ "$COUNT" -ge 3 ]; then
-        rm -f "$STATE"
-        /opt/etc/init.d/S98routerbot restart
-    fi
-    exit 0
-fi
-
-# 4. Процесс мёртв — перезапустить
-if [ -f "$PIDFILE" ] && kill -0 "$(cat $PIDFILE)" 2>/dev/null; then
-    exit 0
-fi
-
-echo "Bot process is dead, restarting..."
-/opt/etc/init.d/S98routerbot restart
-EOF99
+# В версии 0.0.10-02 здесь повторно генерировался УСТАРЕВШИЙ S99,
+# который перезаписывал безопасный healthcheck из основного пакета.
+# Единственный исходник healthcheck уже создан в /opt/router_bot/init/
+# при распаковке. Просто синхронизируем его без изменения логики.
+[ -f "$BASE_DIR/init/S99routerbot_health" ] || {
+    echo "❌ Нет $BASE_DIR/init/S99routerbot_health"; exit 1;
+}
+cp -f "$BASE_DIR/init/S99routerbot_health" "$INIT_DIR/S99routerbot_health"
 chmod +x "$INIT_DIR/S99routerbot_health"
-mkdir -p /opt/router_bot/init
-cp -f "$INIT_DIR/S99routerbot_health" /opt/router_bot/init/S99routerbot_health
-echo "✅ S99routerbot_health"
+echo "✅ S99routerbot_health (единый безопасный исходник)"
 
 # ---------- 12. logrotate ----------
 mkdir -p /opt/etc/logrotate.d
