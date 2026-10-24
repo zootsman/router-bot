@@ -1,7 +1,7 @@
 #!/bin/sh
 set -e
 
-SETUP_VERSION="0.0.10-01"
+SETUP_VERSION="0.0.10-02"
 VERSION_FILE="/opt/router_bot/VERSION"
 INSTALLED_VERSION=""
 if [ -f "$VERSION_FILE" ]; then
@@ -118,6 +118,9 @@ _RB_MANAGED='/opt/router_bot/core /opt/router_bot/modules /opt/router_bot/init
 /opt/router_bot/main.py /opt/router_bot/install.sh /opt/router_bot/uninstall.sh
 /opt/router_bot/ensure_init.sh /opt/router_bot/restore_init.sh
 /opt/router_bot/telegram_routes_persist.sh
+/opt/etc/ndm/ifcreated.d/95-routerbot-telegram-routes.sh
+/opt/etc/ndm/iflayerchanged.d/95-routerbot-telegram-routes.sh
+/opt/etc/ndm/ifipchanged.d/95-routerbot-telegram-routes.sh
 /opt/router_bot/VERSION /opt/router_bot/config.env /opt/router_bot/config.env.bak
 /opt/bin/rb /opt/bin/routerbot_wrapper.sh
 /opt/etc/init.d/S97tgroutes /opt/etc/init.d/S98routerbot /opt/etc/init.d/S99routerbot_health
@@ -3953,7 +3956,7 @@ echo "  → /opt/router_bot/init/S97tgroutes"
 cat > '/opt/router_bot/init/S97tgroutes' << 'RB_INIT_S97TGROUTES_EOF'
 #!/bin/sh
 # Router Bot Telegram route service. Uses the interface chosen in config.env.
-# Persistent NDM route where supported; NDM-event repair for standalone TUN.
+# Persistent NDM routes where available + kernel repair for every selected VPN.
 PERSIST=/opt/router_bot/telegram_routes_persist.sh
 case "${1:-start}" in
     start|rebuild)
@@ -5375,12 +5378,12 @@ if [ "$USE_VPN" = "yes" ] && [ -n "$VPN_IF" ]; then
     fi
 fi
 
-# 1. Маршруты Telegram
-if [ "$USE_VPN" = "yes" ] && [ -n "$VPN_IF" ] && [ -n "$WAN_SRC" ]; then
-    if ! ip route get 149.154.166.110 from "$WAN_SRC" 2>/dev/null | grep -q "$VPN_IF"; then
-        echo "Restoring Telegram routes via $VPN_IF..."
-        /opt/etc/init.d/S97tgroutes rebuild >/dev/null 2>&1 || true
-    fi
+# 1. Маршруты Telegram. Путь in-kernel проверяется независимо от NDM config.
+# repair использует только локальный ip; тяжёлый ndmc не запускается ежеминутно.
+if [ "$USE_VPN" = "yes" ] && [ -n "$VPN_IF" ] && \
+   [ -x /opt/router_bot/telegram_routes_persist.sh ]; then
+    /opt/router_bot/telegram_routes_persist.sh repair >/dev/null 2>&1 || \
+        echo "WARNING: active Telegram routes need attention ($VPN_IF)"
 fi
 
 # 2. resolv.conf
@@ -23675,21 +23678,21 @@ done
 sleep 1
 echo "→ Запускаю установщик..."
 echo ""
-# ROUTERBOT-KEENETIC-TG-STATIC-ROUTES-v1
+# ROUTERBOT-KEENETIC-TG-STATIC-ROUTES-v2
 cat > /opt/router_bot/telegram_routes_persist.sh << 'RB_KEENETIC_TG_ROUTES_EOF'
 #!/bin/sh
 # Telegram routes for the VPN interface SELECTED by the user during Router Bot installation.
 # Keenetic-managed interfaces: persistent ndmc routes, saved to KeeneticOS configuration.
-# Unmanaged Linux TUN: conservative in-kernel routes restored on interface-change hooks.
+# All selected VPN types: reconcile active kernel routes on router network events.
+# A saved NDM route is not proof that the route is active in Linux table main.
 # Never overwrite an existing static route pointing elsewhere.
 CONF=/opt/router_bot/config.env
 NDMC=/bin/ndmc
-MARKER=/opt/router_bot/data/telegram_routes_linux_fallback
 HOOK=95-routerbot-telegram-routes.sh
 ACTION=${1:-apply}
 TG_NETS='149.154.166.110|32|255.255.255.255 149.154.160.0|20|255.255.240.0 91.108.4.0|22|255.255.252.0'
 
-case "$ACTION" in apply|status|fallback-repair) ;; *) echo 'Использование: telegram_routes_persist.sh {apply|status|fallback-repair}'; exit 2 ;; esac
+case "$ACTION" in apply|status|repair|fallback-repair) ;; *) echo 'Использование: telegram_routes_persist.sh {apply|status|repair}'; exit 2 ;; esac
 [ -f "$CONF" ] || { echo 'Telegram: config.env отсутствует'; exit 1; }
 
 read_key() {
@@ -23775,66 +23778,88 @@ route_via_selected() {
     END { exit !(found && !bad) }'
 }
 
-remove_fallback_hooks() {
-    rm -f "$MARKER" \
-        "/opt/etc/ndm/ifcreated.d/$HOOK" \
-        "/opt/etc/ndm/iflayerchanged.d/$HOOK" \
-        "/opt/etc/ndm/ifipchanged.d/$HOOK"
-}
-install_fallback_hooks() {
-    mkdir -p /opt/router_bot/data /opt/etc/ndm/ifcreated.d \
-             /opt/etc/ndm/iflayerchanged.d /opt/etc/ndm/ifipchanged.d || return 1
-    printf '%s\n' "$VPN_IF" > "$MARKER" || return 1
+# Install NDM hooks for EVERY selected tunnel type, including OpkgTun and WireGuard.
+# Existing v1 version accidentally installed them only for unmanaged Linux tun devices.
+install_repair_hooks() {
     for d in /opt/etc/ndm/ifcreated.d /opt/etc/ndm/iflayerchanged.d /opt/etc/ndm/ifipchanged.d; do
+        mkdir -p "$d" || return 1
         cat > "$d/$HOOK" <<'HOOKEOF'
 #!/bin/sh
-# Router Bot managed hook. Never touches unrelated software.
+# Router Bot managed hook. Runs shortly after KeeneticOS interface changes.
 [ "$1" = hook ] || exit 0
-[ -f /opt/router_bot/data/telegram_routes_linux_fallback ] || exit 0
+[ -x /opt/router_bot/telegram_routes_persist.sh ] || exit 0
 (
     sleep 3
-    /opt/router_bot/telegram_routes_persist.sh fallback-repair >/dev/null 2>&1
-    sleep 4
-    /opt/router_bot/telegram_routes_persist.sh fallback-repair >/dev/null 2>&1
+    /opt/router_bot/telegram_routes_persist.sh repair >/dev/null 2>&1
+    sleep 5
+    /opt/router_bot/telegram_routes_persist.sh repair >/dev/null 2>&1
 ) >/dev/null 2>&1 &
 exit 0
 HOOKEOF
         chmod 755 "$d/$HOOK" || return 1
     done
+    # Remove old marker from v1. Hooks no longer require this file.
+    rm -f /opt/router_bot/data/telegram_routes_linux_fallback
 }
 
-# Fallback for a kernel TUN without a KeeneticOS-managed interface.
-# ip route persists neither across reboot nor NDM route recalculation; hooks +
-# bot init/health repair it. Do not overwrite routes to other devices.
+# Explicit, safe reconciliation for Linux table main. An NDM route in
+# running-config can be temporarily missing from the kernel after a VPN change.
+# Route creation is ADD-only: never replace or delete someone else's entry.
+# Preflight all three exact destinations before making any modification.
 repair_linux_routes() {
     failed=0
+    kernel_before=$(ip -4 route show table main 2>/dev/null) || {
+        echo '⚠️ Не удалось прочитать Linux main'; return 1;
+    }
     for entry in $TG_NETS; do
         dst=${entry%%|*}; rem=${entry#*|}; prefix=${rem%%|*}
         net="$dst/$prefix"
-        existing=$(ip -4 route show table main 2>/dev/null | awk -v net="$net" -v dst="$dst" '$1==net || $1==dst')
-        if [ -n "$existing" ]; then
-            if printf '%s\n' "$existing" | awk -v dev="$VPN_IF" 'BEGIN{bad=0} {found=0; for(i=1;i<NF;i++) if($i=="dev" && $(i+1)==dev)found=1; if(!found)bad=1} END {exit bad}'; then
-                [ "$ACTION" = status ] || echo "✓ $net через $VPN_IF"
-            else
-                echo "⚠️ $net уже направлен через другой интерфейс, не трогаю"
-                failed=1
-            fi
-            continue
-        fi
-        [ "$ACTION" = status ] && { echo "· $net не установлен"; continue; }
-        if ip -4 route add "$net" dev "$VPN_IF" src "$VPN_SRC" table main 2>/dev/null; then
-            echo "✓ Временный маршрут $net через $VPN_IF"
-        else
-            echo "⚠️ Не удалось создать маршрут $net через $VPN_IF"
+        existing=$(printf '%s\n' "$kernel_before" |
+            awk -v net="$net" -v dst="$dst" '$1==net || $1==dst')
+        [ -n "$existing" ] || continue
+        if ! printf '%s\n' "$existing" | awk -v dev="$VPN_IF" '
+            {found=0; for(i=1;i<NF;i++) if($i=="dev" && $(i+1)==dev)found=1;
+             if(!found)bad=1} END{exit bad}' ; then
+            echo "⚠️ $net в Linux main направлен не через $VPN_IF; чужой маршрут не изменён"
             failed=1
         fi
     done
+    [ "$failed" -eq 0 ] || return 1
+
+    for entry in $TG_NETS; do
+        dst=${entry%%|*}; rem=${entry#*|}; prefix=${rem%%|*}
+        net="$dst/$prefix"
+        existing=$(printf '%s\n' "$kernel_before" |
+            awk -v net="$net" -v dst="$dst" '$1==net || $1==dst')
+        if [ -n "$existing" ]; then
+            [ "$ACTION" = repair ] || [ "$ACTION" = fallback-repair ] || \
+                echo "✓ Активный маршрут $net через $VPN_IF"
+            continue
+        fi
+        if [ "$ACTION" = status ]; then
+            echo "✗ $net настроен, но отсутствует в Linux main"
+            failed=1
+            continue
+        fi
+        if ip -4 route add "$net" dev "$VPN_IF" src "$VPN_SRC" table main 2>/dev/null; then
+            echo "✓ Восстановлен Linux-маршрут $net через $VPN_IF"
+        else
+            echo "⚠️ Не удалось восстановить Linux-маршрут $net через $VPN_IF"
+            failed=1
+        fi
+    done
+    # Both routing tables and ip rule priorities affect the actual decision.
+    # Report a warning instead of silently declaring a saved config sufficient.
+    actual=$(ip -4 route get 149.154.166.110 2>/dev/null | head -1)
+    case " $actual " in
+        *" dev $VPN_IF "*) : ;;
+        *) echo "⚠️ Фактический маршрут к Telegram не через $VPN_IF: ${actual:-нет маршрута}";
+           failed=1 ;;
+    esac
     return "$failed"
 }
 
-if [ "$ACTION" = fallback-repair ]; then
-    [ -f "$MARKER" ] || exit 0
-    [ "$(cat "$MARKER" 2>/dev/null)" = "$VPN_IF" ] || exit 0
+if [ "$ACTION" = repair ] || [ "$ACTION" = fallback-repair ]; then
     repair_linux_routes
     exit $?
 fi
@@ -23843,14 +23868,18 @@ K_IF=$(resolve_keenetic_interface 2>/dev/null) || K_IF=''
 if [ -z "$K_IF" ]; then
     echo "ℹ️ $VPN_IF не зарегистрирован в KeeneticOS; использую Linux-маршруты с восстановлением по событиям."
     if [ "$ACTION" = apply ]; then
-        install_fallback_hooks || { echo '⚠️ Не удалось включить восстановление маршрутов'; exit 1; }
+        install_repair_hooks || { echo '⚠️ Не удалось включить восстановление маршрутов'; exit 1; }
     fi
     repair_linux_routes
     exit $?
 fi
 
 echo "Telegram: $VPN_IF соответствует интерфейсу KeeneticOS $K_IF"
-[ "$ACTION" = status ] || remove_fallback_hooks
+# Keenetic-managed tunnels also need hooks: NDM may temporarily withdraw its
+# routes when another VPN interface is created.
+[ "$ACTION" != apply ] || install_repair_hooks || {
+    echo '⚠️ Не удалось установить хуки маршрутов'; exit 1;
+}
 BEFORE=$(get_running_config) || { echo '⚠️ Не удалось прочитать конфигурацию KeeneticOS'; exit 1; }
 [ -n "$BEFORE" ] || { echo '⚠️ Конфигурация KeeneticOS пуста'; exit 1; }
 
@@ -23898,6 +23927,9 @@ if [ "$changed" = 1 ]; then
         echo '⚠️ KeeneticOS не сохранила конфигурацию'; failed=1
     fi
 fi
+# Crucial: reconcile the ACTIVE table even if all three permanent NDM routes
+# were already present. This is the reported 0.0.10-01 regression.
+repair_linux_routes || failed=1
 [ "$failed" = 0 ]
 RB_KEENETIC_TG_ROUTES_EOF
 chmod +x /opt/router_bot/telegram_routes_persist.sh
