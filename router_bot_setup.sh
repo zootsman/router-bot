@@ -1,8 +1,37 @@
 #!/bin/sh
 set -e
 
-SETUP_VERSION="0.0.10-03"
+SETUP_VERSION="0.0.10-06"
 VERSION_FILE="/opt/router_bot/VERSION"
+# Не допускаем параллельной записи файлов двумя установщиками.
+_RB_INSTALL_LOCK=/opt/tmp/routerbot-install.lock
+mkdir -p /opt/tmp
+if ! mkdir "$_RB_INSTALL_LOCK" 2>/dev/null; then
+    _rb_lock_pid=$(cat "$_RB_INSTALL_LOCK/pid" 2>/dev/null || true)
+    case "$_rb_lock_pid" in
+        ''|*[!0-9]*) sleep 1; _rb_lock_pid=$(cat "$_RB_INSTALL_LOCK/pid" 2>/dev/null || true) ;;
+    esac
+    case "$_rb_lock_pid" in
+        ''|*[!0-9]*) _rb_lock_alive=no ;;
+        *) if kill -0 "$_rb_lock_pid" 2>/dev/null; then _rb_lock_alive=yes; else _rb_lock_alive=no; fi ;;
+    esac
+    if [ "$_rb_lock_alive" = yes ]; then
+        echo "❌ Router Bot уже устанавливается (PID $_rb_lock_pid)."
+        exit 1
+    fi
+    # Блокировка осталась от аварийного завершения прежней установки.
+    rm -f "$_RB_INSTALL_LOCK/pid"
+    rmdir "$_RB_INSTALL_LOCK" 2>/dev/null || { echo '❌ Не удалось снять старую блокировку'; exit 1; }
+    mkdir "$_RB_INSTALL_LOCK" 2>/dev/null || { echo '❌ Идёт другая установка'; exit 1; }
+fi
+printf '%s\n' "$$" > "$_RB_INSTALL_LOCK/pid"
+_rb_release_install_lock() {
+    if [ -f "$_RB_INSTALL_LOCK/pid" ] && [ "$(cat "$_RB_INSTALL_LOCK/pid" 2>/dev/null)" = "$$" ]; then
+        rm -f "$_RB_INSTALL_LOCK/pid"
+        rmdir "$_RB_INSTALL_LOCK" 2>/dev/null || true
+    fi
+}
+trap '_rb_release_install_lock' 0
 INSTALLED_VERSION=""
 if [ -f "$VERSION_FILE" ]; then
     INSTALLED_VERSION=$(cat "$VERSION_FILE" 2>/dev/null | tr -d " \n\r")
@@ -54,6 +83,10 @@ if [ -n "$INSTALLED_VERSION" ]; then
     echo "В архиве:     $SETUP_VERSION"
     echo ""
     cmp=$(ver_cmp "$INSTALLED_VERSION" "$SETUP_VERSION")
+    if [ "${RB_NONINTERACTIVE:-}" = 1 ] && [ "$cmp" != -1 ]; then
+        echo "Router Bot: установлено $INSTALLED_VERSION, пакет $SETUP_VERSION; обновление не требуется."
+        exit 0
+    fi
     case "$cmp" in
         -1) MODE="upgrade" ;;
         0)
@@ -180,7 +213,14 @@ _rb_rollback() {
     rm -rf "$_RB_SAVE"
     return "$_rb_rc"
 }
-trap '_rb_rollback $?' 0
+_rb_finish() {
+    _rb_exit_status=$1
+    set +e
+    _rb_rollback "$_rb_exit_status"
+    _rb_release_install_lock
+    return "$_rb_exit_status"
+}
+trap '_rb_finish $?' 0
 trap 'exit 130' INT
 trap 'exit 143' TERM
 trap 'exit 129' HUP
@@ -833,7 +873,7 @@ def _build_modules_menu(pending: set):
 
     rows.append([
         InlineKeyboardButton('\u2705 Все', callback_data='router:mod:all'),
-        InlineKeyboardButton('\u2b1c Ничего', callback_data='router:mod:none'),
+        InlineKeyboardButton('\u2b1c Только Net Watch', callback_data='router:mod:none'),
     ])
     rows.append([
         InlineKeyboardButton('\u2705 Применить', callback_data='router:mod:apply'),
@@ -855,7 +895,6 @@ async def _on_modules_menu(q, ctx):
 
 
 async def _on_module_toggle(q, ctx, name):
-    await q.answer()
     pending = ctx.chat_data.get('pending_modules')
     if pending is None:
         pending = _read_enabled_modules()
@@ -866,6 +905,7 @@ async def _on_module_toggle(q, ctx, name):
         pending.discard(name)
     else:
         pending.add(name)
+    await q.answer()
     ctx.chat_data['pending_modules'] = pending
     text, kb = _build_modules_menu(pending)
     try:
@@ -1007,6 +1047,7 @@ async def _cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     # Telegram says "message is not modified", making /start appear broken.
     log.info('/start received; opening a fresh main menu')
     router = ctx.application.bot_data['router']
+    ctx.application.bot_data['_active_module'] = None
     for mod in router.all():
         if hasattr(mod, 'on_leave'):
             try:
@@ -1179,7 +1220,22 @@ async def _on_self_update_now(q, ctx):
         pass
     try:
         path = await asyncio.to_thread(_download_and_verify)
-        log.info('self-update: downloaded %s (%d байт)', path, os.path.getsize(path))
+        # Под старой кнопкой может оказаться уже установленный или устаревший
+        # архив зеркала. Не запускаем его и не предлагаем downgrade.
+        with open(path, 'rb') as downloaded:
+            header = downloaded.read(4096).decode('utf-8', errors='replace')
+        match = re.search(r'^SETUP_VERSION="([^"]+)"', header, re.MULTILINE)
+        if not match:
+            raise RuntimeError('Номер версии отсутствует в загруженном архиве')
+        package_version = match.group(1)
+        current_version = _read_current_version()
+        if current_version and _ver_cmp(package_version, current_version) <= 0:
+            await q.edit_message_text(
+                f'✅ Обновление не требуется. Установлена версия {current_version}; '
+                f'загружена {package_version}.')
+            return
+        log.info('self-update: downloaded %s (%d байт), version=%s',
+                 path, os.path.getsize(path), package_version)
     except Exception as e:
         log.exception('self-update: download failed: %s', e)
         try:
@@ -1311,6 +1367,7 @@ async def _on_mirror_apply(q, ctx, idx):
 
 async def _cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     router = ctx.application.bot_data['router']
+    ctx.application.bot_data['_active_module'] = None
     for mod in router.all():
         if hasattr(mod, 'on_leave'):
             try:
@@ -1359,10 +1416,37 @@ async def _on_router_main(query, ctx):
             raise
 
 
+async def _activate_module(router, ctx, target_name):
+    """Close previous module input before switching the active UI flow."""
+    previous = ctx.application.bot_data.get('_active_module')
+    if previous == target_name:
+        return
+    if previous:
+        old_module = router.get(previous)
+        if old_module and hasattr(old_module, 'on_leave'):
+            try:
+                await old_module.on_leave()
+            except Exception as exc:
+                log.warning('on_leave %s failed: %s', previous, exc)
+    ctx.application.bot_data['_active_module'] = target_name
+
+
+async def _dispatch_module_text(update, ctx):
+    """Single TEXT handler for BIRD/Flashkeen/Keen-PBR/MTProxy/Usque."""
+    name = ctx.application.bot_data.get('_active_module')
+    if name not in ('bird', 'flashkeen', 'keen_pbr', 'mtproxy', 'usque_keenetic'):
+        return
+    mod = ctx.application.bot_data['router'].get(name)
+    if mod is not None:
+        await mod._handle_text(update, ctx)
+
+
 def _register_module_open_handler(app, mod, cmd_name):
     """Открывает карточку модуля по /<cmd_name>."""
     async def _open(update, ctx, _mod=mod):
         try:
+            await _activate_module(ctx.application.bot_data['router'], ctx,
+                                   _mod.name)
             if hasattr(_mod, 'send_card_message'):
                 await _mod.send_card_message(update, ctx)
             else:
@@ -1379,12 +1463,49 @@ def _register_module_open_handler(app, mod, cmd_name):
 
 
 async def _router_error_handler(update, context):
-    """Always log unhandled PTB errors; notify owner without leaking tokens."""
+    """Do not turn recoverable getUpdates disconnects into owner alerts.
+
+    PTB forwards polling network failures to process_error(update=None).
+    Its own retry loop keeps polling; noisy admin notifications are not evidence
+    that the bot has stopped. Real update/job errors still reach the owner.
+    """
+    from telegram.error import BadRequest, NetworkError
+
     err = context.error
+    if err is None:
+        return
+
+    is_poll_network_failure = (
+        update is None
+        and getattr(context, 'job', None) is None
+        and getattr(context, 'coroutine', None) is None
+        and isinstance(err, NetworkError)
+        and not isinstance(err, BadRequest)
+    )
+    if is_poll_network_failure:
+        # Record an occasional compact warning, without flooding the logs
+        # with full tracebacks for normal Telegram long-poll retry attempts.
+        data = context.application.bot_data
+        count = data.get('_poll_net_error_count', 0) + 1
+        data['_poll_net_error_count'] = count
+        now = time.monotonic()
+        last = data.get('_poll_net_error_last_log')
+        if last is None or now - last >= 300:
+            cause = getattr(err, '__cause__', None)
+            detail = type(cause).__name__ if cause else type(err).__name__
+            log.warning('Telegram getUpdates: временная сетевая ошибка (%s); '
+                        'случаев за период: %d; повторная попытка выполняется PTB',
+                        detail, count)
+            data['_poll_net_error_last_log'] = now
+            data['_poll_net_error_count'] = 0
+        return
+
+    # Any error from an actual update, job or non-network background operation
+    # must remain visible. Preserve the existing 15-minute alert cooldown.
     log.error('Unhandled Telegram handler error (%s)', type(err).__name__,
-              exc_info=(type(err), err, err.__traceback__) if err else None)
+              exc_info=(type(err), err, err.__traceback__))
     now = time.monotonic()
-    last = context.application.bot_data.get('_last_error_report', 0)
+    last = context.application.bot_data.get('_last_error_report', float('-inf'))
     if now - last < 900:
         return
     context.application.bot_data['_last_error_report'] = now
@@ -1407,6 +1528,10 @@ async def post_init(app):
             await mod.startup(app)
         except Exception as e:
             log.exception('Module %s startup failed: %s', mod.name, e)
+    from telegram.ext import MessageHandler, filters
+    app.add_handler(MessageHandler(
+        filters.TEXT & ~filters.COMMAND, _dispatch_module_text,
+    ), group=0)
     cmds = [
         BotCommand('start',   '\U0001f680 Главное меню'),
         BotCommand('help',    '\u2753 Помощь'),
@@ -1438,11 +1563,20 @@ async def post_init(app):
     )
     app.bot_data['_router_background_tasks'] = background
     log.info('self-update loop started (interval %ss)', _UPDATE_CHECK_INTERVAL)
+    try:
+        with open('/var/run/routerbot.ready', 'w') as ready:
+            ready.write(str(os.getpid()) + '\n')
+    except OSError as exc:
+        log.error('Cannot write routerbot.ready: %s', exc)
     log.info('Router bot started')
 
 
 async def post_stop(app):
     """Stop background tasks cleanly before PTB closes the HTTP session."""
+    try:
+        os.unlink('/var/run/routerbot.ready')
+    except FileNotFoundError:
+        pass
     tasks = app.bot_data.pop('_router_background_tasks', ())
     for task in tasks:
         if not task.done():
@@ -1606,6 +1740,7 @@ def main():
             _mn = q.data[:-len(':edit_new')]
             _m = ctx.application.bot_data['router'].get(_mn)
             if _m and hasattr(_m, '_ask_new_config'):
+                await _activate_module(router, ctx, _mn)
                 await _m._ask_new_config(q, ctx)
                 return
         if q.data == 'router:update_now':
@@ -1637,6 +1772,7 @@ def main():
         if q.data == 'router:mod:cancel':
             return await _on_modules_cancel(q, ctx)
         if q.data == 'router:main':
+            app.bot_data['_active_module'] = None
             # сбрасываем состояние всех модулей
             for mod in router.all():
                 if hasattr(mod, 'on_leave'):
@@ -1645,6 +1781,9 @@ def main():
                     except Exception as e:
                         log.warning('on_leave %s failed: %s', mod.name, e)
             return await _on_router_main(q, ctx)
+        prefix = (q.data or '').split(':', 1)[0]
+        if router.get(prefix) is not None:
+            await _activate_module(router, ctx, prefix)
         return await router.dispatch_callback(update, ctx)
 
     app.add_handler(CallbackQueryHandler(_global_callback))
@@ -1660,6 +1799,10 @@ def main():
     app.add_handler(_MH(_f.TEXT | _f.COMMAND, _delete_incoming), group=-999)
 
     log.info('Starting router bot...')
+    try:
+        os.unlink('/var/run/routerbot.ready')
+    except FileNotFoundError:
+        pass
     try:
         app.run_polling(drop_pending_updates=False)
     finally:
@@ -1761,6 +1904,10 @@ VER_FILE=$BOT_DIR/VERSION
 PIDFILE=/var/run/routerbot.pid
 GIVEUP=/var/run/routerbot.giveup
 
+# Читаем номер таблицы из пользовательского конфига; не предполагаем 16385.
+_RB_ROUTE_TABLE=$(sed -n "s/^ROUTE_TABLE=['\"]\{0,1\}\([0-9][0-9]*\)['\"]\{0,1\}$/\1/p" "$CONF" 2>/dev/null | head -1)
+case "$_RB_ROUTE_TABLE" in ''|*[!0-9]*) _RB_ROUTE_TABLE=16385 ;; esac
+
 show_help() {
     cat << 'EOF'
 
@@ -1842,11 +1989,11 @@ do_status() {
     fi
 
     echo "  Telegram-маршруты:"
-    R=$(ip rule show 2>/dev/null | grep 16385)
+    R=$(ip rule show 2>/dev/null | grep "$_RB_ROUTE_TABLE")
     if [ -n "$R" ]; then
         echo "$R" | sed 's/^/    /'
     else
-        echo "    (нет — table 16385 пуст)"
+        echo "    (нет — table $_RB_ROUTE_TABLE пуст)"
     fi
 
     echo "  Лог:         $LOG"
@@ -2019,16 +2166,24 @@ PYEOF
         esac
     done
 
-    # --- 3. Модули ---
-    _all_mods="net_watch,ssh_control,system,hydraroute,flashkeen,xkeen,bird,mtproxy,keen_pbr,neofit,usque_keenetic,awg_manager"
-    echo ""
-    echo "  Доступные модули:"
-    echo "    net_watch ssh_control system hydraroute flashkeen xkeen"
-    echo "    bird mtproxy keen_pbr neofit usque_keenetic"
-    if ! _rb_ci_ask "  Модули (через запятую, Enter = все)" "$_all_mods"; then
-        _abort; return 1
+    # --- 3. Все модули включаются автоматически, без меню выбора ---
+    # Используем auto-discovery, чтобы новые модули также попадали в config.env.
+    if ! _ci_mods_list=$(/opt/bin/python3 /opt/router_bot/core/list_modules.py 2>/dev/null); then
+        echo "  ❌ Не удалось получить список модулей"
+        return 1
     fi
-    _ci_mods="$_RB_CI_VAL"
+    _ci_mods=$(printf '%s\n' "$_ci_mods_list" | awk -F '|' '
+        $1 ~ /^[A-Za-z_][A-Za-z0-9_]*$/ {
+            if (out != "") out = out ","
+            out = out $1
+        }
+        END { print out }
+    ')
+    if [ -z "$_ci_mods" ]; then
+        echo "  ❌ Не найдены модули для включения"
+        return 1
+    fi
+    echo "  ✅ Все модули включены автоматически: $_ci_mods"
 
     # --- 4. POLL_INTERVAL ---
     if ! _rb_ci_ask "  Интервал опроса ndmc, сек" "5"; then
@@ -2626,11 +2781,11 @@ do_routes() {
     /bin/ndmc -c "show running-config" 2>/dev/null | \
         grep -E '^ip route (91\.108\.4\.0|149\.154\.160\.0|149\.154\.166\.110)' || true
     echo ""
-    echo "  === ip rule (table 16385) ==="
-    ip rule show 2>/dev/null | grep 16385 || echo "  (пусто)"
+    echo "  === ip rule (table $_RB_ROUTE_TABLE) ==="
+    ip rule show 2>/dev/null | grep "$_RB_ROUTE_TABLE" || echo "  (пусто)"
     echo ""
-    echo "  === ip route (table 16385) ==="
-    ip route show table 16385 2>/dev/null || echo "  (пусто)"
+    echo "  === ip route (table $_RB_ROUTE_TABLE) ==="
+    ip route show table $_RB_ROUTE_TABLE 2>/dev/null || echo "  (пусто)"
     echo ""
     echo "  === route get 149.154.166.110 ==="
     ip route get 149.154.166.110 2>/dev/null
@@ -2716,8 +2871,8 @@ case "$1" in
         printf "  4. Маршрут к TG: "
         ip route get 149.154.166.110 2>/dev/null | head -1
         echo ""
-        echo "  5. ip rule (table 16385):"
-        ip rule show | grep 16385 | sed 's/^/     /' || echo "     (пусто)"
+        echo "  5. ip rule (table $_RB_ROUTE_TABLE):"
+        ip rule show | grep "$_RB_ROUTE_TABLE" | sed 's/^/     /' || echo "     (пусто)"
         echo ""
         ;;
 
@@ -4297,6 +4452,14 @@ _MIRROR_BASES="http://bin.entware.net http://mirrors.nju.edu.cn/entware https://
 _OPKG_OK=0
 _OPKG_CONF_BAK=/tmp/routerbot-opkg.conf.$$
 _MIRROR_TMP=/tmp/routerbot-mirror-index.$$
+# Сначала пробуем настроенный пользователем Entware feed.
+# Исправное зеркало нельзя молча заменять просто из-за недостающего пакета.
+if opkg update >/dev/null 2>&1; then
+    _OPKG_OK=1
+    echo "  ✅ Текущее зеркало Entware работает, сохраняю настройки"
+else
+    echo "  ⚠️  Текущий Entware feed недоступен, проверю резервные зеркала"
+fi
 if [ -f /opt/etc/opkg.conf ]; then
     cp -p /opt/etc/opkg.conf "$_OPKG_CONF_BAK" || {
         echo "❌ Не удалось сохранить резервную копию opkg.conf; зеркала не меняю"
@@ -4331,6 +4494,7 @@ _mirror_index_valid() {
 }
 
 for _mb in $_MIRROR_BASES; do
+    [ "$_OPKG_OK" = 0 ] || break
     [ -n "$_entware_arch" ] || break
     _url="$_mb/$_entware_arch"
     [ -n "$_entware_suffix" ] && _url="$_url$_entware_suffix"
@@ -5015,98 +5179,45 @@ else
 fi
 echo ""
 
-# ---------- 5. Выбор модулей (auto-discovery) ----------
+# ---------- 5. Автоматическая активация всех модулей (auto-discovery) ----------
 echo "────────────────────────────────────────────"
-echo "  Выбор модулей"
+echo "  Автоматическая установка всех модулей"
 echo "────────────────────────────────────────────"
 echo ""
 
 if [ ! -x /opt/bin/python3 ]; then
-    echo "❌ python3 отсутствует — не могу получить список модулей"
+    echo "❌ python3 отсутствует — невозможно обнаружить модули"
     exit 1
 fi
 
-set +e
-_MODS_LIST=$(/opt/bin/python3 /opt/router_bot/core/list_modules.py 2>&1)
-_MODS_RC=$?
-set -e
-
-if [ "$_MODS_RC" != "0" ] || [ -z "$_MODS_LIST" ]; then
-    echo "❌ Не удалось получить список модулей (rc=$_MODS_RC)"
-    echo "$_MODS_LIST" | sed 's/^/     /'
+# Для каждого найденного модуля создаём исходники и включаем его в конфиг.
+# default_enabled не используется: пользователь явно выбрал установку всех.
+if ! _MODS_LIST=$(/opt/bin/python3 /opt/router_bot/core/list_modules.py 2>&1); then
+    echo "❌ Не удалось получить список модулей"
+    printf '%s\n' "$_MODS_LIST" | sed 's/^/     /'
     exit 1
 fi
 
-_MODS_FILE=/tmp/rb_modules_list.txt
-printf '%s\n' "$_MODS_LIST" > "$_MODS_FILE"
+ENABLED=$(printf '%s\n' "$_MODS_LIST" | awk -F '|' '
+    $1 ~ /^[A-Za-z_][A-Za-z0-9_]*$/ {
+        if (out != "") out = out ","
+        out = out $1
+        count++
+    }
+    END { print out }
+')
+_MODS_TOTAL=$(printf '%s\n' "$_MODS_LIST" | awk -F '|' '
+    $1 ~ /^[A-Za-z_][A-Za-z0-9_]*$/ { count++ }
+    END { print count + 0 }
+')
 
-_MODS_TOTAL=0
-while IFS='|' read -r _mname _mtitle _micon _mdesc _mcat _mdef; do
-    [ -n "$_mname" ] && _MODS_TOTAL=$((_MODS_TOTAL+1))
-done < "$_MODS_FILE"
-
-if [ "$_MODS_TOTAL" = "0" ]; then
+if [ -z "$ENABLED" ] || [ "$_MODS_TOTAL" -eq 0 ]; then
     echo "❌ В /opt/router_bot/modules/ не найдено ни одного модуля"
-    rm -f "$_MODS_FILE"
     exit 1
 fi
 
-echo "Найдено модулей: $_MODS_TOTAL"
-echo ""
-
-ENABLED=""
-printf "Установить все модули без вопросов? (y/N): "
-read ANS_ALL
-echo ""
-
-if [ "$ANS_ALL" = "y" ] || [ "$ANS_ALL" = "Y" ]; then
-    _COUNT=0
-    while IFS='|' read -r _mname _mtitle _micon _mdesc _mcat _mdef; do
-        [ -z "$_mname" ] && continue
-        [ "$_mdef" = "1" ] || continue
-        ENABLED="$ENABLED,$_mname"
-        _COUNT=$((_COUNT+1))
-    done < "$_MODS_FILE"
-    echo "════════════════════════════════════════════"
-    echo "  ✅ Выбрано: установка ВСЕХ модулей ($_COUNT)"
-    echo "════════════════════════════════════════════"
-    echo ""
-    while IFS='|' read -r _mname _mtitle _micon _mdesc _mcat _mdef; do
-        [ -z "$_mname" ] && continue
-        [ "$_mdef" = "1" ] || continue
-        printf "  %s %s — %s\n" "$_micon" "$_mtitle" "$_mdesc"
-    done < "$_MODS_FILE"
-    echo ""
-else
-    echo "По умолчанию все модули будут установлены."
-    echo "Введите 'n' чтобы пропустить любой из них."
-    echo ""
-    while IFS='|' read -r _mname _mtitle _micon _mdesc _mcat _mdef; do
-        [ -z "$_mname" ] && continue
-        printf "%s %s\n" "$_micon" "$_mtitle"
-        [ -n "$_mdesc" ] && printf "   %s\n" "$_mdesc"
-        printf "   Установить? (Y/n): "
-        read _ans_mod
-        case "$_ans_mod" in
-            n|N) printf "   ⏭  %s пропущен\n" "$_mtitle" ;;
-            *)   ENABLED="$ENABLED,$_mname"; printf "   ✅ %s будет установлен\n" "$_mtitle" ;;
-        esac
-        echo ""
-    done < "$_MODS_FILE"
-fi
-
-rm -f "$_MODS_FILE"
-
-ENABLED=$(echo "$ENABLED" | sed 's/^,//')
-
-if [ -z "$ENABLED" ]; then
-    echo "❌ Не выбран ни один модуль. Установка отменена."
-    exit 1
-fi
-
-echo "────────────────────────────────────────────"
-echo "✅ Итоговый список модулей: $ENABLED"
-echo "────────────────────────────────────────────"
+echo "✅ Обнаружено и включено модулей: $_MODS_TOTAL"
+echo "  $ENABLED"
 echo ""
 
 # =================== продолжение в следующей части ===================
@@ -5394,10 +5505,39 @@ if [ "$USE_VPN" = "yes" ]; then
     /opt/etc/init.d/S97tgroutes start >/dev/null 2>&1 || true
 fi
 
+rm -f /var/run/routerbot.ready
 _RB_START_RC=0; /opt/etc/init.d/S98routerbot start || _RB_START_RC=$?
-sleep 5
-if [ -f /var/run/routerbot.pid ] && kill -0 "$(cat /var/run/routerbot.pid)" 2>/dev/null; then
-    echo "✅ Router Bot запущен (PID $(cat /var/run/routerbot.pid))"
+_RB_READY=no
+_RB_WAIT=0
+while [ "$_RB_WAIT" -lt 45 ]; do
+    if [ -s /var/run/routerbot.ready ]; then
+        _rb_python_pid=$(cat /var/run/routerbot.ready 2>/dev/null || true)
+        case "$_rb_python_pid" in
+            ''|*[!0-9]*) : ;;
+            *)
+                if kill -0 "$_rb_python_pid" 2>/dev/null &&
+                   [ -r "/proc/$_rb_python_pid/cmdline" ] &&
+                   tr '\000' ' ' < "/proc/$_rb_python_pid/cmdline" | grep -q 'router_bot/main.py'; then
+                    # post_init происходит до начала polling: дадим процессу
+                    # пережить фактический запуск, а не доверимся только маркеру.
+                    sleep 3
+                    if kill -0 "$_rb_python_pid" 2>/dev/null &&
+                       [ ! -e /var/run/routerbot.giveup ] &&
+                       [ -r "/proc/$_rb_python_pid/cmdline" ] &&
+                       tr '\000' ' ' < "/proc/$_rb_python_pid/cmdline" | grep -q 'router_bot/main.py'; then
+                        _RB_READY=yes
+                        break
+                    fi
+                fi
+                ;;
+        esac
+    fi
+    [ -e /var/run/routerbot.giveup ] && break
+    sleep 1
+    _RB_WAIT=$((_RB_WAIT+1))
+done
+if [ "$_RB_READY" = yes ]; then
+    echo "✅ Router Bot инициализирован (Python PID $_rb_python_pid)"
 else
     echo "⚠️  Router Bot не запустился. Проверьте:"
     echo "     tail -50 $LOG_DIR/router_bot.log"
@@ -8938,10 +9078,7 @@ class BirdModule(ModuleBase):
         self._last_action = None
 
     async def startup(self, app):
-        app.add_handler(MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            self._handle_text,
-        ))
+        # Текстовые вводы направляет единый dispatcher в core/main.py.
         log.info('BIRD module started')
 
     async def on_leave(self):
@@ -9856,10 +9993,7 @@ class FlashkeenModule(ModuleBase):
         }
 
     async def startup(self, app):
-        app.add_handler(MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            self._handle_text,
-        ))
+        # Текстовые вводы направляет единый dispatcher в core/main.py.
         log.info('Flashkeen module started')
 
     async def on_leave(self):
@@ -13233,9 +13367,10 @@ class HydraRouteModule(ModuleBase):
             key = lat if has_update else ins
             if has_update and key and last.get(pkg) != key:
                 newly[pkg] = {'installed': ins, 'latest': lat}
+        delivered = False
         if newly:
             log.info('HR update notification: %s', list(newly.keys()))
-            await self._send_update_notification(newly)
+            delivered = await self._send_update_notification(newly)
         # Не теряем старые ключи, обновляем только непустые
         new_state = dict(last)
         for pkg in ('hrneo', 'hrweb', 'hrdns'):
@@ -13243,7 +13378,7 @@ class HydraRouteModule(ModuleBase):
             ins = d.get('installed', '')
             lat = d.get('latest', '')
             key = lat if d.get('update') else ins
-            if key:
+            if key and (pkg not in newly or delivered):
                 new_state[pkg] = key
         save_last_seen(new_state)
 
@@ -13251,8 +13386,8 @@ class HydraRouteModule(ModuleBase):
         lines = ['🆕 <b>Доступны обновления HydraRoute</b>', '']
         for pkg, d in newly.items():
             lines.append(f'⬆️ <b>{pkg}</b>: '
-                         f'<code>{d["installed"]}</code> → '
-                         f'<code>{d["latest"]}</code>')
+                         f'<code>{html.escape(str(d["installed"]))}</code> → '
+                         f'<code>{html.escape(str(d["latest"]))}</code>')
         lines.append('')
         lines.append('<i>Обновить сейчас?</i>')
         kb = InlineKeyboardMarkup([
@@ -13268,8 +13403,10 @@ class HydraRouteModule(ModuleBase):
                 chat_id=self.chat_id,
                 text='\n'.join(lines),
                 parse_mode='HTML', reply_markup=kb)
+            return True
         except Exception as e:
             log.warning('hr update notification failed: %s', e)
+            return False
 
     def _kill(self):
         if self._proc:
@@ -14442,10 +14579,7 @@ class KeenPbrModule(ModuleBase):
         self._editing = False
 
     async def startup(self, app):
-        app.add_handler(MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            self._handle_text,
-        ))
+        # Текстовые вводы направляет единый dispatcher в core/main.py.
         log.info('Keen-PBR module started')
 
     async def on_leave(self):
@@ -15500,10 +15634,7 @@ class MTProxyModule(ModuleBase):
         self._editing = False
 
     async def startup(self, app):
-        app.add_handler(MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            self._handle_text,
-        ))
+        # Текстовые вводы направляет единый dispatcher в core/main.py.
         log.info('MTProxy module started')
 
     async def on_leave(self):
@@ -17888,10 +18019,19 @@ def _disconnect_text(info: dict) -> str:
 
 async def poll_loop(app):
     state = MonitorState()
+    previous_stats = load_json('/opt/router_bot/data/net_watch/stats.json', {})
+    try:
+        state.events = max(0, int(previous_stats.get('total_events', 0)))
+    except (TypeError, ValueError, AttributeError):
+        state.events = 0
     # state доступен через app.bot_data — если понадобится в будущем
     app.bot_data['net_watch_state'] = state
     state.known = await get_active_clients()
     log.info('Initial clients: %s', list(state.known.keys()))
+    pending_path = '/opt/router_bot/data/net_watch/pending_connect.json'
+    pending_connect = load_json(pending_path, {})
+    if not isinstance(pending_connect, dict):
+        pending_connect = {}
 
     while True:
         try:
@@ -17966,7 +18106,13 @@ async def poll_loop(app):
                     continue
 
                 state.events += 1
+                # Сохраняем событие до отправки. Неудачная доставка не
+                # превращает подключение в «уже уведомлено».
+                pending_connect[mac] = info
+                save_json(pending_path, pending_connect)
 
+            # --- Очередь уведомлений с повтором после TelegramError/restart ---
+            for mac, info in list(pending_connect.items()):
                 try:
                     msg = await app.bot.send_message(
                         chat_id=CHAT_ID,
@@ -17974,17 +18120,20 @@ async def poll_loop(app):
                         parse_mode='HTML',
                         reply_markup=device_keyboard(mac, mac in blocked),
                     )
-                    try:
-                        from core.utils import notify_register
-                        notify_register(CHAT_ID, msg.message_id)
-                    except Exception as e:
-                        log.debug('notify_register failed: %s', e)
-                    state.notice_msgs[mac] = msg.message_id
-                    append_event(mac, 'connect')
-                    log.info('New device: %s (%s), msg_id=%s',
-                             mac, info['name'], msg.message_id)
                 except Exception as e:
-                    log.exception('send connect notice error: %s', e)
+                    log.warning('connect notice pending for %s: %s', mac, e)
+                    continue
+                try:
+                    from core.utils import notify_register
+                    notify_register(CHAT_ID, msg.message_id)
+                except Exception as e:
+                    log.debug('notify_register failed: %s', e)
+                state.notice_msgs[mac] = msg.message_id
+                append_event(mac, 'connect')
+                pending_connect.pop(mac, None)
+                save_json(pending_path, pending_connect)
+                log.info('New device notice delivered: %s, msg_id=%s',
+                         mac, msg.message_id)
 
             # --- 3. Отключения (с debounce) ---
             if not current:
@@ -18095,8 +18244,9 @@ class NetWatchModule(ModuleBase):
 
 
     async def on_leave(self):
-        """Сброс состояния при уходе из модуля."""
-        pass
+        """Сбрасываем только интерактивную форму, не фоновый мониторинг."""
+        self._editing_name_mac = None
+        self._editing_name_msg_id = None
 
     async def send_card_message(self, update, ctx):
         """Отправляет карточку модуля в ответ на команду /net."""
@@ -19963,6 +20113,7 @@ cat > '/opt/router_bot/modules/system/module.py' << 'RB_MODULES_SYSTEM_MODULE_PY
 """Модуль System — состояние роутера."""
 from core.module_base import ModuleBase
 import asyncio
+import html
 import json
 import logging
 import os
@@ -20308,6 +20459,7 @@ def get_ndmc_system():
 
 
 def build_system_card(upd=None):
+    from html import escape as _h
     info = get_system_info()
     ndmc_info = get_ndmc_system()
     router = get_router_info()
@@ -20318,44 +20470,44 @@ def build_system_card(upd=None):
     # Шапка: устройство
     hdr = []
     if router.get('model'):
-        hdr.append(f'<b>{router["model"]}</b>')
+        hdr.append(f'<b>{_h(str(router["model"]))}</b>')
     if router.get('hw_id'):
-        hdr.append(f'<code>{router["hw_id"]}</code>')
+        hdr.append(f'<code>{_h(str(router["hw_id"]))}</code>')
     if hdr:
         lines.append(' \u2022 '.join(hdr))
 
     meta = []
     if router.get('hostname'):
-        meta.append(router['hostname'])
+        meta.append(_h(str(router['hostname'])))
     if router.get('arch'):
-        meta.append(router['arch'])
+        meta.append(_h(str(router['arch'])))
     if meta:
         lines.append('<i>' + ' \u2022 '.join(meta) + '</i>')
 
     if router.get('firmware'):
-        lines.append(f'\U0001f4e6 KeeneticOS: <code>{router["firmware"]}</code>')
+        lines.append(f'\U0001f4e6 KeeneticOS: <code>{_h(str(router["firmware"]))}</code>')
 
     # Информация об обновлениях (переданная или вычисленная)
     if upd is None:
         upd = get_update_info()
     if upd.get('channel'):
-        lines.append(f'⚙️ Канал: <code>{upd["channel"]}</code>')
+        lines.append(f'⚙️ Канал: <code>{_h(str(upd["channel"]))}</code>')
     if upd.get('update_available'):
         cur = upd.get('current_version', '')
         new_v = upd.get('release', '') or upd.get('title', '')
         if cur and new_v:
-            lines.append(f'⬆️ <b>Доступно:</b> <code>{new_v}</code>  <i>(сейчас {cur})</i>')
+            lines.append(f'⬆️ <b>Доступно:</b> <code>{_h(str(new_v))}</code>  <i>(сейчас {_h(str(cur))})</i>')
         else:
             lines.append('⬆️ <b>Доступно обновление!</b>')
     else:
         cur = upd.get('current_version', '')
         if cur:
-            lines.append(f'✅ <i>Обновлений нет ({cur})</i>')
+            lines.append(f'✅ <i>Обновлений нет ({_h(str(cur))})</i>')
 
     lines.append('')
 
     # Метрики
-    lines.append(f'\u23f1 Uptime: <b>{info.get("uptime", "?")}</b>')
+    lines.append(f'\u23f1 Uptime: <b>{_h(str(info.get("uptime", "?")))}</b>')
 
     if 'cpuload' in ndmc_info:
         cpu = ndmc_info['cpuload']
@@ -20369,7 +20521,7 @@ def build_system_card(upd=None):
         except Exception:
             la1 = 0
         load_icon = _status_icon(la1, cores, cores * 2)
-        lines.append(f'\u26a1 Load: <code>{info["load"]}</code>  {load_icon}')
+        lines.append(f'\u26a1 Load: <code>{_h(str(info["load"]))}</code>  {load_icon}')
 
     if 'mem_total' in info:
         mt = info['mem_total'] // 1024
@@ -20666,7 +20818,7 @@ class SystemModule(ModuleBase):
                 chat_id=self.chat_id,
                 text=(
                     f'\U0001f510 Пароль получен.\n\n'
-                    f'Логин: <code>{self._fw_login}</code>\n\n'
+                    f'Логин: <code>{html.escape(str(self._fw_login))}</code>\n\n'
                     f'<b>Шаг 3/3.</b> Сохранить логин/пароль в config.env, '
                     f'чтобы не вводить при следующем обновлении?\n'
                     f'<i>Пароль хранится локально в файле с правами 600.</i>'
@@ -20745,8 +20897,8 @@ class SystemModule(ModuleBase):
             _save_update_state(st)
             return
 
-        await self._send_update_notification(upd)
-        st['last_notified_version'] = new_ver
+        if await self._send_update_notification(upd):
+            st['last_notified_version'] = new_ver
         st['last_check'] = datetime.now().isoformat()
         _save_update_state(st)
 
@@ -20757,10 +20909,10 @@ class SystemModule(ModuleBase):
         lines = [
             '\U0001f195 <b>Доступно обновление KeeneticOS</b>',
             '',
-            f'Сейчас: <code>{cur}</code>',
+            f'Сейчас: <code>{html.escape(str(cur))}</code>',
         ]
         if new_v:
-            lines.append(f'Доступно: <code>{new_v}</code>')
+            lines.append(f'Доступно: <code>{html.escape(str(new_v))}</code>')
         else:
             lines.append('Доступна <b>новая версия</b> <i>(номер не сообщён)</i>')
 
@@ -20779,8 +20931,10 @@ class SystemModule(ModuleBase):
             )
             log.info('System update notification sent: version=%s',
                      new_v or '<unknown>')
+            return True
         except Exception as e:
             log.warning('update notification failed: %s', e)
+            return False
 
     async def send_card_message(self, update, ctx):
         upd = await asyncio.to_thread(get_update_info)
@@ -20872,7 +21026,7 @@ class SystemModule(ModuleBase):
 
                 try:
                     await q.edit_message_text(
-                        f'\U0001f510 Логин: <code>{_login}</code>',
+                        f'\U0001f510 Логин: <code>{html.escape(str(_login))}</code>',
                         parse_mode='HTML',
                         reply_markup=None,
                     )
@@ -20931,8 +21085,17 @@ class SystemModule(ModuleBase):
                     reply_markup=_kb(upd.get('update_available', False)),
                 )
             except Exception as e:
-                if 'not modified' not in str(e).lower():
+                if 'not modified' in str(e).lower():
+                    return
+                from telegram.error import BadRequest
+                if not isinstance(e, BadRequest):
                     raise
+                log.warning('KeenOS card edit rejected, sending fresh message: %s', e)
+                new_card = await ctx.bot.send_message(
+                    chat_id=self.chat_id, text=text, parse_mode='HTML',
+                    reply_markup=_kb(upd.get('update_available', False)),
+                )
+                set_last_msg(self.chat_id, new_card.message_id)
             return
 
         if action == 'update_ask':
@@ -21256,10 +21419,7 @@ class UsqueKeeneticModule(ModuleBase):
         self._editing = False
 
     async def startup(self, app):
-        app.add_handler(MessageHandler(
-            filters.TEXT & ~filters.COMMAND,
-            self._handle_text,
-        ))
+        # Текстовые вводы направляет единый dispatcher в core/main.py.
         log.info('Usque-keenetic module started')
 
     async def on_leave(self):
