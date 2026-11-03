@@ -1,7 +1,7 @@
 #!/bin/sh
 set -e
 
-SETUP_VERSION="0.0.10-06"
+SETUP_VERSION="0.0.10-18"
 VERSION_FILE="/opt/router_bot/VERSION"
 # Не допускаем параллельной записи файлов двумя установщиками.
 _RB_INSTALL_LOCK=/opt/tmp/routerbot-install.lock
@@ -150,7 +150,8 @@ fi
 _RB_MANAGED='/opt/router_bot/core /opt/router_bot/modules /opt/router_bot/init
 /opt/router_bot/main.py /opt/router_bot/install.sh /opt/router_bot/uninstall.sh
 /opt/router_bot/ensure_init.sh /opt/router_bot/restore_init.sh
-/opt/router_bot/telegram_routes_persist.sh
+/opt/router_bot/telegram_routes_persist.sh /opt/router_bot/cleanup_legacy.sh
+/opt/router_bot/managed_files.list
 /opt/etc/ndm/ifcreated.d/95-routerbot-telegram-routes.sh
 /opt/etc/ndm/iflayerchanged.d/95-routerbot-telegram-routes.sh
 /opt/etc/ndm/ifipchanged.d/95-routerbot-telegram-routes.sh
@@ -159,6 +160,34 @@ _RB_MANAGED='/opt/router_bot/core /opt/router_bot/modules /opt/router_bot/init
 /opt/etc/init.d/S97tgroutes /opt/etc/init.d/S98routerbot /opt/etc/init.d/S99routerbot_health
 /opt/etc/logrotate.d/router_bot'
 _RB_CRON_FILES='/opt/var/spool/cron/crontabs/root /opt/etc/crontabs/root /opt/etc/crontab'
+# Snapshot the three specific NDM destinations. Updating source files without
+# reverting these routes on failure leaves KeeneticOS and config.env out of sync.
+# The snapshot is deliberately BEFORE installation and not in user's /opt/data.
+_RB_ROUTE_TXN_MARKER="$_RB_SAVE/telegram-route-change-started"
+_RB_ROUTE_TARGET="$_RB_SAVE/telegram-route-new-interface"
+# The child install.sh uses RB_ROUTE_TXN_MARKER and RB_ROUTE_TARGET,
+# WITHOUT the _RB_ prefix. Export actual initialized values, not unset names.
+RB_ROUTE_TXN_MARKER="$_RB_ROUTE_TXN_MARKER"
+RB_ROUTE_TARGET="$_RB_ROUTE_TARGET"
+export RB_ROUTE_TXN_MARKER RB_ROUTE_TARGET
+_RB_ROUTE_SNAPSHOT="$_RB_SAVE/telegram-ndm-before"
+_rb_extract_ndm_tg() {
+    awk '
+      $1=="ip" && $2=="route" &&
+      ($3=="149.154.166.110" || $3=="149.154.166.110/32" ||
+       $3=="149.154.160.0" || $3=="149.154.160.0/20" ||
+       $3=="91.108.4.0" || $3=="91.108.4.0/22") {print}'
+}
+_RB_NDM_SNAPSHOT_OK=no
+if [ -x /bin/ndmc ] && /bin/ndmc -c 'show running-config' > "$_RB_SAVE/ndm-full-before" 2>/dev/null; then
+    _rb_extract_ndm_tg < "$_RB_SAVE/ndm-full-before" > "$_RB_ROUTE_SNAPSHOT"
+    _RB_NDM_SNAPSHOT_OK=yes
+fi
+if [ -f /opt/router_bot/data/telegram_ndm_owner ]; then
+    cp -p /opt/router_bot/data/telegram_ndm_owner "$_RB_SAVE/telegram_ndm_owner.orig" || exit 1
+else
+    : > "$_RB_SAVE/telegram_ndm_owner.was_absent"
+fi
 _RB_OLD_CRON="$_RB_SAVE/cron"
 mkdir -p "$_RB_OLD_CRON"
 for _rb_file in $_RB_MANAGED; do
@@ -181,6 +210,67 @@ _rb_rollback() {
         return 0
     fi
     echo '❌ Router Bot: установка не завершена, восстанавливаю предыдущие файлы...'
+    if [ -f "$_RB_ROUTE_TXN_MARKER" ] && [ "$_RB_NDM_SNAPSHOT_OK" = yes ]; then
+        # Restore the previous exact Telegram NDM entries, but never touch a
+        # route whose interface differs from the selected Router Bot tunnel.
+        # All other prefixes and services are left completely untouched.
+        _rb_current_ndm="$_RB_SAVE/telegram-ndm-current"
+        if /bin/ndmc -c 'show running-config' 2>/dev/null | _rb_extract_ndm_tg > "$_rb_current_ndm"; then
+            _rb_tun=$(cat "$_RB_ROUTE_TARGET" 2>/dev/null || true)
+            if [ -z "$_rb_tun" ]; then
+                _rb_tun=$(sed -n "s/^VPN_IF='\\(.*\\)'/\\1/p" /opt/router_bot/config.env 2>/dev/null | head -1)
+            fi
+            case "$_rb_tun" in
+                opkgtun[0-9]*) _rb_keen_if="OpkgTun${_rb_tun#opkgtun}" ;;
+                opkgtap[0-9]*) _rb_keen_if="OpkgTap${_rb_tun#opkgtap}" ;;
+                nwg[0-9]*) _rb_keen_if="Wireguard${_rb_tun#nwg}" ;;
+                *) _rb_keen_if='' ;;
+            esac
+            _rb_changed=no
+            while IFS= read -r _rb_line; do
+                [ -n "$_rb_line" ] || continue
+                grep -Fxq "$_rb_line" "$_RB_ROUTE_SNAPSHOT" && continue
+                _rb_dst=$(printf '%s\n' "$_rb_line" | awk '{print $3}')
+                _rb_iface=$(printf '%s\n' "$_rb_line" | awk '{if ($4 ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/) print $5; else print $4}')
+                # Refuse deleting any route that is not provably bound to
+                # the interface the failed installer selected.
+                [ -n "$_rb_keen_if" ] && [ "$_rb_iface" = "$_rb_keen_if" ] || {
+                    echo "  ⚠️ Не трогаю неподтверждённый NDM-маршрут: $_rb_line"
+                    continue
+                }
+                case "$_rb_dst" in
+                    149.154.166.110|149.154.166.110/32)
+                        _rb_remove="no ip route $_rb_dst $_rb_iface" ;;
+                    149.154.160.0|91.108.4.0)
+                        _rb_mask=$(printf '%s\n' "$_rb_line" | awk '{print $4}')
+                        _rb_remove="no ip route $_rb_dst $_rb_mask $_rb_iface" ;;
+                    149.154.160.0/20|91.108.4.0/22)
+                        _rb_remove="no ip route $_rb_dst $_rb_iface" ;;
+                    *) continue ;;
+                esac
+                /bin/ndmc -c "$_rb_remove" >/dev/null 2>&1 && _rb_changed=yes || \
+                    echo "  ⚠️ Не удалось отменить маршрут: $_rb_line"
+            done < "$_rb_current_ndm"
+            # Re-add only lines that actually existed when the install began.
+            # A route already present remains unmodified.
+            while IFS= read -r _rb_line; do
+                [ -n "$_rb_line" ] || continue
+                grep -Fxq "$_rb_line" "$_rb_current_ndm" && continue
+                /bin/ndmc -c "$_rb_line" >/dev/null 2>&1 && _rb_changed=yes || \
+                    echo "  ⚠️ Не удалось восстановить маршрут: $_rb_line"
+            done < "$_RB_ROUTE_SNAPSHOT"
+            if [ "$_rb_changed" = yes ]; then
+                /bin/ndmc -c 'system configuration save' >/dev/null 2>&1 || \
+                    echo '  ⚠️ Не удалось сохранить откат маршрутов KeeneticOS'
+                echo '  ↩ Выполнен откат известных маршрутов Telegram KeeneticOS'
+            fi
+        fi
+        if [ -f "$_RB_SAVE/telegram_ndm_owner.was_absent" ]; then
+            rm -f /opt/router_bot/data/telegram_ndm_owner
+        elif [ -f "$_RB_SAVE/telegram_ndm_owner.orig" ]; then
+            cp -p "$_RB_SAVE/telegram_ndm_owner.orig" /opt/router_bot/data/telegram_ndm_owner || true
+        fi
+    fi
     if [ "$_RB_OLD_RUNNING" = yes ] && [ -x /opt/etc/init.d/S98routerbot ]; then
         /opt/etc/init.d/S98routerbot stop >/dev/null 2>&1 || true
     fi
@@ -206,6 +296,13 @@ _rb_rollback() {
             cp -p "$_RB_SAVE$_rb_file" "$_rb_file" || true
         fi
     done
+    if [ -f "$_RB_ROUTE_TXN_MARKER" ] && [ -f /opt/router_bot/config.env ] &&
+       [ -x /opt/router_bot/telegram_routes_persist.sh ]; then
+        # After restoring the old config, put its *owned* Linux policy table
+        # back on the previous interface. Do not modify HydraRoute rules.
+        /opt/router_bot/telegram_routes_persist.sh repair >/dev/null 2>&1 || \
+            echo '  ⚠️ Старую Linux-маршрутизацию не удалось восстановить автоматически'
+    fi
     if [ "$_RB_OLD_RUNNING" = yes ] && [ -x /opt/etc/init.d/S98routerbot ]; then
         /opt/etc/init.d/S98routerbot start >/dev/null 2>&1 || true
     fi
@@ -228,6 +325,8 @@ trap 'exit 129' HUP
  echo "→ Создаю структуру /opt/router_bot/..."
 mkdir -p /opt/router_bot/core /opt/bin /opt/router_bot/modules /opt/router_bot/init /opt/router_bot/data /opt/var/log
 mkdir -p '/opt/router_bot/core'
+# Временный эксперимент SOCKS5/Xray версии 0.0.10-11 удалён.
+rm -f /opt/router_bot/core/tg_proxy.py
 echo "  → /opt/router_bot/core/__init__.py"
 cat > '/opt/router_bot/core/__init__.py' << 'RB_CORE_INIT_PY_EOF'
 
@@ -302,6 +401,7 @@ mkdir -p '/opt/router_bot/core'
 echo "  → /opt/router_bot/core/main.py"
 cat > '/opt/router_bot/core/main.py' << 'RB_CORE_MAIN_PY_EOF'
 """Точка входа фреймворка router_bot."""
+from core.utils import safe_query_answer, safe_query_edit_text
 import asyncio
 import json
 import logging
@@ -601,6 +701,7 @@ from core.utils import (
     check_mirrors, get_current_mirror, apply_mirror, get_entware_mirrors,
     build_mirrors_text, build_mirrors_kb,
     set_last_msg, get_last_msg, show_card, notify_cleanup,
+    ui_edit_or_send,
 )
 from core.router import ModuleRouter
 
@@ -626,7 +727,7 @@ async def _owner_guard(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         q = update.callback_query
         if q:
             try:
-                await q.answer('Доступ запрещён', show_alert=True)
+                await safe_query_answer(q, 'Доступ запрещён', show_alert=True)
             except Exception:
                 pass
         log.warning('Rejected update from chat=%s user=%s',
@@ -691,9 +792,9 @@ async def _show_category(q, ctx, cat_name: str):
     router = ctx.application.bot_data['router']
     mods = [m for m in router.all() if getattr(m, 'category', None) == cat_name]
     if not mods:
-        await q.answer('Категория пуста', show_alert=True)
+        await safe_query_answer(q, 'Категория пуста', show_alert=True)
         return
-    await q.answer()
+    await safe_query_answer(q)
 
     cat_title = getattr(mods[0], 'category_title', cat_name.capitalize())
     cat_icon = getattr(mods[0], 'category_icon', '\U0001f4c1')
@@ -765,7 +866,7 @@ async def _show_category(q, ctx, cat_name: str):
                                      callback_data='router:main')])
 
     try:
-        await q.edit_message_text(
+        await safe_query_edit_text(q, 
             '\n'.join(lines), parse_mode='HTML',
             reply_markup=InlineKeyboardMarkup(kb),
         )
@@ -883,12 +984,12 @@ def _build_modules_menu(pending: set):
 
 
 async def _on_modules_menu(q, ctx):
-    await q.answer()
+    await safe_query_answer(q)
     actual = _read_enabled_modules()
     ctx.chat_data['pending_modules'] = set(actual)
     text, kb = _build_modules_menu(actual)
     try:
-        await q.edit_message_text(text, parse_mode='HTML', reply_markup=kb)
+        await safe_query_edit_text(q, text, parse_mode='HTML', reply_markup=kb)
     except Exception as e:
         if 'not modified' not in str(e).lower():
             raise
@@ -900,23 +1001,23 @@ async def _on_module_toggle(q, ctx, name):
         pending = _read_enabled_modules()
     if name in pending:
         if len(pending) <= 1:
-            await q.answer('Нужен хотя бы один модуль', show_alert=True)
+            await safe_query_answer(q, 'Нужен хотя бы один модуль', show_alert=True)
             return
         pending.discard(name)
     else:
         pending.add(name)
-    await q.answer()
+    await safe_query_answer(q)
     ctx.chat_data['pending_modules'] = pending
     text, kb = _build_modules_menu(pending)
     try:
-        await q.edit_message_text(text, parse_mode='HTML', reply_markup=kb)
+        await safe_query_edit_text(q, text, parse_mode='HTML', reply_markup=kb)
     except Exception as e:
         if 'not modified' not in str(e).lower():
             raise
 
 
 async def _on_module_bulk(q, ctx, mode):
-    await q.answer()
+    await safe_query_answer(q)
     if mode == 'all':
         ctx.chat_data['pending_modules'] = {
             m for m, _, _, _ in _available_module_meta()
@@ -926,7 +1027,7 @@ async def _on_module_bulk(q, ctx, mode):
     pending = ctx.chat_data['pending_modules']
     text, kb = _build_modules_menu(pending)
     try:
-        await q.edit_message_text(text, parse_mode='HTML', reply_markup=kb)
+        await safe_query_edit_text(q, text, parse_mode='HTML', reply_markup=kb)
     except Exception as e:
         if 'not modified' not in str(e).lower():
             raise
@@ -935,7 +1036,7 @@ async def _on_module_bulk(q, ctx, mode):
 async def _on_modules_apply(q, ctx):
     pending = ctx.chat_data.get('pending_modules')
     if not pending:
-        await q.answer('Нечего применять', show_alert=True)
+        await safe_query_answer(q, 'Нечего применять', show_alert=True)
         return
     available = {name for name, _, _, _ in _available_module_meta()}
     actual = _read_enabled_modules()
@@ -945,12 +1046,12 @@ async def _on_modules_apply(q, ctx):
     added = pending - actual
     removed = actual - pending
     if not added and not removed:
-        await q.answer('Изменений нет', show_alert=False)
+        await safe_query_answer(q, 'Изменений нет', show_alert=False)
         return
 
-    await q.answer('Применяю...')
+    await safe_query_answer(q, 'Применяю...')
     try:
-        await q.edit_message_text(
+        await safe_query_edit_text(q, 
             '\u23f3 <b>Применяю изменения...</b>\n\n'
             f'Добавляю: {len(added)}, убираю: {len(removed)}\n'
             '<i>Проверяю зависимости...</i>',
@@ -971,10 +1072,10 @@ async def _on_modules_apply(q, ctx):
             installed = {line.split(' - ', 1)[0].strip() for line in proc.stdout.splitlines()}
             deps_to_install = sorted(required - installed)
         except Exception as e:
-            await q.edit_message_text(f'❌ Не удалось проверить зависимости: {str(e)[:200]}')
+            await safe_query_edit_text(q, f'❌ Не удалось проверить зависимости: {str(e)[:200]}')
             return
     if deps_to_install:
-        await q.edit_message_text(
+        await safe_query_edit_text(q, 
             '⏳ <b>Устанавливаю зависимости</b>\n\n<code>' +
             ' '.join(deps_to_install) + '</code>', parse_mode='HTML')
         try:
@@ -985,7 +1086,7 @@ async def _on_modules_apply(q, ctx):
                 raise RuntimeError((result.stderr or result.stdout)[-500:])
         except Exception as e:
             log.warning('opkg install failed: %s', e)
-            await q.edit_message_text('❌ Установка зависимостей не выполнена: ' + str(e)[:350])
+            await safe_query_edit_text(q, '❌ Установка зависимостей не выполнена: ' + str(e)[:350])
             return
 
     try:
@@ -993,7 +1094,7 @@ async def _on_modules_apply(q, ctx):
     except Exception as e:
         log.exception('save enabled modules failed: %s', e)
         try:
-            await q.edit_message_text(
+            await safe_query_edit_text(q, 
                 f'\u274c <b>Ошибка записи</b>\n\n<code>{e}</code>',
                 parse_mode='HTML',
                 reply_markup=InlineKeyboardMarkup([[
@@ -1009,7 +1110,7 @@ async def _on_modules_apply(q, ctx):
 
     enabled_str = ','.join(sorted(pending))
     try:
-        await q.edit_message_text(
+        await safe_query_edit_text(q, 
             '\u2705 <b>Модули сохранены</b>\n\n'
             f'Включено: <b>{len(pending)}</b> из {len(_available_module_meta())}\n'
             f'<code>{enabled_str}</code>\n\n'
@@ -1030,12 +1131,12 @@ async def _on_modules_apply(q, ctx):
 
 
 async def _on_modules_cancel(q, ctx):
-    await q.answer()
+    await safe_query_answer(q)
     ctx.chat_data.pop('pending_modules', None)
     router = ctx.application.bot_data['router']
     text, kb = await _build_main_menu(router)
     try:
-        await q.edit_message_text(text, parse_mode='HTML', reply_markup=kb)
+        await safe_query_edit_text(q, text, parse_mode='HTML', reply_markup=kb)
     except Exception as e:
         if 'not modified' not in str(e).lower():
             raise
@@ -1098,9 +1199,9 @@ async def _cmd_reboot(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 
 async def _do_reboot_confirm(q, ctx):
-    await q.answer('Перезагружаю...')
+    await safe_query_answer(q, 'Перезагружаю...')
     try:
-        await q.edit_message_text(
+        await safe_query_edit_text(q, 
             '\U0001f504 <b>Роутер перезагружается...</b>\n\n'
             'Вернётся через 1–3 минуты. Напишите /start после.',
             parse_mode='HTML',
@@ -1120,9 +1221,9 @@ async def _do_reboot_confirm(q, ctx):
 
 
 async def _do_restart_confirm(q, ctx):
-    await q.answer('Перезапускаю...')
+    await safe_query_answer(q, 'Перезапускаю...')
     try:
-        await q.edit_message_text(
+        await safe_query_edit_text(q, 
             '\U0001f504 <b>Перезапуск...</b>\n\n'
             'Бот вернётся через 5–10 секунд. Напишите /start после.',
             parse_mode='HTML',
@@ -1149,29 +1250,20 @@ async def _cmd_mirrors(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     current = get_current_mirror()
     text = build_mirrors_text(results, current)
     kb = build_mirrors_kb(results)
-    last_id = get_last_msg(update.effective_chat.id)
-    if last_id:
-        try:
-            await ctx.bot.edit_message_text(
-                chat_id=update.effective_chat.id, message_id=last_id,
-                text=text, parse_mode='HTML', reply_markup=kb,
-            )
-        except Exception:
-            pass
+    chat_id = update.effective_chat.id
+    last_id = get_last_msg(chat_id)
+    new_id = await ui_edit_or_send(ctx.bot, chat_id, last_id, text, kb)
+    set_last_msg(chat_id, new_id)
 
 
 async def _cmd_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     await show_card(update, ctx, '\U0001f50d Проверяю версию на GitHub...')
-    last_id = get_last_msg(update.effective_chat.id)
+    chat_id = update.effective_chat.id
+    last_id = get_last_msg(chat_id)
     async def _edit(text, kb=None):
-        if last_id:
-            try:
-                await ctx.bot.edit_message_text(
-                    chat_id=update.effective_chat.id, message_id=last_id,
-                    text=text, parse_mode='HTML', reply_markup=kb,
-                )
-            except Exception:
-                pass
+        nonlocal last_id
+        last_id = await ui_edit_or_send(ctx.bot, chat_id, last_id, text, kb)
+        set_last_msg(chat_id, last_id)
     current = _read_current_version()
     try:
         latest = await asyncio.to_thread(_fetch_latest_version)
@@ -1208,11 +1300,11 @@ async def _cmd_update(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def _on_self_update_now(q, ctx):
     try:
-        await q.answer('Скачиваю...')
+        await safe_query_answer(q, 'Скачиваю...')
     except Exception as e:
         log.warning('q.answer update_now failed: %s', e)
     try:
-        await q.edit_message_text(
+        await safe_query_edit_text(q, 
             '\U0001f4e5 <b>Скачиваю и проверяю обновление...</b>\n\n'
             '<i>Занимает ~10 секунд.</i>',
             parse_mode='HTML')
@@ -1230,7 +1322,7 @@ async def _on_self_update_now(q, ctx):
         package_version = match.group(1)
         current_version = _read_current_version()
         if current_version and _ver_cmp(package_version, current_version) <= 0:
-            await q.edit_message_text(
+            await safe_query_edit_text(q, 
                 f'✅ Обновление не требуется. Установлена версия {current_version}; '
                 f'загружена {package_version}.')
             return
@@ -1239,7 +1331,7 @@ async def _on_self_update_now(q, ctx):
     except Exception as e:
         log.exception('self-update: download failed: %s', e)
         try:
-            await q.edit_message_text(
+            await safe_query_edit_text(q, 
                 f'\u274c <b>Не удалось скачать обновление</b>\n\n'
                 f'<code>{e}</code>\n\n'
                 f'Попробуйте позже: /update',
@@ -1248,7 +1340,7 @@ async def _on_self_update_now(q, ctx):
             pass
         return
     try:
-        await q.edit_message_text(
+        await safe_query_edit_text(q, 
             '\u2705 <b>Обновление скачано и проверено</b>\n\n'
             'Установка займёт 1–2 минуты. Бот перезапустится автоматически.\n'
             'Напишите /start через 2 минуты.',
@@ -1272,7 +1364,7 @@ async def _on_self_update_now(q, ctx):
 
 async def _on_self_update_later(q, ctx):
     try:
-        await q.answer()
+        await safe_query_answer(q)
     except Exception:
         pass
     st = _load_update_state()
@@ -1281,7 +1373,7 @@ async def _on_self_update_later(q, ctx):
     st.pop('last_notified_version', None)  # разрешить повторное уведомление после отсрочки
     _save_update_state(st)
     try:
-        await q.edit_message_text(
+        await safe_query_edit_text(q, 
             f'\u23f0 <b>Напомню позже</b>\n\n'
             f'До: <code>{until[:10]}</code>\n\n'
             f'Проверить вручную: /update',
@@ -1292,7 +1384,7 @@ async def _on_self_update_later(q, ctx):
 
 async def _on_self_update_never(q, ctx):
     try:
-        await q.answer('Уведомления отключены для этой версии')
+        await safe_query_answer(q, 'Уведомления отключены для этой версии')
     except Exception:
         pass
     st = _load_update_state()
@@ -1301,7 +1393,7 @@ async def _on_self_update_never(q, ctx):
         st['never_notify_version'] = latest
     _save_update_state(st)
     try:
-        await q.edit_message_text(
+        await safe_query_edit_text(q, 
             '\u274c <b>Уведомления отключены</b>\n\n'
             '<i>При выходе следующей версии напоминание придёт снова.</i>\n'
             'Проверить вручную: /update',
@@ -1312,13 +1404,13 @@ async def _on_self_update_never(q, ctx):
 
 async def _on_mirrors(q, ctx):
     """Callback router:mirrors — открывает карточку зеркал."""
-    await q.answer('Проверяю зеркала...')
+    await safe_query_answer(q, 'Проверяю зеркала...')
     results = await check_mirrors()
     current = get_current_mirror()
     text = build_mirrors_text(results, current)
     kb = build_mirrors_kb(results)
     try:
-        await q.edit_message_text(text, parse_mode='HTML', reply_markup=kb)
+        await safe_query_edit_text(q, text, parse_mode='HTML', reply_markup=kb)
     except Exception as e:
         if 'not modified' not in str(e).lower():
             raise
@@ -1326,13 +1418,13 @@ async def _on_mirrors(q, ctx):
 
 async def _on_mirrors_check(q, ctx):
     """Callback router:mirrors_check — перепроверить зеркала."""
-    await q.answer('Проверяю...')
+    await safe_query_answer(q, 'Проверяю...')
     results = await check_mirrors()
     current = get_current_mirror()
     text = build_mirrors_text(results, current)
     kb = build_mirrors_kb(results)
     try:
-        await q.edit_message_text(text, parse_mode='HTML', reply_markup=kb)
+        await safe_query_edit_text(q, text, parse_mode='HTML', reply_markup=kb)
     except Exception as e:
         if 'not modified' not in str(e).lower():
             raise
@@ -1350,9 +1442,9 @@ async def _on_mirror_apply(q, ctx, idx):
             raise IndexError('mirror index out of range')
         url = mirrors[i]
     except Exception:
-        await q.answer('Зеркало не найдено. Перепроверьте список.', show_alert=True)
+        await safe_query_answer(q, 'Зеркало не найдено. Перепроверьте список.', show_alert=True)
         return
-    await q.answer('Применяю зеркало...')
+    await safe_query_answer(q, 'Применяю зеркало...')
     ok, msg = await asyncio.to_thread(apply_mirror, url)
     # Не держим Telegram callback открытым во время opkg update.
     results = await check_mirrors()
@@ -1360,7 +1452,7 @@ async def _on_mirror_apply(q, ctx, idx):
     text = ('✅ ' if ok else '❌ ') + msg + '\n\n' + build_mirrors_text(results, current)
     kb = build_mirrors_kb(results)
     try:
-        await q.edit_message_text(text, parse_mode='HTML', reply_markup=kb)
+        await safe_query_edit_text(q, text, parse_mode='HTML', reply_markup=kb)
     except Exception:
         pass
 
@@ -1405,12 +1497,12 @@ async def _cmd_help(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
 async def _on_router_main(query, ctx):
     """Callback 'router:main' — возврат в главное меню."""
-    await query.answer()
+    await safe_query_answer(query)
     ctx.chat_data.pop('pending_modules', None)
     router = ctx.application.bot_data['router']
     text, kb = await _build_main_menu(router)
     try:
-        await query.edit_message_text(text, parse_mode='HTML', reply_markup=kb)
+        await safe_query_edit_text(query, text, parse_mode='HTML', reply_markup=kb)
     except Exception as e:
         if 'not modified' not in str(e).lower():
             raise
@@ -2314,6 +2406,7 @@ PYEOF
     esac
 
     # --- Запись ---
+    _ci_previous_vpn_if=$(sed -n "s/^VPN_IF='\(.*\)'/\1/p" "$CONF" 2>/dev/null | head -1)
     mkdir -p "$(dirname "$CONF")"
     if [ -f "$CONF" ]; then
         _ts=$(date +%s)
@@ -2355,8 +2448,12 @@ PYEOF
     if [ "$_ci_use_vpn" = "yes" ] && [ -x /opt/etc/init.d/S97tgroutes ]; then
         echo "  → Перестраиваю маршруты Telegram через $_ci_vpn_if..."
         /opt/etc/init.d/S97tgroutes rebuild >/dev/null 2>&1 || true
-        [ ! -x "$BOT_DIR/telegram_routes_persist.sh" ] || \
-            "$BOT_DIR/telegram_routes_persist.sh" apply || true
+        if [ -x "$BOT_DIR/telegram_routes_persist.sh" ]; then
+            RB_TG_REPLACE_EXISTING=yes RB_PREVIOUS_VPN_IF="$_ci_previous_vpn_if" "$BOT_DIR/telegram_routes_persist.sh" apply || {
+                echo '  ❌ Не удалось заменить старые маршруты. Проверьте состояние маршрутизации.'
+                return 1
+            }
+        fi
         echo "  ✅ Готово"
         echo ""
     fi
@@ -2437,6 +2534,10 @@ do_config_tun() {
     done
     echo ""
 
+    if [ -n "$_cur_vpn_if" ] &&
+       ip -o link show dev "$_cur_vpn_if" 2>/dev/null | grep -q '<[^>]*UP[^>]*>'; then
+        case " $_all_tuns " in *" $_cur_vpn_if "*) _first_up="$_cur_vpn_if" ;; esac
+    fi
     _new_vpn_if=""
     if [ "$_n" -eq 1 ]; then
         _new_vpn_if=$(echo "$_all_tuns" | awk '{print $1}')
@@ -2526,14 +2627,15 @@ do_config_tun() {
         return 1
     fi
     _ts=$(date +%s)
-    \cp -f -p "$CONF" "${CONF}.broken.${_ts}" 2>/dev/null || true
+    _rb_tun_backup="${CONF}.broken.${_ts}"
+    cp -p "$CONF" "$_rb_tun_backup" || return 1
+    chmod 600 "$_rb_tun_backup" 2>/dev/null || true
 
     sed -i "s|^VPN_IF=.*|VPN_IF='$_new_vpn_if'|" "$CONF"
     sed -i "s|^VPN_SRC=.*|VPN_SRC='$_new_vpn_src'|" "$CONF"
     sed -i "s|^USE_VPN=.*|USE_VPN='yes'|" "$CONF"
 
-    # Обновить .bak
-    \cp -f -p "$CONF" "${CONF}.bak" 2>/dev/null || true
+    # .bak обновим только после успешной смены маршрута.
 
     echo ""
     echo "  ✅ config.env обновлён:"
@@ -2542,18 +2644,30 @@ do_config_tun() {
     echo "     USE_VPN  = yes"
     echo ""
 
-    # --- S97 rebuild ---
-    if [ -x "$S97" ]; then
-        echo "  → Применяю маршруты (S97tgroutes rebuild)..."
-        $S97 rebuild >/dev/null 2>&1 && echo "  ✅ Маршруты применены" || \
-            echo "  ⚠️  S97tgroutes rebuild вернул ошибку"
-        if [ -x "$BOT_DIR/telegram_routes_persist.sh" ]; then
-            "$BOT_DIR/telegram_routes_persist.sh" apply || \
-                echo "  ⚠️ Постоянные маршруты требуют ручной проверки"
-        fi
-    else
-        echo "  ⚠️  $S97 не найден — маршруты не применены"
+    # --- Одна транзакция: NDM старого туннеля -> NDM нового туннеля ---
+    echo '  → Заменяю постоянные Telegram-маршруты в KeeneticOS...'
+    _rb_tun_ok=no
+    if [ -x "$BOT_DIR/telegram_routes_persist.sh" ] && \
+       RB_TG_REPLACE_EXISTING=yes RB_PREVIOUS_VPN_IF="$_cur_vpn_if" "$BOT_DIR/telegram_routes_persist.sh" apply; then
+        _rb_tun_ok=yes
     fi
+    if [ "$_rb_tun_ok" = yes ]; then
+        _live=$(ip -4 route get 149.154.166.110 2>/dev/null | head -1)
+        case " $_live " in *" dev $_new_vpn_if "*) : ;; *) _rb_tun_ok=no ;; esac
+        if [ "$_rb_tun_ok" = yes ]; then
+            /opt/bin/curl -4 -sfSI --connect-timeout 7 --max-time 12 \
+                https://api.telegram.org >/dev/null 2>&1 || _rb_tun_ok=no
+        fi
+    fi
+    if [ "$_rb_tun_ok" != yes ]; then
+        echo '  ❌ Новый маршрут не заработал; возвращаю прежнюю конфигурацию.'
+        cp -p "$_rb_tun_backup" "$CONF" || return 1
+        RB_PREVIOUS_VPN_IF="$_new_vpn_if" "$BOT_DIR/telegram_routes_persist.sh" apply >/dev/null 2>&1 || \
+            echo '  ⚠️ Не удалось автоматически вернуть маршруты; проверьте KeeneticOS.'
+        return 1
+    fi
+    cp -p "$CONF" "${CONF}.bak" || true
+    echo "  ✅ Старые маршруты заменены на $_new_vpn_if"
 
     echo ""
     echo "  → Перезапустить бота: rb restart"
@@ -2975,6 +3089,7 @@ mkdir -p '/opt/router_bot/core'
 echo "  → /opt/router_bot/core/router.py"
 cat > '/opt/router_bot/core/router.py' << 'RB_CORE_ROUTER_PY_EOF'
 """Реестр модулей и роутинг callback'ов по префиксу."""
+from core.utils import safe_query_answer, safe_query_edit_text
 import logging
 
 log = logging.getLogger(__name__)
@@ -3017,7 +3132,7 @@ class ModuleRouter:
                 log.exception('Module %s handle_callback(%r) failed: %s',
                               mod.name, action, e)
                 try:
-                    await q.answer(
+                    await safe_query_answer(q, 
                         f'❌ Ошибка: {type(e).__name__}',
                         show_alert=True,
                     )
@@ -3031,7 +3146,7 @@ class ModuleRouter:
                 return await _safe_call(mod, rest)
             # Не перенаправлять неизвестные действия случайному модулю.
             try:
-                await q.answer('Кнопка устарела. Откройте /start.', show_alert=True)
+                await safe_query_answer(q, 'Кнопка устарела. Откройте /start.', show_alert=True)
             except Exception:
                 pass
             return
@@ -3735,7 +3850,7 @@ async def ui_edit_q(q, text, kb=None, parse_mode='HTML'):
         await ui_edit_q(q, '⏳ Выполняется...', kb=kill_kb)
     """
     try:
-        await q.edit_message_text(text, parse_mode=parse_mode, reply_markup=kb)
+        await safe_query_edit_text(q, text, parse_mode=parse_mode, reply_markup=kb)
         set_last_msg(q.message.chat_id, q.message.message_id)
         return q.message.message_id
     except Exception as e:
@@ -3904,6 +4019,64 @@ def save_secret_env_values(path: str, values: dict):
     finally:
         if os.path.exists(tmp):
             os.unlink(tmp)
+
+
+# Telegram rejects edits to messages deleted from chat history and answers to
+# callback queries older than its short response window. Both are recoverable,
+# not application bugs. Route all module callbacks through these helpers.
+async def safe_query_answer(query, *args, **kwargs):
+    """Answer a callback, quietly ignoring only Telegram's expired-query reply."""
+    from telegram.error import BadRequest
+    try:
+        return await query.answer(*args, **kwargs)
+    except BadRequest as error:
+        detail = str(error).lower()
+        if ('query is too old' in detail or
+                'query id is invalid' in detail or
+                'query_id_invalid' in detail):
+            import logging
+            logging.getLogger(__name__).debug('Telegram callback expired: %s', error)
+            return False
+        raise
+
+
+async def safe_query_edit_text(query, text, *args, **kwargs):
+    """Edit a card, or send a fresh card if the original Telegram message is gone.
+
+    Never suppress unexpected Bot API errors. Keep the menu's last-message ID in
+    sync, so the next action edits the replacement rather than the deleted card.
+    """
+    from telegram.error import BadRequest
+    try:
+        return await query.edit_message_text(text, *args, **kwargs)
+    except BadRequest as error:
+        detail = str(error).lower()
+        if 'message is not modified' in detail or 'message not modified' in detail:
+            return getattr(query, 'message', None)
+        if not any(marker in detail for marker in (
+                'message to edit not found', 'message_id_invalid',
+                "message can't be edited", 'message can not be edited')):
+            raise
+        message = getattr(query, 'message', None)
+        chat = getattr(message, 'chat', None)
+        chat_id = getattr(chat, 'id', None)
+        if chat_id is None:
+            chat_id = getattr(message, 'chat_id', None)
+        if chat_id is None or args:
+            raise
+        options = {key: value for key, value in kwargs.items() if key in (
+            'parse_mode', 'reply_markup', 'entities', 'disable_web_page_preview',
+            'link_preview_options', 'message_thread_id', 'business_connection_id',
+        )}
+        sent = await query.get_bot().send_message(
+            chat_id=chat_id, text=text, **options,
+        )
+        set_last_msg(chat_id, sent.message_id)
+        import logging
+        logging.getLogger(__name__).info(
+            'Stale Telegram card %s replaced with %s',
+            getattr(message, 'message_id', '?'), sent.message_id)
+        return sent
 RB_CORE_UTILS_PY_EOF
 mkdir -p '/opt/router_bot/core'
 echo "  → /opt/router_bot/core/wrapper.sh"
@@ -4060,43 +4233,32 @@ if [ ! -x /opt/bin/crond ] && ! command -v crond >/dev/null 2>&1; then
     echo '  ⚠️ crond отсутствует: cron-задачи не будут выполняться автоматически'
 fi
 
-# Убираем ТОЛЬКО старые задания ротации Router Bot с неправильным путём.
-# Остальные задания cron и logrotate не трогаем.
-for _cf in /opt/var/spool/cron/crontabs/root /opt/etc/crontabs/root /opt/etc/crontab; do
-    if [ -f "$_cf" ]; then
-        sed -i '\|/opt/etc/logrotate.d/router_bot|d' "$_cf" 2>/dev/null || true
-    fi
-done
-mkdir -p /opt/var/run
+# Выбираем АКТИВНЫЙ каталог crond (crond -c путь), а не пишем по три
+# одинаковых задания. Обрабатываем только собственные строки Router Bot.
+_CRON_DIR=$(ps w 2>/dev/null | awk '
+    /[c]rond / {
+        for (i=1;i<NF;i++) if ($i=="-c") {print $(i+1);exit}
+    }')
+case "$_CRON_DIR" in
+    /opt/etc/crontabs|/opt/var/spool/cron/crontabs) : ;;
+    *) _CRON_DIR=/opt/etc/crontabs ;;
+esac
+_CRON_TARGET="$_CRON_DIR/root"
+mkdir -p "$_CRON_DIR" || exit 1
 CRON_LINE="* * * * * /opt/etc/init.d/S99routerbot_health"
-CRON_ROTATE=""
+CRON_ROTATE=''
 if [ -n "$LOGROTATE_BIN" ]; then
     CRON_ROTATE="17 3 * * * $LOGROTATE_BIN -s /opt/var/run/routerbot-logrotate.status /opt/etc/logrotate.d/router_bot >/dev/null 2>&1"
 fi
-CRON_OK=0
-# В файлах пользовательского crontab используется формат из пяти полей.
-for _cf in /opt/var/spool/cron/crontabs/root /opt/etc/crontabs/root; do
-    _cd=${_cf%/*}
-    mkdir -p "$_cd" 2>/dev/null || continue
-    touch "$_cf" 2>/dev/null || continue
-    if ! grep -Fq '/opt/etc/init.d/S99routerbot_health' "$_cf"; then
-        echo "$CRON_LINE" >> "$_cf"
-    fi
-    if [ -n "$CRON_ROTATE" ]; then
-        echo "$CRON_ROTATE" >> "$_cf"
-    fi
-    CRON_OK=1
+for _cf in /opt/var/spool/cron/crontabs/root /opt/etc/crontabs/root /opt/etc/crontab; do
+    [ -f "$_cf" ] || continue
+    sed -i '\|/opt/etc/init.d/S99routerbot_health|d; \|/opt/etc/logrotate.d/router_bot|d' "$_cf" || exit 1
 done
-# Legacy Entware crontab тоже может быть пользовательским (пять полей).
-if [ -f /opt/etc/crontab ]; then
-    if ! grep -Fq '/opt/etc/init.d/S99routerbot_health' /opt/etc/crontab; then
-        echo "$CRON_LINE" >> /opt/etc/crontab
-    fi
-    if [ -n "$CRON_ROTATE" ]; then
-        echo "$CRON_ROTATE" >> /opt/etc/crontab
-    fi
-    CRON_OK=1
-fi
+touch "$_CRON_TARGET" || exit 1
+printf '%s\n' "$CRON_LINE" >> "$_CRON_TARGET"
+[ -z "$CRON_ROTATE" ] || printf '%s\n' "$CRON_ROTATE" >> "$_CRON_TARGET"
+CRON_OK=1
+echo "  → Активное расписание Router Bot: $_CRON_TARGET"
 # Перечитать расписание, если Entware crond запущен.
 if [ -x /opt/etc/init.d/S10cron ]; then
     /opt/etc/init.d/S10cron restart >/dev/null 2>&1 || /opt/etc/init.d/S10cron start >/dev/null 2>&1 || true
@@ -4259,6 +4421,17 @@ cat > '/opt/router_bot/install.sh' << 'RB_INSTALL_SH_EOF'
 #!/bin/sh
 set -e
 
+# This embedded installer must be launched by the full self-contained setup.
+# Running it alone cannot snapshot and roll back KeeneticOS static routes.
+if [ -z "${RB_ROUTE_TXN_MARKER:-}" ] || [ -z "${RB_ROUTE_TARGET:-}" ]; then
+    echo '❌ Нет транзакции маршрутов: запустите полный router_bot_setup_0.0.10-18.sh, а не /opt/router_bot/install.sh.'
+    exit 1
+fi
+if [ ! -d "${RB_ROUTE_TXN_MARKER%/*}" ] || [ ! -w "${RB_ROUTE_TXN_MARKER%/*}" ]; then
+    echo '❌ Каталог журнала маршрутов недоступен. Установка остановлена до изменения конфигурации.'
+    exit 1
+fi
+
 # ---- Неинтерактивный режим (self-update из Telegram) ----
 # Self-update intentionally preserves the current configuration and does not
 # ask interactive questions. Critical install errors must still fail with set -e.
@@ -4286,6 +4459,217 @@ if [ "$MODE" = "auto" ]; then
         MODE="install"
     fi
 fi
+
+# ---------- Проверка Telegram-маршрутов до работы с токеном ----------
+# Отдельная ВРЕМЕННАЯ таблица нужна, когда main и правила KeeneticOS
+# ещё ведут Telegram через старый VPN. Не изменяем ни main, ни HydraRoute.
+RB_TEST_TABLE=22098
+RB_TEST_ACTIVE=no
+
+rb_test_cleanup() {
+    if [ "$RB_TEST_ACTIVE" = yes ]; then
+        for _item in '149.154.166.110/32|1990' '149.154.160.0/20|1991' '91.108.4.0/22|1992'; do
+            _net=${_item%%|*}; _pref=${_item#*|}
+            ip -4 rule del pref "$_pref" to "$_net" lookup "$RB_TEST_TABLE" >/dev/null 2>&1 || true
+            ip -4 route del "$_net" table "$RB_TEST_TABLE" >/dev/null 2>&1 || true
+        done
+        _rb_left=$(ip -4 rule show 2>/dev/null) || _rb_left=''
+        for _p in 1990 1991 1992; do
+            if printf '%s\n' "$_rb_left" | awk -v p="$_p:" '$1==p {hit=1} END{exit !hit}'; then
+                echo "  ❌ Временное правило $_p не удалось снять" >&2
+                return 1
+            fi
+        done
+        _rb_table_left=$(ip -4 route show table "$RB_TEST_TABLE" 2>/dev/null) || _rb_table_left='?'
+        if [ -n "$_rb_table_left" ]; then
+            echo "  ❌ Временная таблица $RB_TEST_TABLE не очищена" >&2
+            return 1
+        fi
+        RB_TEST_ACTIVE=no
+    fi
+    return 0
+}
+trap 'rb_test_cleanup' 0
+trap 'exit 130' INT
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+
+rb_check_route() {
+    _dest=$1; _wanted=$2
+    _actual=$(ip -4 route get "$_dest" 2>/dev/null | head -1) || return 1
+    case " $_actual " in
+        *" dev $_wanted "*) return 0 ;;
+    esac
+    echo "  ❌ Маршрут $_dest не через $_wanted: ${_actual:-отсутствует}"
+    return 1
+}
+
+rb_test_apply() {
+    _if=$1; _src=$2
+    rb_test_cleanup
+    case "$_if" in ''|*[!a-zA-Z0-9_.:-]*) echo '  ❌ Недопустимое имя интерфейса'; return 1 ;; esac
+    case "$_src" in ''|*[!0-9.]*) echo '  ❌ У интерфейса нет корректного IPv4'; return 1 ;; esac
+    ip -4 -o addr show dev "$_if" 2>/dev/null | awk -v a="$_src" '
+      $3=="inet" {split($4,v,"/"); if (v[1]==a) found=1} END {exit !found}' || {
+        echo "  ❌ Адрес $_src отсутствует на $_if"; return 1;
+    }
+    _rules=$(ip -4 rule show 2>/dev/null) || return 1
+    for _p in 1990 1991 1992; do
+        if printf '%s\n' "$_rules" | awk -v p="$_p:" '$1==p {hit=1} END {exit !hit}'; then
+            echo "  ❌ Временный приоритет $_p уже занят. Чужие правила не изменяю."
+            return 1
+        fi
+    done
+    # Обходить приоритетные fwmark-политики HydraRoute запрещено.
+    if printf '%s\n' "$_rules" | awk '
+        /fwmark/ {split($1,a,":"); if (a[1] ~ /^[0-9]+$/ && a[1]>=1990) bad=1}
+        END{exit !bad}'; then
+        echo '  ❌ В системе есть fwmark-правило с приоритетом >= 1990; автоматическая проверка небезопасна.'
+        return 1
+    fi
+    _existing=$(ip -4 route show table "$RB_TEST_TABLE" 2>/dev/null) || return 1
+    if [ -n "$_existing" ]; then
+        echo "  ❌ Таблица $RB_TEST_TABLE уже занята, чужие маршруты не трогаю."
+        return 1
+    fi
+    RB_TEST_ACTIVE=yes
+    for _net in 149.154.166.110/32 149.154.160.0/20 91.108.4.0/22; do
+        ip -4 route add "$_net" dev "$_if" src "$_src" table "$RB_TEST_TABLE" 2>/dev/null || {
+            echo "  ❌ Нельзя добавить временный маршрут $_net"; rb_test_cleanup; return 1;
+        }
+    done
+    for _item in '149.154.166.110/32|1990' '149.154.160.0/20|1991' '91.108.4.0/22|1992'; do
+        _net=${_item%%|*}; _pref=${_item#*|}
+        ip -4 rule add pref "$_pref" to "$_net" lookup "$RB_TEST_TABLE" 2>/dev/null || {
+            echo "  ❌ Нельзя применить временное правило $_pref"; rb_test_cleanup; return 1;
+        }
+    done
+    for _ip in 149.154.166.110 149.154.160.1 91.108.4.1; do
+        rb_check_route "$_ip" "$_if" || { rb_test_cleanup; return 1; }
+    done
+    echo "  ✅ Все три маршрута применены через $_if (временная таблица $RB_TEST_TABLE)"
+}
+
+rb_api_works() {
+    # A single HEAD request is not a reliable permanent-route health test.
+    # Diagnose the *normal* unbound routing path, without curl proxy variables.
+    _attempt=1
+    while [ "$_attempt" -le 3 ]; do
+        _rb_http_err="/opt/tmp/rb-curl-telegram.$$"
+        _code=$(/opt/bin/curl --noproxy '*' -4 -sS -I --connect-timeout 8 --max-time 15 \
+            -o /dev/null -w '%{http_code}' https://api.telegram.org 2>"$_rb_http_err")
+        _rb_curl_rc=$?
+        if [ "$_rb_curl_rc" -eq 0 ]; then
+            case "$_code" in 2??|3??|4??) break ;; esac
+        fi
+        _err=$(head -c 180 "$_rb_http_err" 2>/dev/null | tr '\r\n' '  ')
+        echo "  ⚠️ Telegram HTTPS: попытка $_attempt/3, curl rc=$_rb_curl_rc, HTTP=${_code:-000}; ${_err:-нет подробностей}"
+        rm -f "$_rb_http_err"
+        [ "$_attempt" -ge 3 ] && break
+        sleep 3
+        _attempt=$((_attempt+1))
+    done
+    rm -f "$_rb_http_err"
+    if [ "$_rb_curl_rc" -ne 0 ]; then
+        echo '  ❌ HTTPS к api.telegram.org недоступен по обычному маршруту.'
+        _route=$(ip -4 route get 149.154.166.110 2>/dev/null | head -1)
+        echo "     ip route get 149.154.166.110: ${_route:-нет маршрута}"
+        if [ "${USE_VPN:-no}" = yes ] && [ -n "${VPN_IF:-}" ]; then
+            _via_code=$(/opt/bin/curl --noproxy '*' -4 -sS -I \
+                --interface "$VPN_IF" --connect-timeout 6 --max-time 10 \
+                -o /dev/null -w '%{http_code}' https://api.telegram.org 2>/dev/null)
+            _via_rc=$?
+            if [ "$_via_rc" -eq 0 ]; then
+                echo "     Прямо через $VPN_IF: работает (HTTP $_via_code), неполадка в policy routing."
+            else
+                echo "     Прямо через $VPN_IF: также недоступен (curl rc=$_via_rc), проверьте VPN/провайдера."
+            fi
+        fi
+        echo '     Правила Telegram Router Bot:'
+        ip -4 rule show 2>/dev/null | grep -E '^(199[0-9]|200[0-2]):' | head -8 || true
+        echo '     Таблица 22097:'
+        ip -4 route show table 22097 2>/dev/null | head -5 || true
+        return 1
+    fi
+    case "$_code" in 2??|3??|4??) : ;; *) echo "  ❌ Telegram вернул HTTP $_code"; return 1 ;; esac
+    _py=$(/opt/bin/python3 - <<'RB_API_PROBE_PY'
+import urllib.request, urllib.error
+class NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, request, fp, code, msg, headers, url):
+        return None
+opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), NoRedirect)
+for attempt in range(2):
+    try:
+        with opener.open('https://api.telegram.org', timeout=12) as response:
+            if 200 <= response.status < 500:
+                print('OK')
+                break
+            print('FAIL:HTTP ' + str(response.status))
+            break
+    except urllib.error.HTTPError as exc:
+        print('OK' if 300 <= exc.code < 500 else 'FAIL:HTTP ' + str(exc.code))
+        break
+    except Exception as exc:
+        if attempt == 1:
+            print('FAIL:' + type(exc).__name__ + ':' + str(exc)[:160])
+        else:
+            import time
+            time.sleep(2)
+RB_API_PROBE_PY
+) || return 1
+    case "$_py" in OK) echo '  ✅ Telegram доступен для curl и Python urllib'; return 0 ;; esac
+    echo "  ❌ Python не может подключиться к Telegram: $_py"
+    return 1
+}
+rb_test_persistent() {
+    # Реальный маршрут обязан работать БЕЗ временных правил.
+    # Никогда не объявлять успешной проверку временного VPN, если режим VPN
+    # не включён. Иначе временные RPDB-правила будут сняты, а постоянных не будет.
+    if [ "$RB_TEST_ACTIVE" = yes ] && [ "$USE_VPN" != yes ]; then
+        echo '  ❌ VPN проверен временно, но USE_VPN не включён. Прерываю установку.'
+        return 1
+    fi
+    # При финальной проверке (не staged preflight) сверяем сохранённый файл.
+    if [ "$USE_VPN" = yes ] && [ -z "${RB_TG_CONFIG_FILE:-}" ]; then
+        _rb_stored_mode=$(sed -n "s/^USE_VPN='\(.*\)'$/\1/p" "$BASE_DIR/config.env" | tail -1)
+        _rb_stored_if=$(sed -n "s/^VPN_IF='\(.*\)'$/\1/p" "$BASE_DIR/config.env" | tail -1)
+        if [ "$_rb_stored_mode" != yes ] || [ "$_rb_stored_if" != "$VPN_IF" ]; then
+            echo "  ❌ Сохранённый VPN не соответствует выбору мастера: USE_VPN=${_rb_stored_mode:-пусто}, VPN_IF=${_rb_stored_if:-пусто}"
+            return 1
+        fi
+    fi
+    if [ "$USE_VPN" = yes ]; then
+        echo "→ Закрепляю маршрут Telegram через $VPN_IF..."
+        [ -z "${RB_ROUTE_TXN_MARKER:-}" ] || : > "$RB_ROUTE_TXN_MARKER" || return 1
+        [ -z "${RB_ROUTE_TARGET:-}" ] || printf '%s\n' "$VPN_IF" > "$RB_ROUTE_TARGET" || return 1
+        if ! "$BASE_DIR/telegram_routes_persist.sh" apply; then
+            echo '  ❌ Не удалось закрепить маршрутизацию. Установка остановлена.'
+            return 1
+        fi
+    fi
+    rb_test_cleanup || return 1
+    if [ "$USE_VPN" = yes ]; then
+        for _ip in 149.154.166.110 149.154.160.1 91.108.4.1; do
+            rb_check_route "$_ip" "$VPN_IF" || return 1
+        done
+    fi
+    if rb_api_works; then
+        return 0
+    fi
+    # Re-apply owned Linux rules once: NDM may asynchronously recreate routes
+    # when a WireGuard tunnel changes state. Never hide failed checks.
+    if [ "$USE_VPN" = yes ]; then
+        echo '  ↻ Проверка не прошла. Восстанавливаю собственные правила и повторяю HTTPS...'
+        "$BASE_DIR/telegram_routes_persist.sh" repair || return 1
+        sleep 3
+        for _ip in 149.154.166.110 149.154.160.1 91.108.4.1; do
+            rb_check_route "$_ip" "$VPN_IF" || return 1
+        done
+        rb_api_works && return 0
+    fi
+    echo '  ❌ Выбранный VPN виден в таблицах маршрутизации, но реальный HTTPS недоступен.'
+    return 1
+}
 
 # ---- всегда копируем helper-скрипты в /opt/bin ----
 # (работает в любом режиме — install, upgrade, reinstall)
@@ -4690,6 +5074,11 @@ if [ "$MODE" != "install" ]; then
                 fi
             done
             echo ""
+            _preferred_if=$(sed -n "s/^VPN_IF='\(.*\)'/\1/p" "$BASE_DIR/config.env" 2>/dev/null | head -1)
+            if [ -n "$_preferred_if" ] &&
+               ip -o link show dev "$_preferred_if" 2>/dev/null | grep -q '<[^>]*UP[^>]*>'; then
+                case " $_all_tuns " in *" $_preferred_if "*) _first_up="$_preferred_if" ;; esac
+            fi
             _new_vpn_if=""
             if [ "$_n" -eq 1 ]; then
                 _new_vpn_if=$(echo "$_all_tuns" | awk "{print \$1}")
@@ -4697,7 +5086,8 @@ if [ "$MODE" != "install" ]; then
             else
                 while true; do
                     if [ -n "$_first_up" ]; then
-                        printf "  Выберите номер [1-%d] (Enter = 1, %s): " "$_n" "$_first_up"
+                        _default_n=$(printf '%s\n' "$_all_tuns" | awk -v x="$_first_up" '{for(i=1;i<=NF;i++)if($i==x){print i;exit}}')
+                        printf "  Выберите номер [1-%d] (Enter = %s, %s): " "$_n" "$_default_n" "$_first_up"
                     else
                         printf "  Выберите номер [1-%d]: " "$_n"
                     fi
@@ -4720,32 +5110,55 @@ if [ "$MODE" != "install" ]; then
             fi
 
             _new_vpn_src=$(ip -4 -o addr show dev "$_new_vpn_if" 2>/dev/null | awk "{print \$4}" | cut -d/ -f1 | head -1)
-            _wt=$(sed -n "s/^ROUTE_TABLE='\(.*\)'/\1/p" /opt/router_bot/config.env 2>/dev/null)
-            [ -z "$_wt" ] && _wt="16385"
-            echo "  Проверяю $_new_vpn_if ($_new_vpn_src)... (до 8 сек)"
-            _CURL_OK=no
-            if /opt/bin/curl -4 -sf --interface "$_new_vpn_if" --max-time 8 "https://api.telegram.org" >/dev/null 2>&1; then
-                _CURL_OK=yes
-            fi
-            if [ "$_CURL_OK" = "yes" ]; then
-                echo "  ✅ Доступ через $_new_vpn_if есть"
-                sed -i "s|^VPN_IF=.*|VPN_IF='$_new_vpn_if'|" /opt/router_bot/config.env
-                sed -i "s|^VPN_SRC=.*|VPN_SRC='$_new_vpn_src'|" /opt/router_bot/config.env
-                sed -i "s|^USE_VPN=.*|USE_VPN='yes'|" /opt/router_bot/config.env
-                if [ ! -x /opt/etc/init.d/S97tgroutes ] && [ -f /opt/router_bot/init/S97tgroutes ]; then
-                    cp -f /opt/router_bot/init/S97tgroutes /opt/etc/init.d/S97tgroutes
-                    chmod +x /opt/etc/init.d/S97tgroutes
-                fi
-                /opt/etc/init.d/S97tgroutes rebuild >/dev/null 2>&1 || true
-                echo "  ✅ config.env обновлён"
+            if [ -z "$_new_vpn_src" ]; then
+                echo "  ❌ На $_new_vpn_if нет IPv4; прежний интерфейс сохранён."
+            elif ! /opt/bin/curl -4 -fsSI --interface "$_new_vpn_if" --connect-timeout 7 --max-time 12 \
+                https://api.telegram.org >/dev/null 2>&1; then
+                echo "  ❌ $_new_vpn_if не обеспечивает соединение с Telegram; прежние настройки сохранены."
+            elif ! rb_test_apply "$_new_vpn_if" "$_new_vpn_src"; then
+                echo '  ❌ Проверочное применение маршрутов не удалось, прежняя конфигурация сохранена.'
+            elif ! rb_api_works; then
+                echo '  ❌ Маршрут не обеспечивает доступ Python/curl к Telegram; прежние настройки сохранены.'
+                rb_test_cleanup
             else
-                echo "  ❌ Через $_new_vpn_if доступа нет, оставляю старую настройку"
+                _rb_conf_bak="/opt/tmp/routerbot-routing-prev.$$"
+                _rb_previous_vpn_if=$(sed -n "s/^VPN_IF='\(.*\)'/\1/p" "$BASE_DIR/config.env" | head -1)
+                cp -p "$BASE_DIR/config.env" "$_rb_conf_bak" || exit 1
+                chmod 600 "$_rb_conf_bak"
+                sed -i "s|^VPN_IF=.*|VPN_IF='$_new_vpn_if'|" "$BASE_DIR/config.env"
+                sed -i "s|^VPN_SRC=.*|VPN_SRC='$_new_vpn_src'|" "$BASE_DIR/config.env"
+                sed -i "s|^USE_VPN=.*|USE_VPN='yes'|" "$BASE_DIR/config.env"
+                USE_VPN=yes
+                VPN_IF=$_new_vpn_if
+                VPN_SRC=$_new_vpn_src
+                RB_PREVIOUS_VPN_IF="$_rb_previous_vpn_if"
+                export RB_PREVIOUS_VPN_IF
+                # Пользователь ответил y на смену маршрута и выбрал этот VPN.
+                # Только этот вызов может заменить прежние Telegram static routes,
+                # даже если их создала более старая версия без owner marker.
+                if RB_TG_REPLACE_EXISTING=yes rb_test_persistent; then
+                    unset RB_PREVIOUS_VPN_IF
+                    echo "  ✅ Telegram переведён на $_new_vpn_if и проверен"
+                    rm -f "$_rb_conf_bak"
+                else
+                    echo '  ❌ Постоянный маршрут не заработал. Восстанавливаю прежнюю конфигурацию.'
+                    cp -p "$_rb_conf_bak" "$BASE_DIR/config.env"
+                    rm -f "$_rb_conf_bak"
+                    rb_test_cleanup
+                    RB_PREVIOUS_VPN_IF="$_new_vpn_if" "$BASE_DIR/telegram_routes_persist.sh" apply >/dev/null 2>&1 || true
+                    unset RB_PREVIOUS_VPN_IF
+                    exit 1
+                fi
             fi
         fi
     else
         echo "  Маршрут оставлен без изменений"
     fi
     echo ""
+
+    # Не запрашиваем токен, если telegram.org по маршруту недоступен.
+    echo '→ Проверка Telegram до запроса токена...'
+    rb_api_works || { echo '❌ Telegram недоступен. Токен и Chat ID пока не запрашиваю.'; exit 1; }
 
     # --- 2. Токен ---
     _RETRY=0
@@ -4795,8 +5208,9 @@ PYEOF
                     echo "  ❌ Токен неверен: ${_RES#FAIL_TOKEN:}"
                     ;;
                 FAIL_NET:*)
-                    echo "  ⚠️  Сеть: ${_RES#FAIL_NET:}"
-                    printf "     Повторить? (Y/n): "; read _R; [ "$_R" = "n" ] && break
+                    echo "  ❌ Ошибка сети, а не токена: ${_RES#FAIL_NET:}"
+                    echo '  Проверьте маршрут Telegram. Установка остановлена.'
+                    exit 1
                     ;;
                 *) echo "  ❌ $_RES" ;;
             esac
@@ -4855,8 +5269,9 @@ PYEOF
                     echo "  ❌ Chat ID неверен или бот не начал диалог: ${_RES#FAIL_CHAT:}"
                     ;;
                 FAIL_NET:*)
-                    echo "  ⚠️  Сеть: ${_RES#FAIL_NET:}"
-                    printf "     Повторить? (Y/n): "; read _R; [ "$_R" = "n" ] && break
+                    echo "  ❌ Ошибка сети, а не токена: ${_RES#FAIL_NET:}"
+                    echo '  Проверьте маршрут Telegram. Установка остановлена.'
+                    exit 1
                     ;;
                 *) echo "  ❌ $_RES" ;;
             esac
@@ -4866,13 +5281,24 @@ PYEOF
     fi
     echo ""
 
+    # После отказа от экспериментального SOCKS5 удаляем его переменную
+    # только после успешной проверки прямого Telegram-маршрута.
+    sed -i '/^TG_PROXY_URL=/d' "$BASE_DIR/config.env"
+
     echo "→ Обновляю init-скрипты..."
     sh /opt/router_bot/ensure_init.sh || exit 1
     /opt/etc/init.d/S97tgroutes rebuild >/dev/null 2>&1 || true
     if [ -x "$BASE_DIR/telegram_routes_persist.sh" ]; then
         echo "→ Проверяю постоянные маршруты Telegram..."
-        "$BASE_DIR/telegram_routes_persist.sh" apply || \
-            echo "⚠️ Статические маршруты KeeneticOS требуют проверки"
+        [ -z "${RB_ROUTE_TXN_MARKER:-}" ] || : > "$RB_ROUTE_TXN_MARKER"
+        "$BASE_DIR/telegram_routes_persist.sh" apply || {
+            echo '❌ Постоянные маршруты Telegram не применены, обновление не завершено.'
+            exit 1
+        }
+        rb_api_works || {
+            echo '❌ Telegram недоступен после изменения постоянного маршрута.'
+            exit 1
+        }
     fi
     rm -f /var/run/routerbot.giveup /var/run/routerbot.fail
     echo "→ Перезапускаю бота..."
@@ -5032,6 +5458,10 @@ elif /opt/bin/curl $_curl_opts "https://api.telegram.org" >/dev/null 2>&1; then
     VPN_IF=""
     VPN_SRC=""
 else
+    # Прямой доступ не работает: выбранный пользователем туннель обязан
+    # включать VPN-маршрутизацию. До 0.0.10-16 режим оставался пустым,
+    # даже когда временная таблица 22098 успешно проверяла Telegram.
+    USE_VPN="yes"
     echo "❌ недоступен"
     echo "  Похоже, Telegram блокируется. Настроим VPN."
     echo ""
@@ -5071,6 +5501,11 @@ else
         done
         echo ""
 
+        _preferred_if=$(sed -n "s/^VPN_IF='\(.*\)'/\1/p" "$BASE_DIR/config.env" 2>/dev/null | head -1)
+        if [ -n "$_preferred_if" ] &&
+           ip -o link show dev "$_preferred_if" 2>/dev/null | grep -q '<[^>]*UP[^>]*>'; then
+            case " $_all_tuns " in *" $_preferred_if "*) _first_up="$_preferred_if" ;; esac
+        fi
         if [ "$_n" -eq 0 ]; then
             echo "  ОШИБКА: туннели не найдены"
             exit 1
@@ -5082,7 +5517,8 @@ else
         else
             while true; do
                 if [ -n "$_first_up" ]; then
-                    printf "  Выберите номер туннеля [1-%d] (Enter = 1, %s): " "$_n" "$_first_up"
+                    _default_n=$(printf '%s\n' "$_all_tuns" | awk -v x="$_first_up" '{for(i=1;i<=NF;i++)if($i==x){print i;exit}}')
+                    printf "  Выберите номер туннеля [1-%d] (Enter = %s, %s): " "$_n" "$_default_n" "$_first_up"
                 else
                     printf "  Выберите номер туннеля [1-%d]: " "$_n"
                 fi
@@ -5136,48 +5572,66 @@ else
     fi
 
     echo ""
-    printf "→ Проверяю доступ к Telegram через $VPN_IF ($VPN_SRC)... "
-    # До записи config.env нужны временные маршруты для проверки токена.
-    # Добавляем только отсутствующие маршруты в main без подмены чужих.
-    # Не создаём ip rule lookup WAN_TABLE: такие правила могут обходить
-    # сохранённые KeeneticOS маршруты после добавления новых VPN.
-    for _net in 149.154.166.110 149.154.160.0/20 91.108.4.0/22; do
-        _route_dst=${_net%/32}
-        if ! ip -4 route show table main 2>/dev/null | awk '{print $1}' | grep -Eq "^(${_net}|${_route_dst})$"; then
-            ip -4 route add "$_net" dev "$VPN_IF" src "$VPN_SRC" table main 2>/dev/null || true
-        fi
-    done
-
-    _vpn_ok=no; _route_ok=no
-    if /opt/bin/curl $_curl_opts --interface "$VPN_IF" "https://api.telegram.org" >/dev/null 2>&1; then
-        _vpn_ok=yes
+    echo "→ Проверяю VPN $VPN_IF ($VPN_SRC) через Telegram..."
+    if [ -z "$VPN_SRC" ]; then
+        echo "  ❌ На $VPN_IF не найден IPv4. Установка остановлена."
+        exit 1
     fi
-    if /opt/bin/curl $_curl_opts "https://api.telegram.org" >/dev/null 2>&1; then
-        _route_ok=yes
+    # Наличие туннеля не доказывает доступность Telegram.
+    if ! /opt/bin/curl -4 -fsSI --interface "$VPN_IF" --connect-timeout 7 --max-time 12 \
+        https://api.telegram.org >/dev/null 2>&1; then
+        echo "  ❌ Telegram недоступен через $VPN_IF даже с --interface."
+        echo '  Выберите рабочий VPN и запустите установщик повторно. Токен пока не нужен.'
+        exit 1
     fi
-    if [ "$_route_ok" = "yes" ]; then
-        echo "✅ работает"
-        USE_VPN="yes"
-    elif [ "$_vpn_ok" = "yes" ]; then
-        echo "⚠️  VPN работает, но маршрут пока не применяется"
-        echo "  Бот при старте применит маршруты повторно (S97tgroutes)."
-        USE_VPN="yes"
-    else
-        echo "❌ VPN не работает (даже --interface)"
-        printf "  Продолжить установку всё равно? (y/N): "
-        read ANS
-        if [ "$ANS" = "y" ] || [ "$ANS" = "Y" ]; then
-            USE_VPN="yes"
-            echo "  ⚠️  Продолжаем без рабочего VPN."
-        else
-            echo "  Отмена."
-            exit 1
-        fi
-    fi
-    # Сохраняем временные маршруты до проверки токена (urllib).
-    # После создания config.env их закрепит KeeneticOS либо NDM-хуки.
+    echo "  ✅ $VPN_IF обеспечивает HTTPS-доступ"
+    # Временная policy routing таблица обходит конфликт со старым маршрутом
+    # opkgtun3, не удаляя чужие маршруты из main и таблиц HydraRoute.
+    rb_test_apply "$VPN_IF" "$VPN_SRC" || exit 1
 fi
+
+# Строгая проверка для того же сетевого клиента, который проверяет токен.
+echo '→ Проверяю Telegram до запроса токена и Chat ID...'
+rb_api_works || {
+    echo '❌ Telegram не доступен с маршрутом выбранного интерфейса.'
+    echo '   Установка остановлена до запроса токена. Временные маршруты будут сняты.'
+    exit 1
+}
+
 echo ""
+
+# ---------- 4b. Постоянные маршруты, ДО запроса токена ----------
+if [ "$RB_TEST_ACTIVE" = yes ] && [ "$USE_VPN" != yes ]; then
+    echo '❌ Выбран VPN, но USE_VPN не включён. Не перехожу к токену.'
+    exit 1
+fi
+# All kernel temporary test rules must be removed here. The persisted route is
+# checked with the same unbound clients used later for token verification.
+if [ "$USE_VPN" = yes ]; then
+    # The final config.env does not exist yet on a first install. The route
+    # helper reads this short stage file only for the immediate preflight.
+    # It is stored in the parent's rollback directory and deleted on exit.
+    [ -n "${RB_ROUTE_TXN_MARKER:-}" ] || { echo '❌ Нет журнала обновления Telegram-маршрутов'; exit 1; }
+    RB_TG_CONFIG_FILE="${RB_ROUTE_TXN_MARKER}.env"
+    export RB_TG_CONFIG_FILE
+    _old_tg_if=$(sed -n "s/^VPN_IF='\(.*\)'/\1/p" "$BASE_DIR/config.env" 2>/dev/null | head -1)
+    printf "USE_VPN='%s'\nVPN_IF='%s'\nVPN_SRC='%s'\n" \
+        "$USE_VPN" "$VPN_IF" "$VPN_SRC" > "$RB_TG_CONFIG_FILE" || exit 1
+    chmod 600 "$RB_TG_CONFIG_FILE" || exit 1
+    if [ -n "$_old_tg_if" ]; then
+        RB_PREVIOUS_VPN_IF="$_old_tg_if"
+        export RB_PREVIOUS_VPN_IF
+    fi
+    echo '→ Проверка постоянного маршрута до настройки бота...'
+    # This install path follows an explicit VPN selection in the wizard.
+    # It is safe to replace ONLY the three defined Telegram prefixes here.
+    RB_TG_REPLACE_EXISTING=yes rb_test_persistent || {
+        echo '❌ Постоянный маршрут не обеспечивает связь. Токен и Chat ID не запрашиваю.'
+        exit 1
+    }
+    unset RB_TG_CONFIG_FILE
+    unset RB_PREVIOUS_VPN_IF
+fi
 
 # ---------- 5. Автоматическая активация всех модулей (auto-discovery) ----------
 echo "────────────────────────────────────────────"
@@ -5253,11 +5707,20 @@ PYEOF
 )
     case "$RES" in
         OK:*) BOT_USERNAME="${RES#OK:}"; echo "  ✅ Токен валиден. Бот: @${BOT_USERNAME}"; break ;;
-        *) echo "  ❌ Невалидный токен: $RES" ;;
+        FAIL_TOKEN:*) echo "  ❌ Неверный токен: ${RES#FAIL_TOKEN:}" ;;
+        FAIL_NET:*)
+            echo "  ❌ Ошибка сети, не токена: ${RES#FAIL_NET:}"
+            echo '  Установка остановлена. Временные маршруты будут сняты.'
+            exit 1 ;;
+        *) echo "  ❌ Не удалось проверить токен: $RES"; exit 1 ;;
     esac
 done
 
 echo ""
+rb_api_works || {
+    echo '❌ Telegram перестал отвечать после проверки токена. Chat ID не запрашиваю.'
+    exit 1
+}
 printf "Ваш Chat ID (узнать у @userinfobot): "
 read CHAT_ID
 CHAT_ID=$(echo "$CHAT_ID" | tr -d ' ')
@@ -5288,12 +5751,20 @@ try:
     )
     d = json.loads(r.read())
     print('OK' if d.get('ok') else 'FAIL:' + d.get('description', ''))
+except urllib.error.HTTPError as e:
+    print('FAIL_CHAT:HTTP ' + str(e.code) if e.code in (400, 403, 404) else 'FAIL_NET:HTTP ' + str(e.code))
+except urllib.error.URLError as e:
+    print('FAIL_NET:' + str(e.reason)[:100])
 except Exception as e:
-    print('FAIL:' + str(e)[:100])
+    print('FAIL_OTHER:' + type(e).__name__ + ':' + str(e)[:100])
 PYEOF
 )
 case "$TEST_RES" in
     OK) echo "✅ доставлено" ;;
+    FAIL_NET:*)
+        echo "❌ Telegram недоступен: ${TEST_RES#FAIL_NET:}"
+        echo '  Chat ID не отклонён: ошибка именно сети. Установка остановлена.'
+        exit 1 ;;
     *)
         echo "❌ $TEST_RES"
         echo "  Причины: неверный Chat ID, или вы не нажали /start у бота @${BOT_USERNAME}"
@@ -5319,13 +5790,31 @@ printf "Искать вендора по MAC (on/off) [on]: "; read VENDOR
 [ -z "$VENDOR" ] && VENDOR=on
 
 # ---------- 8. Запись config.env ----------
+if [ -n "${VPN_IF:-}" ] && [ "${USE_VPN:-}" != yes ]; then
+    echo '❌ Выбран интерфейс VPN, но режим маршрутизации отключён. Конфигурация не сохраняется.'
+    exit 1
+fi
 mkdir -p "$BASE_DIR" "$LOG_DIR" "$INIT_DIR" "$BASE_DIR/data" "$BASE_DIR/data/net_watch" "$BASE_DIR/data/ssh_control" "$BASE_DIR/data/xkeen" "$BASE_DIR/data/bird" "$BASE_DIR/data/hydraroute" "$BASE_DIR/data/mtproxy" "$BASE_DIR/data/keen_pbr" "$BASE_DIR/data/neofit" "$BASE_DIR/data/usque_keenetic" "$BASE_DIR/data/awg_manager"
 
-# На обновлении не перезаписываем пользовательский конфиг значениями визарда.
-# Сохраняем старый файл и генерируем defaults только при первой установке.
+# Для существующего конфига сохраняем настройки модулей и внешних
+# интеграций, но ОБЯЗАТЕЛЬНО обновляем выбор VPN и параметры Telegram,
+# подтверждённые пользователем в этом мастере. Старая версия молча
+# возвращала USE_VPN='' и тем самым удаляла активные policy rules.
 if [ -f "$BASE_DIR/config.env" ]; then
-    cp -p "$BASE_DIR/config.env" "$BASE_DIR/config.env.preserve.tmp"
-    echo "✅ Существующий config.env сохранён без изменений"
+    _rb_conf_tmp="$BASE_DIR/config.env.route-new.$$"
+    # Удаляем все предыдущие определения ключей, включая дубликаты.
+    # Остальные строки пользователя сохраняем дословно.
+    awk '!/^(USE_VPN|VPN_IF|VPN_SRC|TG_BOT_TOKEN|TG_CHAT_ID|ENABLED_MODULES)=/' \
+        "$BASE_DIR/config.env" > "$_rb_conf_tmp" || exit 1
+    {
+        printf "\nUSE_VPN='%s'\nVPN_IF='%s'\nVPN_SRC='%s'\n" \
+            "$USE_VPN" "$VPN_IF" "$VPN_SRC"
+        printf "TG_BOT_TOKEN='%s'\nTG_CHAT_ID='%s'\nENABLED_MODULES='%s'\n" \
+            "$TOKEN" "$CHAT_ID" "$ENABLED"
+    } >> "$_rb_conf_tmp" || { rm -f "$_rb_conf_tmp"; exit 1; }
+    chmod 600 "$_rb_conf_tmp" || { rm -f "$_rb_conf_tmp"; exit 1; }
+    mv -f "$_rb_conf_tmp" "$BASE_DIR/config.env" || exit 1
+    echo "✅ Существующий config.env сохранён; VPN, Telegram и 12 модулей обновлены"
 else
 cat > "$BASE_DIR/config.env" << EOF
 # Router Bot — конфиг
@@ -5360,14 +5849,23 @@ DISABLE_IPV6='$DISABLE_IPV6'
 AWG_MCP_TOKEN=''
 EOF
 fi
-if [ -f "$BASE_DIR/config.env.preserve.tmp" ]; then
-    # Сохраняем актуальный конфиг и его права; бэкап обновляем из него.
-    mv "$BASE_DIR/config.env.preserve.tmp" "$BASE_DIR/config.env"
-fi
+# В 0.0.10-14 файл preserve.tmp возвращал старый USE_VPN после выбора VPN.
+# Не восстанавливать этот устаревший промежуточный файл: теперь config.env
+# записывается атомарно только с выбранными значениями.
+rm -f "$BASE_DIR/config.env.preserve.tmp"
 chmod 600 "$BASE_DIR/config.env"
-cp -p "$BASE_DIR/config.env" "$BASE_DIR/config.env.bak"
+# Проверка С ФАЙЛА, который прочтёт бот и telegram_routes_persist.sh.
+_rb_cfg_use=$(sed -n "s/^USE_VPN='\([^']*\)'$/\1/p" "$BASE_DIR/config.env" | tail -1)
+_rb_cfg_if=$(sed -n "s/^VPN_IF='\([^']*\)'$/\1/p" "$BASE_DIR/config.env" | tail -1)
+_rb_cfg_src=$(sed -n "s/^VPN_SRC='\([^']*\)'$/\1/p" "$BASE_DIR/config.env" | tail -1)
+if [ "$_rb_cfg_use" != "$USE_VPN" ] || [ "$_rb_cfg_if" != "$VPN_IF" ] ||
+   [ "$_rb_cfg_src" != "$VPN_SRC" ]; then
+    echo '❌ config.env не совпадает с выбранной конфигурацией VPN; установка остановлена.'
+    exit 1
+fi
+cp -p "$BASE_DIR/config.env" "$BASE_DIR/config.env.bak" || exit 1
 chmod 600 "$BASE_DIR/config.env.bak"
-echo "✅ config.env сохранён/создан (+ backup)"
+echo "✅ config.env сохранён/создан (+ backup); маршруты VPN согласованы"
 
 # =================== продолжение в следующей части ===================
 
@@ -5491,11 +5989,16 @@ rm -f "$BASE_DIR/uninstall_helper.py" /opt/router_bot/uninstall_helper.py
 
 # ---------- 14b. Постоянные маршруты через KeeneticOS ----------
 # Применяем до запуска бота, а не после: иначе Telegram API может быть недоступен.
-if [ "$USE_VPN" = "yes" ] && [ -x "$BASE_DIR/telegram_routes_persist.sh" ]; then
-    echo "→ Закрепляю Telegram-маршруты в KeeneticOS..."
-    "$BASE_DIR/telegram_routes_persist.sh" apply || \
-        echo "⚠️ Не все статические маршруты сохранены. Проверьте rb routes."
+if [ "$USE_VPN" = "yes" ]; then
+    [ -x "$BASE_DIR/telegram_routes_persist.sh" ] || {
+        echo '❌ Отсутствует механизм постоянной маршрутизации Telegram'; exit 1;
+    }
 fi
+# Здесь временные правила снимаются, и проверяется уже ПОСТОЯННЫЙ маршрут.
+rb_test_persistent || {
+    echo '❌ Постоянный Telegram-маршрут не работает. Бота не запускаю.'
+    exit 1
+}
 
 # ---------- 15. Запуск ----------
 echo ""
@@ -5832,6 +6335,7 @@ mkdir -p '/opt/router_bot/modules/awg_manager'
 echo "  → /opt/router_bot/modules/awg_manager/module.py"
 cat > '/opt/router_bot/modules/awg_manager/module.py' << 'RB_MODULES_AWG_MANAGER_MODULE_PY_EOF'
 """Модуль AWG Manager — управление AmneziaWG / Sing-box."""
+from core.utils import safe_query_answer, safe_query_edit_text
 from core.module_base import ModuleBase
 import asyncio
 import html
@@ -6180,7 +6684,7 @@ class AwgManagerModule(ModuleBase):
             [InlineKeyboardButton('❌ Отмена', callback_data='awg_manager:main')]
         ])
         try:
-            await q.edit_message_text(text, parse_mode='HTML', reply_markup=kb)
+            await safe_query_edit_text(q, text, parse_mode='HTML', reply_markup=kb)
         except Exception as e:
             if 'not modified' not in str(e).lower():
                 log.debug('ask_mcp_token edit failed: %s', e)
@@ -6340,7 +6844,7 @@ class AwgManagerModule(ModuleBase):
     async def _show_mcp_menu(self, q, ctx):
         text, kb = self._build_card()
         try:
-            await q.edit_message_text(text, parse_mode='HTML', reply_markup=kb)
+            await safe_query_edit_text(q, text, parse_mode='HTML', reply_markup=kb)
         except Exception as e:
             if 'not modified' not in str(e).lower():
                 raise
@@ -6383,7 +6887,7 @@ class AwgManagerModule(ModuleBase):
 
     async def _mcp_singbox_action(self, q, ctx, action):
         if action not in ('start', 'stop', 'restart'):
-            await q.answer('❌ Это действие недоступно', show_alert=True)
+            await safe_query_answer(q, '❌ Это действие недоступно', show_alert=True)
             return
 
         labels = {
@@ -6400,7 +6904,7 @@ class AwgManagerModule(ModuleBase):
         except Exception as e:
             err = str(e)
             try:
-                await q.edit_message_text(
+                await safe_query_edit_text(q, 
                     f'❌ <b>{label} — ошибка</b>\n\n<code>{_esc(err[:300])}</code>',
                     parse_mode='HTML',
                     reply_markup=InlineKeyboardMarkup([[
@@ -6417,7 +6921,7 @@ class AwgManagerModule(ModuleBase):
             pass
 
     async def _mcp_tunnel_ip(self, q, ctx, tunnel_id):
-        await q.answer()
+        await safe_query_answer(q)
         try:
             res = await _mcp_tool('check_ip', {'tunnelId': tunnel_id})
             changed = res.get('ipChanged')
@@ -6432,7 +6936,7 @@ class AwgManagerModule(ModuleBase):
             return await self._mcp_extra_error(q, e, f'mcp:tunnel:{tunnel_id}')
 
     async def _mcp_tunnel_test(self, q, ctx, tunnel_id):
-        await q.answer()
+        await safe_query_answer(q)
         try:
             res = await _mcp_tool('test_connectivity', {'tunnelId': tunnel_id})
             state = '✅ Интернет доступен' if res.get('connected') else '❌ Интернет недоступен'
@@ -6458,7 +6962,7 @@ class AwgManagerModule(ModuleBase):
             await _mcp_tool('control_tunnel', {'tunnelId': tunnel_id, 'action': action})
         except Exception as e:
             try:
-                await q.edit_message_text(f'❌ <b>{label} — ошибка</b>\n\n<code>{_esc(str(e)[:300])}</code>', parse_mode='HTML',
+                await safe_query_edit_text(q, f'❌ <b>{label} — ошибка</b>\n\n<code>{_esc(str(e)[:300])}</code>', parse_mode='HTML',
                                           reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('⬅️ Назад', callback_data=self._compact_callback(f'awg_manager:mcp:tunnel:{tunnel_id}'))]]))
             except Exception: pass
             return
@@ -6472,7 +6976,7 @@ class AwgManagerModule(ModuleBase):
             t = await _mcp_tool('get_tunnel', {'tunnelId': tunnel_id})
         except Exception as e:
             try:
-                await q.edit_message_text(f'❌ <b>Ошибка MCP</b>\n\n<code>{_esc(str(e))}</code>', parse_mode='HTML',
+                await safe_query_edit_text(q, f'❌ <b>Ошибка MCP</b>\n\n<code>{_esc(str(e))}</code>', parse_mode='HTML',
                                           reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('⬅️ Назад', callback_data='awg_manager:mcp:tunnels')]]))
             except Exception: pass
             return
@@ -6553,12 +7057,12 @@ class AwgManagerModule(ModuleBase):
         rows.append([InlineKeyboardButton('⬅️ К туннелям', callback_data='awg_manager:mcp:tunnels')])
 
         try:
-            await q.edit_message_text('\n'.join(lines), parse_mode='HTML', reply_markup=InlineKeyboardMarkup(rows))
+            await safe_query_edit_text(q, '\n'.join(lines), parse_mode='HTML', reply_markup=InlineKeyboardMarkup(rows))
         except Exception as e:
             if 'not modified' not in str(e).lower(): raise
 
     async def _mcp_dns_download(self, q, ctx, rid):
-        await q.answer()
+        await safe_query_answer(q)
         try:
             domains = []
             total = 0
@@ -6599,7 +7103,7 @@ class AwgManagerModule(ModuleBase):
         )
         kb = InlineKeyboardMarkup([[InlineKeyboardButton('⬅️ Отмена', callback_data=self._compact_callback(f'awg_manager:mcp:r_dns:{rid}'))]])
         try:
-            await q.edit_message_text(text, parse_mode='HTML', reply_markup=kb)
+            await safe_query_edit_text(q, text, parse_mode='HTML', reply_markup=kb)
         except Exception as e:
             if 'not modified' not in str(e).lower(): raise
 
@@ -6636,12 +7140,12 @@ class AwgManagerModule(ModuleBase):
         try:
             await _mcp_tool('set_dns_route_enabled', {'routeId': rid, 'enabled': bool(enable)})
         except Exception as e:
-            await q.answer(f'❌ Ошибка: {str(e)[:100]}', show_alert=True)
+            await safe_query_answer(q, f'❌ Ошибка: {str(e)[:100]}', show_alert=True)
             return
         await self._show_mcp_r_dns_detail(q, ctx, rid)
 
     async def _mcp_dns_delete_ask(self, q, ctx, rid):
-        await q.answer()
+        await safe_query_answer(q)
         text = (
             f'⚠️ <b>Удалить DNS-маршрут?</b>\n\n'
             f'ID: <code>{_esc(rid)}</code>\n'
@@ -6652,7 +7156,7 @@ class AwgManagerModule(ModuleBase):
             [InlineKeyboardButton('⬅️ Отмена', callback_data=self._compact_callback(f'awg_manager:mcp:r_dns:{rid}'))]
         ])
         try:
-            await q.edit_message_text(text, parse_mode='HTML', reply_markup=kb)
+            await safe_query_edit_text(q, text, parse_mode='HTML', reply_markup=kb)
         except Exception as e:
             if 'not modified' not in str(e).lower(): raise
 
@@ -6660,9 +7164,9 @@ class AwgManagerModule(ModuleBase):
         # Итоговый ответ отправляется после завершения операции.
         try:
             await _mcp_tool('remove_dns_route', {'routeId': rid})
-            await q.answer('✅ Маршрут удалён', show_alert=True)
+            await safe_query_answer(q, '✅ Маршрут удалён', show_alert=True)
         except Exception as e:
-            await q.answer(f'❌ Ошибка: {str(e)[:100]}', show_alert=True)
+            await safe_query_answer(q, f'❌ Ошибка: {str(e)[:100]}', show_alert=True)
             return
         await self._show_mcp_routes_dns(q, ctx)
 
@@ -6672,7 +7176,7 @@ class AwgManagerModule(ModuleBase):
             r = await _mcp_tool('get_dns_route', {'routeId': rid, 'domainsOffset': 0})
         except Exception as e:
             try:
-                await q.edit_message_text(f'❌ <b>Ошибка MCP</b>\n\n<code>{_esc(str(e))}</code>', parse_mode='HTML',
+                await safe_query_edit_text(q, f'❌ <b>Ошибка MCP</b>\n\n<code>{_esc(str(e))}</code>', parse_mode='HTML',
                                           reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('⬅️ Назад', callback_data='awg_manager:mcp:routes:dns')]]))
             except Exception: pass
             return
@@ -6715,7 +7219,7 @@ class AwgManagerModule(ModuleBase):
         rows.append([InlineKeyboardButton('⬅️ К списку DNS', callback_data='awg_manager:mcp:routes:dns')])
 
         try:
-            await q.edit_message_text('\n'.join(lines), parse_mode='HTML', reply_markup=InlineKeyboardMarkup(rows))
+            await safe_query_edit_text(q, '\n'.join(lines), parse_mode='HTML', reply_markup=InlineKeyboardMarkup(rows))
         except Exception as e:
             if 'not modified' not in str(e).lower(): raise
 
@@ -6724,12 +7228,12 @@ class AwgManagerModule(ModuleBase):
         try:
             await _mcp_tool('set_static_route_enabled', {'routeId': rid, 'enabled': bool(enable)})
         except Exception as e:
-            await q.answer(f'❌ Ошибка: {str(e)[:100]}', show_alert=True)
+            await safe_query_answer(q, f'❌ Ошибка: {str(e)[:100]}', show_alert=True)
             return
         await self._show_mcp_r_static_detail(q, ctx, rid)
 
     async def _mcp_static_delete_ask(self, q, ctx, rid):
-        await q.answer()
+        await safe_query_answer(q)
         text = (
             f'⚠️ <b>Удалить Static-маршрут?</b>\n\n'
             f'ID: <code>{_esc(rid)}</code>\n'
@@ -6740,7 +7244,7 @@ class AwgManagerModule(ModuleBase):
             [InlineKeyboardButton('⬅️ Отмена', callback_data=self._compact_callback(f'awg_manager:mcp:r_static:{rid}'))]
         ])
         try:
-            await q.edit_message_text(text, parse_mode='HTML', reply_markup=kb)
+            await safe_query_edit_text(q, text, parse_mode='HTML', reply_markup=kb)
         except Exception as e:
             if 'not modified' not in str(e).lower(): raise
 
@@ -6748,9 +7252,9 @@ class AwgManagerModule(ModuleBase):
         # Итоговый ответ отправляется после завершения операции.
         try:
             await _mcp_tool('remove_static_route', {'routeId': rid})
-            await q.answer('✅ Маршрут удалён', show_alert=True)
+            await safe_query_answer(q, '✅ Маршрут удалён', show_alert=True)
         except Exception as e:
-            await q.answer(f'❌ Ошибка: {str(e)[:100]}', show_alert=True)
+            await safe_query_answer(q, f'❌ Ошибка: {str(e)[:100]}', show_alert=True)
             return
         await self._show_mcp_routes_static(q, ctx)
 
@@ -6761,11 +7265,11 @@ class AwgManagerModule(ModuleBase):
             routes = res.get('routes', []) if isinstance(res, dict) else []
             route = next((r for r in routes if str(r.get('id')) == rid), None)
             if not route:
-                await q.answer('Маршрут не найден (возможно, удалён)', show_alert=True)
+                await safe_query_answer(q, 'Маршрут не найден (возможно, удалён)', show_alert=True)
                 return await self._show_mcp_routes_static(q, ctx)
         except Exception as e:
             try:
-                await q.edit_message_text(f'❌ <b>Ошибка MCP</b>\n\n<code>{_esc(str(e))}</code>', parse_mode='HTML',
+                await safe_query_edit_text(q, f'❌ <b>Ошибка MCP</b>\n\n<code>{_esc(str(e))}</code>', parse_mode='HTML',
                                           reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('⬅️ Назад', callback_data='awg_manager:mcp:routes:static')]]))
             except Exception: pass
             return
@@ -6799,7 +7303,7 @@ class AwgManagerModule(ModuleBase):
         rows.append([InlineKeyboardButton('⬅️ К списку Static', callback_data='awg_manager:mcp:routes:static')])
 
         try:
-            await q.edit_message_text('\n'.join(lines), parse_mode='HTML', reply_markup=InlineKeyboardMarkup(rows))
+            await safe_query_edit_text(q, '\n'.join(lines), parse_mode='HTML', reply_markup=InlineKeyboardMarkup(rows))
         except Exception as e:
             if 'not modified' not in str(e).lower(): raise
 
@@ -6808,26 +7312,26 @@ class AwgManagerModule(ModuleBase):
         try:
             await _mcp_tool('set_client_route_enabled', {'clientIp': ip, 'enabled': bool(enable)})
         except Exception as e:
-            await q.answer(f'❌ {str(e)[:100]}', show_alert=True)
+            await safe_query_answer(q, f'❌ {str(e)[:100]}', show_alert=True)
             return
         await self._show_mcp_r_client_detail(q, ctx, ip)
 
     async def _mcp_client_delete_ask(self, q, ctx, ip):
-        await q.answer()
+        await safe_query_answer(q)
         text = f'⚠️ <b>Удалить маршрут для {ip}?</b>\n\n<i>Устройство вернётся к WAN.</i>'
         kb = InlineKeyboardMarkup([
             [InlineKeyboardButton('🗑 Да', callback_data=self._compact_callback(f'awg_manager:mcp:r_client_del:{ip}'))],
             [InlineKeyboardButton('⬅️ Отмена', callback_data=self._compact_callback(f'awg_manager:mcp:r_client:{ip}'))]
         ])
-        await q.edit_message_text(text, parse_mode='HTML', reply_markup=kb)
+        await safe_query_edit_text(q, text, parse_mode='HTML', reply_markup=kb)
 
     async def _mcp_client_delete(self, q, ctx, ip):
         # Итоговый ответ отправляется после завершения операции.
         try:
             await _mcp_tool('set_client_route', {'clientIp': ip, 'tunnelId': ''})
-            await q.answer('✅ Привязка удалена', show_alert=True)
+            await safe_query_answer(q, '✅ Привязка удалена', show_alert=True)
         except Exception as e:
-            await q.answer(f'❌ {str(e)[:100]}', show_alert=True)
+            await safe_query_answer(q, f'❌ {str(e)[:100]}', show_alert=True)
             return
         await self._show_mcp_routes_client(q, ctx)
 
@@ -6838,10 +7342,10 @@ class AwgManagerModule(ModuleBase):
             routes = res.get('routes', []) if isinstance(res, dict) else []
             route = next((r for r in routes if str(r.get('clientIp')) == ip), None)
             if not route:
-                await q.answer('Устройство не в маршрутах устройств', show_alert=True)
+                await safe_query_answer(q, 'Устройство не в маршрутах устройств', show_alert=True)
                 return await self._show_mcp_routes_client(q, ctx)
         except Exception as e:
-            await q.answer(f'❌ {str(e)[:100]}', show_alert=True)
+            await safe_query_answer(q, f'❌ {str(e)[:100]}', show_alert=True)
             return
 
         t_id = route.get('tunnelID') or route.get('tunnelId') or '?'
@@ -6862,7 +7366,7 @@ class AwgManagerModule(ModuleBase):
         rows.append([InlineKeyboardButton('🔄 Обновить', callback_data=self._compact_callback(f'awg_manager:mcp:r_client:{ip}'))])
         rows.append([InlineKeyboardButton('⬅️ К устройствам', callback_data='awg_manager:mcp:routes:client')])
         try:
-            await q.edit_message_text('\n'.join(lines), parse_mode='HTML', reply_markup=InlineKeyboardMarkup(rows))
+            await safe_query_edit_text(q, '\n'.join(lines), parse_mode='HTML', reply_markup=InlineKeyboardMarkup(rows))
         except Exception as e:
             if 'not modified' not in str(e).lower(): raise
 
@@ -6873,7 +7377,7 @@ class AwgManagerModule(ModuleBase):
                 'Отправьте домен (например, <code>youtube.com</code>) или IP-адрес.')
         kb = InlineKeyboardMarkup([[InlineKeyboardButton('⬅️ Отмена', callback_data='awg_manager:mcp:routes')]])
         try:
-            await q.edit_message_text(text, parse_mode='HTML', reply_markup=kb)
+            await safe_query_edit_text(q, text, parse_mode='HTML', reply_markup=kb)
         except Exception as e:
             if 'not modified' not in str(e).lower(): raise
 
@@ -6980,7 +7484,7 @@ class AwgManagerModule(ModuleBase):
             routes = res.get('routes', []) if isinstance(res, dict) else []
         except Exception as e:
             try:
-                await q.edit_message_text(f'❌ <b>Ошибка MCP</b>\n\n<code>{_esc(str(e))}</code>', parse_mode='HTML',
+                await safe_query_edit_text(q, f'❌ <b>Ошибка MCP</b>\n\n<code>{_esc(str(e))}</code>', parse_mode='HTML',
                                           reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('⬅️ Назад', callback_data='awg_manager:mcp:routes')]]))
             except Exception: pass
             return
@@ -7005,7 +7509,7 @@ class AwgManagerModule(ModuleBase):
         rows.append([InlineKeyboardButton('⬅️ Назад', callback_data='awg_manager:mcp:routes')])
 
         try:
-            await q.edit_message_text('\n'.join(lines), parse_mode='HTML', reply_markup=InlineKeyboardMarkup(rows))
+            await safe_query_edit_text(q, '\n'.join(lines), parse_mode='HTML', reply_markup=InlineKeyboardMarkup(rows))
         except Exception as e:
             if 'not modified' not in str(e).lower(): raise
 
@@ -7015,7 +7519,7 @@ class AwgManagerModule(ModuleBase):
             routes = res.get('routes', []) if isinstance(res, dict) else []
         except Exception as e:
             try:
-                await q.edit_message_text(f'❌ <b>Ошибка MCP</b>\n\n<code>{_esc(str(e))}</code>', parse_mode='HTML',
+                await safe_query_edit_text(q, f'❌ <b>Ошибка MCP</b>\n\n<code>{_esc(str(e))}</code>', parse_mode='HTML',
                                           reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('⬅️ Назад', callback_data='awg_manager:mcp:routes')]]))
             except Exception: pass
             return
@@ -7046,7 +7550,7 @@ class AwgManagerModule(ModuleBase):
         rows.append([InlineKeyboardButton('⬅️ Назад', callback_data='awg_manager:mcp:routes')])
 
         try:
-            await q.edit_message_text('\n'.join(lines), parse_mode='HTML', reply_markup=InlineKeyboardMarkup(rows))
+            await safe_query_edit_text(q, '\n'.join(lines), parse_mode='HTML', reply_markup=InlineKeyboardMarkup(rows))
         except Exception as e:
             if 'not modified' not in str(e).lower(): raise
 
@@ -7056,7 +7560,7 @@ class AwgManagerModule(ModuleBase):
             routes = res.get('routes', []) if isinstance(res, dict) else []
         except Exception as e:
             try:
-                await q.edit_message_text(f'❌ <b>Ошибка MCP</b>\n\n<code>{_esc(str(e))}</code>', parse_mode='HTML',
+                await safe_query_edit_text(q, f'❌ <b>Ошибка MCP</b>\n\n<code>{_esc(str(e))}</code>', parse_mode='HTML',
                                           reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('⬅️ Назад', callback_data='awg_manager:mcp:routes')]]))
             except Exception: pass
             return
@@ -7092,7 +7596,7 @@ class AwgManagerModule(ModuleBase):
         rows.append([InlineKeyboardButton('⬅️ Назад', callback_data='awg_manager:mcp:routes')])
 
         try:
-            await q.edit_message_text('\n'.join(lines), parse_mode='HTML', reply_markup=InlineKeyboardMarkup(rows))
+            await safe_query_edit_text(q, '\n'.join(lines), parse_mode='HTML', reply_markup=InlineKeyboardMarkup(rows))
         except Exception as e:
             if 'not modified' not in str(e).lower(): raise
 
@@ -7115,7 +7619,7 @@ class AwgManagerModule(ModuleBase):
             [InlineKeyboardButton('⬅️ Назад', callback_data='awg_manager:mcp_menu')]
         ]
         try:
-            await q.edit_message_text('\n'.join(lines), parse_mode='HTML', reply_markup=InlineKeyboardMarkup(rows))
+            await safe_query_edit_text(q, '\n'.join(lines), parse_mode='HTML', reply_markup=InlineKeyboardMarkup(rows))
         except Exception as e:
             if 'not modified' not in str(e).lower(): raise
 
@@ -7125,7 +7629,7 @@ class AwgManagerModule(ModuleBase):
             tunnels = res.get('tunnels', []) if isinstance(res, dict) else []
         except Exception as e:
             try:
-                await q.edit_message_text(f'❌ <b>Ошибка MCP</b>\n\n<code>{_esc(str(e))}</code>', parse_mode='HTML',
+                await safe_query_edit_text(q, f'❌ <b>Ошибка MCP</b>\n\n<code>{_esc(str(e))}</code>', parse_mode='HTML',
                                           reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('⬅️ Назад', callback_data='awg_manager:mcp_menu')]]))
             except Exception: pass
             return
@@ -7158,7 +7662,7 @@ class AwgManagerModule(ModuleBase):
         rows.append([InlineKeyboardButton('⬅️ Назад', callback_data='awg_manager:mcp_menu')])
 
         try:
-            await q.edit_message_text('\n'.join(lines), parse_mode='HTML', reply_markup=InlineKeyboardMarkup(rows))
+            await safe_query_edit_text(q, '\n'.join(lines), parse_mode='HTML', reply_markup=InlineKeyboardMarkup(rows))
         except Exception as e:
             if 'not modified' not in str(e).lower(): raise
 
@@ -7168,7 +7672,7 @@ class AwgManagerModule(ModuleBase):
             status = await _mcp_tool('get_system_status')
         except Exception as e:
             try:
-                await q.edit_message_text('❌ <b>Ошибка MCP</b>\n\n<code>' + _esc(str(e)) + '</code>', parse_mode='HTML', reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('⬅️ Назад', callback_data='awg_manager:mcp_menu')]]))
+                await safe_query_edit_text(q, '❌ <b>Ошибка MCP</b>\n\n<code>' + _esc(str(e)) + '</code>', parse_mode='HTML', reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton('⬅️ Назад', callback_data='awg_manager:mcp_menu')]]))
             except Exception:
                 pass
             return
@@ -7241,7 +7745,7 @@ class AwgManagerModule(ModuleBase):
         rows.append([InlineKeyboardButton('⬅️ Назад', callback_data='awg_manager:mcp_menu')])
 
         try:
-            await q.edit_message_text('\n'.join(lines), parse_mode='HTML', reply_markup=InlineKeyboardMarkup(rows))
+            await safe_query_edit_text(q, '\n'.join(lines), parse_mode='HTML', reply_markup=InlineKeyboardMarkup(rows))
         except Exception as e:
             if 'not modified' not in str(e).lower():
                 raise
@@ -7325,7 +7829,7 @@ class AwgManagerModule(ModuleBase):
         return await self._mcp_extra_page(q, '🔍 Диагностика', lines, rows, 'mcp:monitoring')
 
     async def _mcp_run_diag(self, q, ctx):
-        await q.answer()
+        await safe_query_answer(q)
         try:
             res = await _mcp_tool('run_diagnostics', {})
             status = 'Запущена новая проверка.' if res.get('started') else 'Проверка уже выполняется.'
@@ -7336,7 +7840,7 @@ class AwgManagerModule(ModuleBase):
             await self._mcp_extra_error(q, e, 'mcp:diag')
 
     async def _mcp_run_ping(self, q, ctx):
-        await q.answer()
+        await safe_query_answer(q)
         try:
             res = await _mcp_tool('run_pingcheck', {})
             status = 'Запущена новая проверка.' if res.get('triggered') else 'Проверка уже выполняется.'
@@ -7360,7 +7864,7 @@ class AwgManagerModule(ModuleBase):
             static = await _mcp_tool('list_static_routes')
         except Exception as e:
             log.error('Dashboard MCP error: %s', e)
-            await q.edit_message_text(
+            await safe_query_edit_text(q, 
                 f'❌ <b>Ошибка MCP</b>\n\n<code>{_esc(str(e))}</code>',
                 parse_mode='HTML',
                 reply_markup=InlineKeyboardMarkup([
@@ -7392,7 +7896,7 @@ class AwgManagerModule(ModuleBase):
             [InlineKeyboardButton('⬅️ Назад', callback_data='awg_manager:main')],
         ])
         try:
-            await q.edit_message_text('\n'.join(lines), parse_mode='HTML', reply_markup=kb)
+            await safe_query_edit_text(q, '\n'.join(lines), parse_mode='HTML', reply_markup=kb)
         except Exception as e:
             if 'not modified' not in str(e).lower():
                 raise
@@ -7419,7 +7923,7 @@ class AwgManagerModule(ModuleBase):
             back = 'mcp:ux:back'
         buttons.append([InlineKeyboardButton('⬅️ Назад', callback_data=self._compact_callback('awg_manager:' + back))])
         try:
-            await q.edit_message_text('\n'.join(parts), parse_mode='HTML',
+            await safe_query_edit_text(q, '\n'.join(parts), parse_mode='HTML',
                                       reply_markup=InlineKeyboardMarkup(buttons))
         except Exception as e:
             if 'not modified' not in str(e).lower():
@@ -8094,12 +8598,12 @@ class AwgManagerModule(ModuleBase):
                  'sb:groups', 'sb:rules', 'sb:staging', 'servers', 'devices', 'policies',
                  'logs:app', 'logs:singbox')
         if view in views:
-            await q.answer()
+            await safe_query_answer(q)
             await self._mcp_extra_view(q, view)
             return True
         if not (view.startswith('x:') or view.startswith('ux:')):
             return False
-        await q.answer()
+        await safe_query_answer(q)
         try:
             parts = view.split(':')
             if parts[0] == 'ux':
@@ -8296,9 +8800,9 @@ class AwgManagerModule(ModuleBase):
         if action.startswith('k:'):
             action = self._callback_aliases.get(action[2:])
             if action is None:
-                return await q.answer('Кнопка устарела. Откройте карточку заново.', show_alert=True)
+                return await safe_query_answer(q, 'Кнопка устарела. Откройте карточку заново.', show_alert=True)
         if action == 'dashboard':
-            await q.answer()
+            await safe_query_answer(q)
             return await self._show_dashboard(q, ctx)
         if action != 'ask:mcp_token':
             self._awaiting_token = False
@@ -8320,19 +8824,19 @@ class AwgManagerModule(ModuleBase):
                           'mcp:r_dns_ren_ask:', 'mcp:r_dns_tog:', 'mcp:r_dns_del:',
                           'mcp:singbox:', 'mcp:run_ping')
         if (action.startswith(write_prefixes) and not self._mcp_can_write()):
-            await q.answer('Нужен проверенный токен с полным доступом', show_alert=True)
+            await safe_query_answer(q, 'Нужен проверенный токен с полным доступом', show_alert=True)
             return
         if action == 'mcp_menu':
-            await q.answer()
+            await safe_query_answer(q)
             return await self._show_mcp_menu(q, ctx)
         if action == 'mcp:dashboard':
-            await q.answer()
+            await safe_query_answer(q)
             return await self._show_mcp_dashboard(q, ctx)
         if action == 'mcp:routes':
-            await q.answer()
+            await safe_query_answer(q)
             return await self._show_mcp_routes(q, ctx)
         if action == 'mcp:routes:client':
-            await q.answer()
+            await safe_query_answer(q)
             return await self._show_mcp_routes_client(q, ctx)
         if action.startswith('mcp:r_client:'):
             return await self._show_mcp_r_client_detail(q, ctx, action[13:])
@@ -8345,10 +8849,10 @@ class AwgManagerModule(ModuleBase):
         if action.startswith('mcp:r_client_del:'):
             return await self._mcp_client_delete(q, ctx, action[17:])
         if action == 'mcp:routes:explain':
-            await q.answer()
+            await safe_query_answer(q)
             return await self._show_mcp_routes_explain(q, ctx)
         if action == 'mcp:routes:static':
-            await q.answer()
+            await safe_query_answer(q)
             return await self._show_mcp_routes_static(q, ctx)
         if action.startswith('mcp:r_static:'):
             return await self._show_mcp_r_static_detail(q, ctx, action[13:])
@@ -8361,7 +8865,7 @@ class AwgManagerModule(ModuleBase):
         if action.startswith('mcp:r_static_del:'):
             return await self._mcp_static_delete(q, ctx, action[17:])
         if action == 'mcp:routes:dns':
-            await q.answer()
+            await safe_query_answer(q)
             return await self._show_mcp_routes_dns(q, ctx)
         if action.startswith('mcp:r_dns:'):
             return await self._show_mcp_r_dns_detail(q, ctx, action[10:])
@@ -8378,15 +8882,15 @@ class AwgManagerModule(ModuleBase):
         if action.startswith('mcp:r_dns_del:'):
             return await self._mcp_dns_delete(q, ctx, action[14:])
         if action == 'mcp:tunnels':
-            await q.answer()
+            await safe_query_answer(q)
             return await self._show_mcp_tunnels(q, ctx)
         if action.startswith('mcp:t_act:'):
             parts = action[len('mcp:t_act:'):].rsplit(':', 1)
             if len(parts) == 2:
                 tid, op = parts
                 if op not in ('start','stop','restart','enable','disable','set_default_route','unset_default_route'):
-                    return await q.answer('Недопустимая операция', show_alert=True)
-                await q.answer()
+                    return await safe_query_answer(q, 'Недопустимая операция', show_alert=True)
+                await safe_query_answer(q)
                 return await self._mcp_extra_page(q, '⚠️ Подтвердить управление туннелем?', [
                     'Туннель: <code>' + self._mcp_val(tid, 80) + '</code>',
                     'Действие: <b>' + self._mcp_val(op, 40) + '</b>',
@@ -8397,19 +8901,19 @@ class AwgManagerModule(ModuleBase):
             if len(parts) == 2 and self._mcp_can_write():
                 tid, op = parts
                 if op in ('start','stop','restart','enable','disable','set_default_route','unset_default_route'):
-                    await q.answer()
+                    await safe_query_answer(q)
                     return await self._mcp_tunnel_action(q, ctx, tid, op)
-            return await q.answer('Операция недоступна', show_alert=True)
+            return await safe_query_answer(q, 'Операция недоступна', show_alert=True)
         if action.startswith('mcp:t_test:'):
             return await self._mcp_tunnel_test(q, ctx, action[11:])
         if action.startswith('mcp:t_ip:'):
             return await self._mcp_tunnel_ip(q, ctx, action[9:])
         if action.startswith('mcp:tunnel:'):
             tid = action[11:]
-            await q.answer()
+            await safe_query_answer(q)
             return await self._show_mcp_tunnel_detail(q, ctx, tid)
         if action == 'mcp:system':
-            await q.answer()
+            await safe_query_answer(q)
             return await self._show_mcp_system(q, ctx)
         if action == 'mcp:singbox:start':
             return await self._mcp_singbox_action(q, ctx, 'start')
@@ -8418,7 +8922,7 @@ class AwgManagerModule(ModuleBase):
         if action == 'mcp:singbox:restart':
             return await self._mcp_singbox_action(q, ctx, 'restart')
         if action == 'mcp:diag' or action.startswith('mcp:diag:'):
-            await q.answer()
+            await safe_query_answer(q)
             page = action.rsplit(':', 1)[-1]
             return await self._show_mcp_diag(q, ctx, int(page) if page.isdigit() else 0)
         if action == 'mcp:run_diag':
@@ -8426,35 +8930,35 @@ class AwgManagerModule(ModuleBase):
         if action == 'mcp:run_ping':
             return await self._mcp_run_ping(q, ctx)
         if action == 'main':
-            await q.answer()
+            await safe_query_answer(q)
             text, kb = self._build_card()
             try:
-                await q.edit_message_text(text, parse_mode='HTML', reply_markup=kb)
+                await safe_query_edit_text(q, text, parse_mode='HTML', reply_markup=kb)
             except Exception as e:
                 if 'not modified' not in str(e).lower():
                     raise
             return
 
         if action == 'cleanup:all':
-            await q.answer()
+            await safe_query_answer(q)
             return await self._do_cleanup(q, ctx)
 
         if action == 'ask:uninstall':
-            await q.answer()
+            await safe_query_answer(q)
             return await self._show_uninstall_menu(q, ctx)
 
         if action.startswith('opt:'):
             return await self._handle_opt(q, ctx, action[4:])
 
         if action == 'ask:mcp_token':
-            await q.answer()
+            await safe_query_answer(q)
             return await self._ask_mcp_token(q, ctx)
         if action.startswith('ask:'):
             key = action[4:]
-            await q.answer()
+            await safe_query_answer(q)
             a = ACTIONS.get(key)
             if not a:
-                await q.answer('Неизвестное действие', show_alert=True)
+                await safe_query_answer(q, 'Неизвестное действие', show_alert=True)
                 return
             desc = a['desc']
             if key == 'install':
@@ -8475,7 +8979,7 @@ class AwgManagerModule(ModuleBase):
                 [InlineKeyboardButton('❌ Отмена', callback_data='awg_manager:main')],
             ])
             try:
-                await q.edit_message_text(text, parse_mode='HTML', reply_markup=kb)
+                await safe_query_edit_text(q, text, parse_mode='HTML', reply_markup=kb)
             except Exception as e:
                 if 'not modified' not in str(e).lower():
                     raise
@@ -8483,14 +8987,14 @@ class AwgManagerModule(ModuleBase):
 
         if action.startswith('go:'):
             key = action[3:]
-            await q.answer()
+            await safe_query_answer(q)
             a = ACTIONS.get(key)
             if not a:
                 return
             await self._run_action(q, ctx, key, a)
             return
 
-        await q.answer()
+        await safe_query_answer(q)
 
     # ================= Выполнение =================
 
@@ -8630,7 +9134,7 @@ class AwgManagerModule(ModuleBase):
             prefix='awg_manager',
         )
         try:
-            await q.edit_message_text(text, parse_mode='HTML', reply_markup=kb)
+            await safe_query_edit_text(q, text, parse_mode='HTML', reply_markup=kb)
         except Exception as e:
             if 'not modified' not in str(e).lower():
                 raise
@@ -8639,11 +9143,11 @@ class AwgManagerModule(ModuleBase):
         if key in self._uninstall_opts:
             toggle_opt(self._uninstall_opts, key)
             state = 'вкл' if self._uninstall_opts[key] else 'выкл'
-            await q.answer(f'{state}: {key}')
+            await safe_query_answer(q, f'{state}: {key}')
             await self._show_uninstall_menu(q, ctx)
             return
         if key == 'go':
-            await q.answer()
+            await safe_query_answer(q)
             targets = existing_targets(UNINSTALL_TARGETS)
             cmd = collect_uninstall_cmd(targets, self._uninstall_opts, UNINSTALL_CMD)
             self._uninstall_opts = {}
@@ -8654,7 +9158,7 @@ class AwgManagerModule(ModuleBase):
             }
             await self._run_action(q, ctx, 'uninstall', action)
             return
-        await q.answer()
+        await safe_query_answer(q)
 
     async def _check_leftovers(self, ctx):
         try:
@@ -8678,7 +9182,7 @@ class AwgManagerModule(ModuleBase):
 
     async def _do_cleanup(self, q, ctx):
         if not getattr(self, '_leftovers', None):
-            await q.answer('Нечего удалять', show_alert=True)
+            await safe_query_answer(q, 'Нечего удалять', show_alert=True)
             return
         parts = []
         total = len(self._leftovers)
@@ -8973,6 +9477,7 @@ mkdir -p '/opt/router_bot/modules/bird'
 echo "  → /opt/router_bot/modules/bird/module.py"
 cat > '/opt/router_bot/modules/bird/module.py' << 'RB_MODULES_BIRD_MODULE_PY_EOF'
 """Модуль BIRD — динамическая маршрутизация (BGP/OSPF)."""
+from core.utils import safe_query_answer, safe_query_edit_text
 from core.module_base import ModuleBase
 import asyncio
 import html
@@ -9221,24 +9726,24 @@ class BirdModule(ModuleBase):
             answer = action[4:]
             payloads = {'y': b'y\n', 'n': b'n\n', 'enter': b'\n'}
             if answer not in payloads:
-                return await q.answer('Недопустимый ответ', show_alert=True)
+                return await safe_query_answer(q, 'Недопустимый ответ', show_alert=True)
             return await self._answer(q, payloads[answer])
         if action == 'main':
-            await q.answer()
+            await safe_query_answer(q)
             self._editing = False
             text, kb = self._build_card()
             try:
-                await q.edit_message_text(text, parse_mode='HTML', reply_markup=kb)
+                await safe_query_edit_text(q, text, parse_mode='HTML', reply_markup=kb)
             except Exception as e:
                 if 'not modified' not in str(e).lower():
                     raise
             return
 
         if action == 'kill':
-            await q.answer('Прерываю...')
+            await safe_query_answer(q, 'Прерываю...')
             self._kill()
             try:
-                await q.edit_message_text(
+                await safe_query_edit_text(q, 
                     '\U0001f6d1 Операция прервана.',
                     reply_markup=InlineKeyboardMarkup([
                         [InlineKeyboardButton('\u2b05\ufe0f Назад', callback_data='bird:main')],
@@ -9249,16 +9754,16 @@ class BirdModule(ModuleBase):
             return
 
         if action == 'edit_config':
-            await q.answer()
+            await safe_query_answer(q)
             await self._show_config(q, ctx)
             return
 
         if action == 'cleanup:all':
-            await q.answer()
+            await safe_query_answer(q)
             return await self._do_cleanup(q, ctx)
 
         if action == 'ask:uninstall':
-            await q.answer()
+            await safe_query_answer(q)
             return await self._show_uninstall_menu(q, ctx)
 
         if action.startswith('opt:'):
@@ -9266,10 +9771,10 @@ class BirdModule(ModuleBase):
 
         if action.startswith('ask:'):
             key = action[4:]
-            await q.answer()
+            await safe_query_answer(q)
             a = ACTIONS.get(key)
             if not a:
-                await q.answer('Неизвестное действие', show_alert=True)
+                await safe_query_answer(q, 'Неизвестное действие', show_alert=True)
                 return
             desc = a['desc']
             text = (
@@ -9284,7 +9789,7 @@ class BirdModule(ModuleBase):
                                       callback_data='bird:main')],
             ])
             try:
-                await q.edit_message_text(text, parse_mode='HTML', reply_markup=kb)
+                await safe_query_edit_text(q, text, parse_mode='HTML', reply_markup=kb)
             except Exception as e:
                 if 'not modified' not in str(e).lower():
                     raise
@@ -9292,14 +9797,14 @@ class BirdModule(ModuleBase):
 
         if action.startswith('go:'):
             key = action[3:]
-            await q.answer()
+            await safe_query_answer(q)
             a = ACTIONS.get(key)
             if not a:
                 return
             await self._start_action(q, ctx, key, a)
             return
 
-        await q.answer()
+        await safe_query_answer(q)
 
     def _drain_master(self, master):
         """Дочитывает все доступные данные из pty перед закрытием."""
@@ -9344,7 +9849,7 @@ class BirdModule(ModuleBase):
 
     async def _do_cleanup(self, q, ctx):
         if not getattr(self, '_leftovers', None):
-            await q.answer('Нечего удалять', show_alert=True)
+            await safe_query_answer(q, 'Нечего удалять', show_alert=True)
             return
         # Формируем rm-команду с echo для наглядности
         parts = []
@@ -9394,7 +9899,7 @@ class BirdModule(ModuleBase):
             prefix='bird',
         )
         try:
-            await q.edit_message_text(text, parse_mode='HTML', reply_markup=kb)
+            await safe_query_edit_text(q, text, parse_mode='HTML', reply_markup=kb)
         except Exception as e:
             if 'not modified' not in str(e).lower():
                 raise
@@ -9403,12 +9908,12 @@ class BirdModule(ModuleBase):
         if key in self._uninstall_opts:
             toggle_opt(self._uninstall_opts, key)
             state = 'вкл' if self._uninstall_opts[key] else 'выкл'
-            await q.answer(f'{state}: {key}')
+            await safe_query_answer(q, f'{state}: {key}')
             await self._show_uninstall_menu(q, ctx)
             return
 
         if key == 'go':
-            await q.answer()
+            await safe_query_answer(q)
             targets = existing_targets(UNINSTALL_TARGETS)
             base_cmd = ('opkg remove '
                         'bird2c bird2 2>&1 || true')
@@ -9440,7 +9945,7 @@ class BirdModule(ModuleBase):
             asyncio.create_task(self._reader_loop(ctx, pid, master))
             return
 
-        await q.answer()
+        await safe_query_answer(q)
     async def _show_config(self, q, ctx):
         """Показывает текущий конфиг и даёт кнопку «Прислать новый»."""
         try:
@@ -9465,7 +9970,7 @@ class BirdModule(ModuleBase):
             [InlineKeyboardButton('\u2b05\ufe0f Назад', callback_data='bird:main')],
         ])
         try:
-            await q.edit_message_text(text, parse_mode='HTML', reply_markup=kb)
+            await safe_query_edit_text(q, text, parse_mode='HTML', reply_markup=kb)
         except Exception as e:
             if 'not modified' not in str(e).lower():
                 raise
@@ -9485,7 +9990,7 @@ class BirdModule(ModuleBase):
             [InlineKeyboardButton('\u274c Отмена', callback_data='bird:main')],
         ])
         try:
-            await q.edit_message_text(text, parse_mode='HTML', reply_markup=kb)
+            await safe_query_edit_text(q, text, parse_mode='HTML', reply_markup=kb)
         except Exception as e:
             if 'not modified' not in str(e).lower():
                 raise
@@ -9766,16 +10271,16 @@ class BirdModule(ModuleBase):
 
     async def _answer(self, q, payload: bytes):
         if not getattr(self, '_proc_pid', None) or self._master is None:
-            await q.answer('Сессия завершена', show_alert=False)
+            await safe_query_answer(q, 'Сессия завершена', show_alert=False)
             return
         try:
             os.write(self._master, payload)
-            await q.answer(
+            await safe_query_answer(q, 
                 f'Отправлено: {payload.decode(errors="replace").strip() or "Enter"}',
             )
         except OSError as e:
             log.warning('write failed: %s', e)
-            await q.answer(f'Ошибка: {e}', show_alert=True)
+            await safe_query_answer(q, f'Ошибка: {e}', show_alert=True)
             return
         self._awaiting_yn = False
         await self._update_status(bot=q.bot)
@@ -9867,6 +10372,7 @@ mkdir -p '/opt/router_bot/modules/flashkeen'
 echo "  → /opt/router_bot/modules/flashkeen/module.py"
 cat > '/opt/router_bot/modules/flashkeen/module.py' << 'RB_MODULES_FLASHKEEN_MODULE_PY_EOF'
 """Модуль Flashkeen — интерактивный терминал в Telegram."""
+from core.utils import safe_query_answer, safe_query_edit_text
 from core.module_base import ModuleBase
 import asyncio
 import fcntl
@@ -10100,21 +10606,21 @@ class FlashkeenModule(ModuleBase):
 
     async def handle_callback(self, action, q, ctx):
         if action == 'main':
-            await q.answer()
+            await safe_query_answer(q)
             text, kb = self._build_card()
             try:
-                await q.edit_message_text(text, parse_mode='HTML', reply_markup=kb)
+                await safe_query_edit_text(q, text, parse_mode='HTML', reply_markup=kb)
             except Exception as e:
                 if 'not modified' not in str(e).lower():
                     raise
             return
 
         if action == 'cleanup:all':
-            await q.answer()
+            await safe_query_answer(q)
             return await self._do_cleanup(q, ctx)
 
         if action == 'ask:uninstall':
-            await q.answer()
+            await safe_query_answer(q)
             return await self._show_uninstall_menu(q, ctx)
 
         if action.startswith('opt:'):
@@ -10122,7 +10628,7 @@ class FlashkeenModule(ModuleBase):
 
         if action.startswith('ask:'):
             key = action[4:]
-            await q.answer()
+            await safe_query_answer(q)
             titles = {
                 'install': ('\u2b07\ufe0f Установка Flashkeen',
                             'Будет скачан и запущен установочный скрипт с GitHub.\n'
@@ -10143,7 +10649,7 @@ class FlashkeenModule(ModuleBase):
                 [InlineKeyboardButton('\u274c Отмена',
                                       callback_data='flashkeen:main')],
             ])
-            await q.edit_message_text(
+            await safe_query_edit_text(q, 
                 f'{t[0]}\n\n{t[1]}\n\nПодтвердить?',
                 parse_mode='HTML', reply_markup=kb,
             )
@@ -10151,7 +10657,7 @@ class FlashkeenModule(ModuleBase):
 
         if action.startswith('go:'):
             key = action[3:]
-            await q.answer()
+            await safe_query_answer(q)
             cmds = {
                 'install': INSTALL_CMD,
                 'update': UPDATE_ENTWARE_CMD,
@@ -10164,15 +10670,15 @@ class FlashkeenModule(ModuleBase):
             return
 
         if action == 'run':
-            await q.answer('Запускаю...')
+            await safe_query_answer(q, 'Запускаю...')
             await self._start_interactive(q, ctx)
             return
 
         if action == 'kill':
-            await q.answer('Закрываю...')
+            await safe_query_answer(q, 'Закрываю...')
             self._kill()
             try:
-                await q.edit_message_text(
+                await safe_query_edit_text(q, 
                     '\U0001f6d1 Сессия закрыта.\n\nНапишите /start для возврата.',
                 )
             except Exception:
@@ -10199,7 +10705,7 @@ class FlashkeenModule(ModuleBase):
             return
 
         if action == 'text_input':
-            await q.answer('Напишите текст следующим сообщением')
+            await safe_query_answer(q, 'Напишите текст следующим сообщением')
             self._text_input_mode = True
             try:
                 await q.edit_message_reply_markup(
@@ -10213,17 +10719,17 @@ class FlashkeenModule(ModuleBase):
             return
 
         if action == 'text_cancel':
-            await q.answer()
+            await safe_query_answer(q)
             self._text_input_mode = False
             await self._refresh_interactive(ctx)
             return
 
         if action == 'refresh':
-            await q.answer()
+            await safe_query_answer(q)
             await self._refresh_interactive(ctx)
             return
 
-        await q.answer()
+        await safe_query_answer(q)
 
     # ================= actions (стриминг) =================
 
@@ -10251,7 +10757,7 @@ class FlashkeenModule(ModuleBase):
 
     async def _do_cleanup(self, q, ctx):
         if not getattr(self, '_leftovers', None):
-            await q.answer('Нечего удалять', show_alert=True)
+            await safe_query_answer(q, 'Нечего удалять', show_alert=True)
             return
 
         parts = []
@@ -10304,7 +10810,7 @@ class FlashkeenModule(ModuleBase):
             prefix='flashkeen',
         )
         try:
-            await q.edit_message_text(text, parse_mode='HTML', reply_markup=kb)
+            await safe_query_edit_text(q, text, parse_mode='HTML', reply_markup=kb)
         except Exception as e:
             if 'not modified' not in str(e).lower():
                 raise
@@ -10312,12 +10818,12 @@ class FlashkeenModule(ModuleBase):
         if key in self._uninstall_opts:
             toggle_opt(self._uninstall_opts, key)
             state = 'вкл' if self._uninstall_opts[key] else 'выкл'
-            await q.answer(f'{state}: {key}')
+            await safe_query_answer(q, f'{state}: {key}')
             await self._show_uninstall_menu(q, ctx)
             return
 
         if key == 'go':
-            await q.answer()
+            await safe_query_answer(q)
             targets = existing_targets(UNINSTALL_TARGETS)
             base_cmd = UNINSTALL_CMD
             cmd = collect_uninstall_cmd(targets, self._uninstall_opts, base_cmd)
@@ -10349,7 +10855,7 @@ class FlashkeenModule(ModuleBase):
             asyncio.create_task(self._reader_loop_action(ctx, pid, master))
             return
 
-        await q.answer()
+        await safe_query_answer(q)
     async def _start_action(self, q, ctx, key, cmd):
         if self._running:
             return
@@ -10518,14 +11024,14 @@ class FlashkeenModule(ModuleBase):
 
     async def _send_input(self, q, ctx, payload: bytes):
         if not getattr(self, '_proc_pid', None) or self._master is None:
-            await q.answer('Сессия завершена', show_alert=True)
+            await safe_query_answer(q, 'Сессия завершена', show_alert=True)
             return
         try:
             os.write(self._master, payload)
-            await q.answer(f'Отправлено: {payload.decode(errors="replace").strip() or "Enter"}')
+            await safe_query_answer(q, f'Отправлено: {payload.decode(errors="replace").strip() or "Enter"}')
         except OSError as e:
             log.warning('write failed: %s', e)
-            await q.answer('Ошибка отправки', show_alert=True)
+            await safe_query_answer(q, 'Ошибка отправки', show_alert=True)
             return
         if self._question_msg_id:
             try:
@@ -12227,6 +12733,7 @@ mkdir -p '/opt/router_bot/modules/hydraroute'
 echo '  → /opt/router_bot/modules/hydraroute/neo_ui.py'
 cat > '/opt/router_bot/modules/hydraroute/neo_ui.py' << 'RB_HYDRA_NEO_UI_EOFM'
 """Telegram-карточки редактора HydraRoute Neo. Без произвольного shell."""
+from core.utils import safe_query_answer, safe_query_edit_text
 import asyncio
 import hashlib
 import html
@@ -12430,7 +12937,7 @@ class NeoUI:
     async def _edit(self, q, text, keyboard):
         text = text[:3700]
         try:
-            await q.edit_message_text(text, parse_mode='HTML', reply_markup=keyboard,
+            await safe_query_edit_text(q, text, parse_mode='HTML', reply_markup=keyboard,
                                       disable_web_page_preview=True)
             if getattr(q, 'message', None):
                 set_last_msg(q.message.chat_id, q.message.message_id)
@@ -12821,7 +13328,7 @@ class NeoUI:
     async def _commit(self, q):
         pending = self.pending
         if not pending:
-            await q.answer('Изменение устарело', show_alert=True)
+            await safe_query_answer(q, 'Изменение устарело', show_alert=True)
             return
         await self._apply_entries(q, self._queue + [pending])
 
@@ -12838,7 +13345,7 @@ class NeoUI:
     async def handle_callback(self, action, q, ctx):
         if not action.startswith('neo:'):
             return False
-        await q.answer()
+        await safe_query_answer(q)
         a = action[4:]
         self.parent._match_editing = False
         self.parent._token_editing = False
@@ -13213,6 +13720,7 @@ mkdir -p '/opt/router_bot/modules/hydraroute'
 echo "  → /opt/router_bot/modules/hydraroute/module.py"
 cat > '/opt/router_bot/modules/hydraroute/module.py' << 'RB_MODULES_HYDRAROUTE_MODULE_PY_EOF'
 """Модуль HydraRoute — установка/управление через бота."""
+from core.utils import safe_query_answer, safe_query_edit_text
 from core.module_base import ModuleBase
 import asyncio
 import html
@@ -13546,10 +14054,10 @@ class HydraRouteModule(ModuleBase):
         if await self._neo.handle_callback(action, q, ctx):
             return
         if action in ('main',):
-            await q.answer()
+            await safe_query_answer(q)
             text, kb = self._build_card()
             try:
-                await q.edit_message_text(text, parse_mode='HTML', reply_markup=kb)
+                await safe_query_edit_text(q, text, parse_mode='HTML', reply_markup=kb)
             except Exception as e:
                 if 'not modified' in str(e).lower():
                     return
@@ -13562,11 +14070,11 @@ class HydraRouteModule(ModuleBase):
             return
 
         if action == 'cleanup:all':
-            await q.answer()
+            await safe_query_answer(q)
             return await self._do_cleanup(q, ctx)
 
         if action in ('ask:uninstall_std', 'ask:uninstall_full', 'ask:uninstall'):
-            await q.answer()
+            await safe_query_answer(q)
             self._uninstall_mode = 'std' if action == 'ask:uninstall_std' else 'full'
             return await self._show_uninstall_menu(q, ctx)
 
@@ -13574,26 +14082,26 @@ class HydraRouteModule(ModuleBase):
             return await self._handle_opt(q, ctx, action[4:])
 
         if action == 'ask:check_updates':
-            await q.answer('Проверяю...')
+            await safe_query_answer(q, 'Проверяю...')
             return await self._do_check_updates(q, ctx)
 
         if action == 'ask:keenetic':
-            await q.answer('Токен RCI создаёт сам Neo. Ручная запись отключена.', show_alert=True)
+            await safe_query_answer(q, 'Токен RCI создаёт сам Neo. Ручная запись отключена.', show_alert=True)
             return
 
         if action == 'ask:match':
-            await q.answer()
+            await safe_query_answer(q)
             return await self._ask_match(q, ctx)
 
         if action == 'ask:help':
-            await q.answer()
+            await safe_query_answer(q)
             from .actions import build_help_text
             kb = InlineKeyboardMarkup([
                 [InlineKeyboardButton('⬅️ Назад',
                                       callback_data='hydraroute:main')],
             ])
             try:
-                await q.edit_message_text(
+                await safe_query_edit_text(q, 
                     build_help_text(),
                     parse_mode='HTML', reply_markup=kb)
             except Exception as e:
@@ -13604,12 +14112,12 @@ class HydraRouteModule(ModuleBase):
         if action.startswith('ask:'):
             key = action[4:]
             if key in ('keenetic', 'genconfig'):
-                await q.answer('Небезопасная операция отключена. Конфигурация доступна через Neo.', show_alert=True)
+                await safe_query_answer(q, 'Небезопасная операция отключена. Конфигурация доступна через Neo.', show_alert=True)
                 return
-            await q.answer()
+            await safe_query_answer(q)
             a = ACTIONS.get(key)
             if not a:
-                await q.answer('Неизвестное действие', show_alert=True)
+                await safe_query_answer(q, 'Неизвестное действие', show_alert=True)
                 return
             desc = a['desc']
             if key == 'install':
@@ -13635,7 +14143,7 @@ class HydraRouteModule(ModuleBase):
                                       callback_data='hydraroute:main')],
             ])
             try:
-                await q.edit_message_text(text, parse_mode='HTML', reply_markup=kb)
+                await safe_query_edit_text(q, text, parse_mode='HTML', reply_markup=kb)
             except Exception as e:
                 if 'not modified' not in str(e).lower():
                     raise
@@ -13644,9 +14152,9 @@ class HydraRouteModule(ModuleBase):
         if action.startswith('go:'):
             key = action[3:]
             if key in ('keenetic', 'genconfig'):
-                await q.answer('Операция отключена', show_alert=True)
+                await safe_query_answer(q, 'Операция отключена', show_alert=True)
                 return
-            await q.answer()
+            await safe_query_answer(q)
             a = ACTIONS.get(key)
             if not a:
                 return
@@ -13654,9 +14162,9 @@ class HydraRouteModule(ModuleBase):
             return
 
         if action == 'kill':
-            await q.answer('Прерываю...')
+            await safe_query_answer(q, 'Прерываю...')
             self._kill()
-            await q.edit_message_text(
+            await safe_query_edit_text(q, 
                 '🛑 Операция прервана.\n\nНапишите /start для возврата в меню.',
             )
             return
@@ -13671,7 +14179,7 @@ class HydraRouteModule(ModuleBase):
             await self._answer(q, b'\r')
             return
 
-        await q.answer()
+        await safe_query_answer(q)
 
     async def _check_leftovers(self, ctx):
         try:
@@ -13695,7 +14203,7 @@ class HydraRouteModule(ModuleBase):
 
     async def _do_cleanup(self, q, ctx):
         if not getattr(self, '_leftovers', None):
-            await q.answer('Нечего удалять', show_alert=True)
+            await safe_query_answer(q, 'Нечего удалять', show_alert=True)
             return
 
         parts = []
@@ -13743,7 +14251,7 @@ class HydraRouteModule(ModuleBase):
             prefix='hydraroute',
         )
         try:
-            await q.edit_message_text(text, parse_mode='HTML', reply_markup=kb)
+            await safe_query_edit_text(q, text, parse_mode='HTML', reply_markup=kb)
         except Exception as e:
             if 'not modified' not in str(e).lower():
                 raise
@@ -13752,12 +14260,12 @@ class HydraRouteModule(ModuleBase):
         if key in self._uninstall_opts:
             toggle_opt(self._uninstall_opts, key)
             state = 'вкл' if self._uninstall_opts[key] else 'выкл'
-            await q.answer(f'{state}: {key}')
+            await safe_query_answer(q, f'{state}: {key}')
             await self._show_uninstall_menu(q, ctx)
             return
 
         if key == 'go':
-            await q.answer()
+            await safe_query_answer(q)
             targets = existing_targets(UNINSTALL_TARGETS)
             base_cmd = ('opkg remove hrneo' if getattr(self, '_uninstall_mode', 'full') == 'std'
                         else 'opkg remove hrneo hrweb')
@@ -13787,7 +14295,7 @@ class HydraRouteModule(ModuleBase):
             asyncio.create_task(self._run_action(ctx, action))
             return
 
-        await q.answer()
+        await safe_query_answer(q)
 
     async def _do_check_updates(self, q, ctx):
         info = await asyncio.to_thread(check_updates)
@@ -13820,7 +14328,7 @@ class HydraRouteModule(ModuleBase):
                                       callback_data='hydraroute:main')],
             ])
         try:
-            await q.edit_message_text('\n'.join(lines),
+            await safe_query_edit_text(q, '\n'.join(lines),
                                       parse_mode='HTML', reply_markup=kb)
         except Exception as e:
             if 'not modified' not in str(e).lower():
@@ -13863,7 +14371,7 @@ class HydraRouteModule(ModuleBase):
                                   callback_data='hydraroute:main')],
         ])
         try:
-            await q.edit_message_text(
+            await safe_query_edit_text(q, 
                 '🔑 <b>Пришли Keenetic RCI токен</b>\n\n'
                 'Следующим сообщением отправь токен.\n'
                 'Текущий конфиг будет сохранён.',
@@ -13880,7 +14388,7 @@ class HydraRouteModule(ModuleBase):
                                   callback_data='hydraroute:main')],
         ])
         try:
-            await q.edit_message_text(
+            await safe_query_edit_text(q, 
                 '🎯 <b>Куда идёт домен</b>\n\n'
                 'Пришли домен (например youtube.com). '
                 'Проверим его наличие в watchlist работающего Neo.',
@@ -13897,7 +14405,7 @@ class HydraRouteModule(ModuleBase):
                                            ('hrweb', installed.get('web')),
                                            ('hrdns', installed.get('hrdns'))) if val]
             if not pkgs:
-                if q: await q.answer('Нет установленных пакетов HydraRoute', show_alert=True)
+                if q: await safe_query_answer(q, 'Нет установленных пакетов HydraRoute', show_alert=True)
                 return
             action = dict(action, cmd='opkg update && opkg upgrade ' + ' '.join(pkgs))
         self._running = True
@@ -14078,14 +14586,14 @@ class HydraRouteModule(ModuleBase):
 
     async def _answer(self, q, payload: bytes):
         if not getattr(self, '_proc', None) or self._master_fd is None:
-            await q.answer('Сессия завершена', show_alert=False)
+            await safe_query_answer(q, 'Сессия завершена', show_alert=False)
             return
         try:
             os.write(self._master_fd, payload)
-            await q.answer(f'Отправлено: {payload.decode(errors="replace").strip() or "Enter"}')
+            await safe_query_answer(q, f'Отправлено: {payload.decode(errors="replace").strip() or "Enter"}')
         except OSError as e:
             log.warning('write failed: %s', e)
-            await q.answer(f'Ошибка: {e}', show_alert=True)
+            await safe_query_answer(q, f'Ошибка: {e}', show_alert=True)
             return
         self._awaiting_yn = False
         # _run_action сам перерисует статус через 1.2с
@@ -14477,6 +14985,7 @@ mkdir -p '/opt/router_bot/modules/keen_pbr'
 echo "  → /opt/router_bot/modules/keen_pbr/module.py"
 cat > '/opt/router_bot/modules/keen_pbr/module.py' << 'RB_MODULES_KEEN_PBR_MODULE_PY_EOF'
 """Модуль keen-pbr — policy-based routing."""
+from core.utils import safe_query_answer, safe_query_edit_text
 from core.module_base import ModuleBase
 import asyncio
 import html
@@ -14715,21 +15224,21 @@ class KeenPbrModule(ModuleBase):
 
     async def handle_callback(self, action, q, ctx):
         if action == 'main':
-            await q.answer()
+            await safe_query_answer(q)
             self._editing = False
             text, kb = self._build_card()
             try:
-                await q.edit_message_text(text, parse_mode='HTML', reply_markup=kb)
+                await safe_query_edit_text(q, text, parse_mode='HTML', reply_markup=kb)
             except Exception as e:
                 if 'not modified' not in str(e).lower():
                     raise
             return
 
         if action == 'kill':
-            await q.answer('Прерываю...')
+            await safe_query_answer(q, 'Прерываю...')
             self._kill()
             try:
-                await q.edit_message_text(
+                await safe_query_edit_text(q, 
                     '\U0001f6d1 Операция прервана.',
                     reply_markup=InlineKeyboardMarkup([
                         [InlineKeyboardButton('\u2b05\ufe0f Назад', callback_data='keen_pbr:main')],
@@ -14740,19 +15249,19 @@ class KeenPbrModule(ModuleBase):
             return
 
         if action == 'cleanup:all':
-            await q.answer()
+            await safe_query_answer(q)
             return await self._do_cleanup(q, ctx)
 
         if action == 'show_config':
-            await q.answer()
+            await safe_query_answer(q)
             return await self._show_config(q, ctx)
 
         if action == 'edit_config':
-            await q.answer()
+            await safe_query_answer(q)
             return await self._ask_new_config(q, ctx)
 
         if action == 'ask:uninstall':
-            await q.answer()
+            await safe_query_answer(q)
             return await self._show_uninstall_menu(q, ctx)
 
         if action.startswith('opt:'):
@@ -14760,10 +15269,10 @@ class KeenPbrModule(ModuleBase):
 
         if action.startswith('ask:'):
             key = action[4:]
-            await q.answer()
+            await safe_query_answer(q)
             a = ACTIONS.get(key)
             if not a:
-                await q.answer('Неизвестное действие', show_alert=True)
+                await safe_query_answer(q, 'Неизвестное действие', show_alert=True)
                 return
             text = (
                 f'{a["icon"]} <b>{a["title"]}</b>\n\n'
@@ -14777,7 +15286,7 @@ class KeenPbrModule(ModuleBase):
                                       callback_data='keen_pbr:main')],
             ])
             try:
-                await q.edit_message_text(text, parse_mode='HTML', reply_markup=kb)
+                await safe_query_edit_text(q, text, parse_mode='HTML', reply_markup=kb)
             except Exception as e:
                 if 'not modified' not in str(e).lower():
                     raise
@@ -14785,14 +15294,14 @@ class KeenPbrModule(ModuleBase):
 
         if action.startswith('go:'):
             key = action[3:]
-            await q.answer()
+            await safe_query_answer(q)
             a = ACTIONS.get(key)
             if not a:
                 return
             await self._start_action(q, ctx, key, a)
             return
 
-        await q.answer()
+        await safe_query_answer(q)
 
     # ================= конфиг =================
 
@@ -14822,7 +15331,7 @@ class KeenPbrModule(ModuleBase):
                                   callback_data='keen_pbr:main')],
         ])
         try:
-            await q.edit_message_text(text, parse_mode='HTML', reply_markup=kb)
+            await safe_query_edit_text(q, text, parse_mode='HTML', reply_markup=kb)
         except Exception as e:
             if 'not modified' not in str(e).lower():
                 raise
@@ -14841,7 +15350,7 @@ class KeenPbrModule(ModuleBase):
             [InlineKeyboardButton('\u274c Отмена', callback_data='keen_pbr:main')],
         ])
         try:
-            await q.edit_message_text(text, parse_mode='HTML', reply_markup=kb)
+            await safe_query_edit_text(q, text, parse_mode='HTML', reply_markup=kb)
         except Exception as e:
             if 'not modified' not in str(e).lower():
                 raise
@@ -15143,7 +15652,7 @@ class KeenPbrModule(ModuleBase):
             prefix='keen_pbr',
         )
         try:
-            await q.edit_message_text(text, parse_mode='HTML', reply_markup=kb)
+            await safe_query_edit_text(q, text, parse_mode='HTML', reply_markup=kb)
         except Exception as e:
             if 'not modified' not in str(e).lower():
                 raise
@@ -15152,12 +15661,12 @@ class KeenPbrModule(ModuleBase):
         if key in self._uninstall_opts:
             toggle_opt(self._uninstall_opts, key)
             state = 'вкл' if self._uninstall_opts[key] else 'выкл'
-            await q.answer(f'{state}: {key}')
+            await safe_query_answer(q, f'{state}: {key}')
             await self._show_uninstall_menu(q, ctx)
             return
 
         if key == 'go':
-            await q.answer()
+            await safe_query_answer(q)
             targets = existing_targets(UNINSTALL_TARGETS)
             cmd = collect_uninstall_cmd(targets, self._uninstall_opts, UNINSTALL_CMD)
             self._uninstall_opts = {}
@@ -15186,7 +15695,7 @@ class KeenPbrModule(ModuleBase):
             asyncio.create_task(self._reader_loop(ctx, pid, master))
             return
 
-        await q.answer()
+        await safe_query_answer(q)
 
     # ================= удаление остатков =================
 
@@ -15212,7 +15721,7 @@ class KeenPbrModule(ModuleBase):
 
     async def _do_cleanup(self, q, ctx):
         if not getattr(self, '_leftovers', None):
-            await q.answer('Нечего удалять', show_alert=True)
+            await safe_query_answer(q, 'Нечего удалять', show_alert=True)
             return
         parts = []
         total = len(self._leftovers)
@@ -15533,6 +16042,7 @@ mkdir -p '/opt/router_bot/modules/mtproxy'
 echo "  → /opt/router_bot/modules/mtproxy/module.py"
 cat > '/opt/router_bot/modules/mtproxy/module.py' << 'RB_MODULES_MTPROXY_MODULE_PY_EOF'
 """Модуль MTProxy — MTProto-прокси для Telegram."""
+from core.utils import safe_query_answer, safe_query_edit_text
 from core.module_base import ModuleBase
 import asyncio
 import html
@@ -15784,21 +16294,21 @@ class MTProxyModule(ModuleBase):
 
     async def handle_callback(self, action, q, ctx):
         if action == 'main':
-            await q.answer()
+            await safe_query_answer(q)
             self._editing = False
             text, kb = self._build_card()
             try:
-                await q.edit_message_text(text, parse_mode='HTML', reply_markup=kb)
+                await safe_query_edit_text(q, text, parse_mode='HTML', reply_markup=kb)
             except Exception as e:
                 if 'not modified' not in str(e).lower():
                     raise
             return
 
         if action == 'kill':
-            await q.answer('Прерываю...')
+            await safe_query_answer(q, 'Прерываю...')
             self._kill()
             try:
-                await q.edit_message_text(
+                await safe_query_edit_text(q, 
                     '\U0001f6d1 Операция прервана.',
                     reply_markup=InlineKeyboardMarkup([
                         [InlineKeyboardButton('\u2b05\ufe0f Назад', callback_data='mtproxy:main')],
@@ -15809,24 +16319,24 @@ class MTProxyModule(ModuleBase):
             return
 
         if action == 'cleanup:all':
-            await q.answer()
+            await safe_query_answer(q)
             return await self._do_cleanup(q, ctx)
 
         if action == 'noop':
-            await q.answer('✅ Ссылка скопирована')
+            await safe_query_answer(q, '✅ Ссылка скопирована')
             return
 
         if action == 'show_link':
-            await q.answer()
+            await safe_query_answer(q)
             return await self._show_link(q, ctx)
 
         if action == 'edit_config':
-            await q.answer()
+            await safe_query_answer(q)
             await self._show_config(q, ctx)
             return
 
         if action == 'ask:uninstall':
-            await q.answer()
+            await safe_query_answer(q)
             return await self._show_uninstall_menu(q, ctx)
 
         if action.startswith('opt:'):
@@ -15834,10 +16344,10 @@ class MTProxyModule(ModuleBase):
 
         if action.startswith('ask:'):
             key = action[4:]
-            await q.answer()
+            await safe_query_answer(q)
             a = ACTIONS.get(key)
             if not a:
-                await q.answer('Неизвестное действие', show_alert=True)
+                await safe_query_answer(q, 'Неизвестное действие', show_alert=True)
                 return
             text = (
                 f'{a["icon"]} <b>{a["title"]}</b>\n\n'
@@ -15851,7 +16361,7 @@ class MTProxyModule(ModuleBase):
                                       callback_data='mtproxy:main')],
             ])
             try:
-                await q.edit_message_text(text, parse_mode='HTML', reply_markup=kb)
+                await safe_query_edit_text(q, text, parse_mode='HTML', reply_markup=kb)
             except Exception as e:
                 if 'not modified' not in str(e).lower():
                     raise
@@ -15859,14 +16369,14 @@ class MTProxyModule(ModuleBase):
 
         if action.startswith('go:'):
             key = action[3:]
-            await q.answer()
+            await safe_query_answer(q)
             a = ACTIONS.get(key)
             if not a:
                 return
             await self._start_action(q, ctx, key, a)
             return
 
-        await q.answer()
+        await safe_query_answer(q)
 
     # ================= ссылка =================
 
@@ -15930,7 +16440,7 @@ class MTProxyModule(ModuleBase):
 
         text = '\n'.join(lines)
         try:
-            await q.edit_message_text(text, parse_mode='HTML', reply_markup=kb)
+            await safe_query_edit_text(q, text, parse_mode='HTML', reply_markup=kb)
         except Exception as e:
             if 'not modified' not in str(e).lower():
                 raise
@@ -15958,7 +16468,7 @@ class MTProxyModule(ModuleBase):
             [InlineKeyboardButton('\u2b05\ufe0f Назад', callback_data='mtproxy:main')],
         ])
         try:
-            await q.edit_message_text(text, parse_mode='HTML', reply_markup=kb)
+            await safe_query_edit_text(q, text, parse_mode='HTML', reply_markup=kb)
         except Exception as e:
             if 'not modified' not in str(e).lower():
                 raise
@@ -15976,7 +16486,7 @@ class MTProxyModule(ModuleBase):
             [InlineKeyboardButton('\u274c Отмена', callback_data='mtproxy:main')],
         ])
         try:
-            await q.edit_message_text(text, parse_mode='HTML', reply_markup=kb)
+            await safe_query_edit_text(q, text, parse_mode='HTML', reply_markup=kb)
         except Exception as e:
             if 'not modified' not in str(e).lower():
                 raise
@@ -16274,7 +16784,7 @@ class MTProxyModule(ModuleBase):
             prefix='mtproxy',
         )
         try:
-            await q.edit_message_text(text, parse_mode='HTML', reply_markup=kb)
+            await safe_query_edit_text(q, text, parse_mode='HTML', reply_markup=kb)
         except Exception as e:
             if 'not modified' not in str(e).lower():
                 raise
@@ -16283,12 +16793,12 @@ class MTProxyModule(ModuleBase):
         if key in self._uninstall_opts:
             toggle_opt(self._uninstall_opts, key)
             state = 'вкл' if self._uninstall_opts[key] else 'выкл'
-            await q.answer(f'{state}: {key}')
+            await safe_query_answer(q, f'{state}: {key}')
             await self._show_uninstall_menu(q, ctx)
             return
 
         if key == 'go':
-            await q.answer()
+            await safe_query_answer(q)
             targets = existing_targets(UNINSTALL_TARGETS)
             cmd = collect_uninstall_cmd(targets, self._uninstall_opts, UNINSTALL_CMD)
             self._uninstall_opts = {}
@@ -16317,7 +16827,7 @@ class MTProxyModule(ModuleBase):
             asyncio.create_task(self._reader_loop(ctx, pid, master))
             return
 
-        await q.answer()
+        await safe_query_answer(q)
 
     # ================= удаление остатков =================
 
@@ -16343,7 +16853,7 @@ class MTProxyModule(ModuleBase):
 
     async def _do_cleanup(self, q, ctx):
         if not getattr(self, '_leftovers', None):
-            await q.answer('Нечего удалять', show_alert=True)
+            await safe_query_answer(q, 'Нечего удалять', show_alert=True)
             return
         parts = []
         total = len(self._leftovers)
@@ -16643,6 +17153,7 @@ mkdir -p '/opt/router_bot/modules/neofit'
 echo "  → /opt/router_bot/modules/neofit/module.py"
 cat > '/opt/router_bot/modules/neofit/module.py' << 'RB_MODULES_NEOFIT_MODULE_PY_EOF'
 """Модуль NeoFit — веб-панель управления прокси на Keenetic."""
+from core.utils import safe_query_answer, safe_query_edit_text
 from core.module_base import ModuleBase
 import asyncio
 import html
@@ -16838,20 +17349,20 @@ class NeoFitModule(ModuleBase):
 
     async def handle_callback(self, action, q, ctx):
         if action == 'main':
-            await q.answer()
+            await safe_query_answer(q)
             text, kb = self._build_card()
             try:
-                await q.edit_message_text(text, parse_mode='HTML', reply_markup=kb)
+                await safe_query_edit_text(q, text, parse_mode='HTML', reply_markup=kb)
             except Exception as e:
                 if 'not modified' not in str(e).lower():
                     raise
             return
 
         if action == 'kill':
-            await q.answer('Прерываю...')
+            await safe_query_answer(q, 'Прерываю...')
             self._kill()
             try:
-                await q.edit_message_text(
+                await safe_query_edit_text(q, 
                     '\U0001f6d1 Операция прервана.',
                     reply_markup=InlineKeyboardMarkup([
                         [InlineKeyboardButton('\u2b05\ufe0f Назад', callback_data='neofit:main')],
@@ -16862,11 +17373,11 @@ class NeoFitModule(ModuleBase):
             return
 
         if action == 'cleanup:all':
-            await q.answer()
+            await safe_query_answer(q)
             return await self._do_cleanup(q, ctx)
 
         if action == 'ask:uninstall':
-            await q.answer()
+            await safe_query_answer(q)
             return await self._show_uninstall_menu(q, ctx)
 
         if action.startswith('opt:'):
@@ -16874,10 +17385,10 @@ class NeoFitModule(ModuleBase):
 
         if action.startswith('ask:'):
             key = action[4:]
-            await q.answer()
+            await safe_query_answer(q)
             a = ACTIONS.get(key)
             if not a:
-                await q.answer('Неизвестное действие', show_alert=True)
+                await safe_query_answer(q, 'Неизвестное действие', show_alert=True)
                 return
             text = (
                 f'{a["icon"]} <b>{a["title"]}</b>\n\n'
@@ -16889,7 +17400,7 @@ class NeoFitModule(ModuleBase):
                 [InlineKeyboardButton('\u274c Отмена', callback_data='neofit:main')],
             ])
             try:
-                await q.edit_message_text(text, parse_mode='HTML', reply_markup=kb)
+                await safe_query_edit_text(q, text, parse_mode='HTML', reply_markup=kb)
             except Exception as e:
                 if 'not modified' not in str(e).lower():
                     raise
@@ -16897,14 +17408,14 @@ class NeoFitModule(ModuleBase):
 
         if action.startswith('go:'):
             key = action[3:]
-            await q.answer()
+            await safe_query_answer(q)
             a = ACTIONS.get(key)
             if not a:
                 return
             await self._start_action(q, ctx, key, a)
             return
 
-        await q.answer()
+        await safe_query_answer(q)
 
     # ================= запуск =================
 
@@ -17166,7 +17677,7 @@ class NeoFitModule(ModuleBase):
             prefix='neofit',
         )
         try:
-            await q.edit_message_text(text, parse_mode='HTML', reply_markup=kb)
+            await safe_query_edit_text(q, text, parse_mode='HTML', reply_markup=kb)
         except Exception as e:
             if 'not modified' not in str(e).lower():
                 raise
@@ -17175,12 +17686,12 @@ class NeoFitModule(ModuleBase):
         if key in self._uninstall_opts:
             toggle_opt(self._uninstall_opts, key)
             state = 'вкл' if self._uninstall_opts[key] else 'выкл'
-            await q.answer(f'{state}: {key}')
+            await safe_query_answer(q, f'{state}: {key}')
             await self._show_uninstall_menu(q, ctx)
             return
 
         if key == 'go':
-            await q.answer()
+            await safe_query_answer(q)
             targets = existing_targets(UNINSTALL_TARGETS)
             cmd = collect_uninstall_cmd(targets, self._uninstall_opts, UNINSTALL_CMD)
             self._uninstall_opts = {}
@@ -17207,7 +17718,7 @@ class NeoFitModule(ModuleBase):
             asyncio.create_task(self._reader_loop(ctx, pid, master))
             return
 
-        await q.answer()
+        await safe_query_answer(q)
 
     # ================= удаление остатков =================
 
@@ -17231,7 +17742,7 @@ class NeoFitModule(ModuleBase):
 
     async def _do_cleanup(self, q, ctx):
         if not getattr(self, '_leftovers', None):
-            await q.answer('Нечего удалять', show_alert=True)
+            await safe_query_answer(q, 'Нечего удалять', show_alert=True)
             return
         parts = []
         total = len(self._leftovers)
@@ -17271,6 +17782,7 @@ RB_MODULES_NET_WATCH_INIT_PY_EOF
 mkdir -p '/opt/router_bot/modules/net_watch'
 echo "  → /opt/router_bot/modules/net_watch/module.py"
 cat > '/opt/router_bot/modules/net_watch/module.py' << 'RB_MODULES_NET_WATCH_MODULE_PY_EOF'
+from core.utils import safe_query_answer, safe_query_edit_text
 #!/opt/bin/python3
 from core.module_base import ModuleBase
 import asyncio
@@ -17281,6 +17793,7 @@ import os
 import re
 import subprocess
 import socket
+import time
 import urllib.request
 from datetime import datetime, timedelta
 
@@ -17332,6 +17845,128 @@ async def run_ndmc(cmd: str, timeout: float = 5) -> str:
     return out.decode(errors='replace')
 
 
+_DHCP_CACHE = {'at': 0.0, 'bindings': {}}
+_DHCP_CACHE_TTL = 60
+
+
+def _parse_dhcp_bindings(output: str) -> dict:
+    """Read only `lease:` blocks from `show ip dhcp bindings`.
+
+    Keep their IP as a *past/lease* address, not a confirmed active address.
+    """
+    found = {}
+    for block in re.split(r'(?m)^\s*lease:\s*$', output or '')[1:]:
+        fields = {}
+        for line in block.splitlines():
+            m = re.match(r'^\s*(mac|ip|hostname|name):\s*(.*?)\s*$', line, re.I)
+            if m:
+                fields[m.group(1).lower()] = m.group(2).strip()
+        mac = fields.get('mac', '').lower()
+        if not _looks_like_mac_token(mac):
+            continue
+        found[mac] = fields
+    return found
+
+
+async def _dhcp_bindings_cached() -> dict:
+    now = time.monotonic()
+    if now - _DHCP_CACHE['at'] < _DHCP_CACHE_TTL:
+        return _DHCP_CACHE['bindings']
+    # Cache even unsuccessful fetches; the poll loop can run every 5 seconds.
+    _DHCP_CACHE['at'] = now
+    try:
+        raw = await run_ndmc('show ip dhcp bindings', timeout=8)
+        bindings = _parse_dhcp_bindings(raw)
+    except Exception as e:
+        log.debug('DHCP bindings lookup failed: %s', e)
+        bindings = {}
+    _DHCP_CACHE['bindings'] = bindings
+    return bindings
+
+
+def _client_visible_name(info: dict) -> str:
+    name = str(info.get('name') or '').strip()
+    mac = str(info.get('mac') or '').strip()
+    if not name or _norm_client_token(name) == _norm_client_token(mac):
+        return 'Устройство без имени'
+    return name
+
+
+def _client_visible_ip(info: dict) -> str:
+    ip = str(info.get('ip') or '').strip()
+    return ip if ip and ip != '0.0.0.0' else 'IPv4 неизвестен'
+
+
+def _norm_client_token(value: str) -> str:
+    return ' '.join(str(value or '').strip().lower().split())
+
+
+def _looks_like_mac_token(value: str) -> bool:
+    return bool(re.fullmatch(r'[0-9a-f]{2}(?::[0-9a-f]{2}){5}', _norm_client_token(value)))
+
+
+def _bad_client_name(value: str, ssid: str = '', ap: str = '') -> bool:
+    token = _norm_client_token(value)
+    if not token:
+        return True
+    if _looks_like_mac_token(token):
+        return True
+    blocked = {_norm_client_token(ssid), _norm_client_token(ap)}
+    blocked.discard('')
+    if token in blocked:
+        return True
+    if token in {'unknown', 'device', 'client', 'host', 'wifi', 'wireless'}:
+        return True
+    return False
+
+
+def _ssdp_display_name(info: dict) -> str:
+    model = (info.get('ssdp_model') or '').strip()
+    model_desc = (info.get('ssdp_model_desc') or '').strip()
+    manufacturer = (info.get('ssdp_manufacturer') or '').strip()
+    if model and manufacturer:
+        if model.lower() in manufacturer.lower():
+            return model
+        return f'{manufacturer} {model}'
+    return model or model_desc or manufacturer
+
+
+def _pick_client_display_name(info: dict, known_name: str = '') -> str:
+    if known_name:
+        return str(known_name).strip() or info.get('mac', '')
+
+    ssid = info.get('ssid', '')
+    ap = info.get('ap', '')
+    candidates = []
+
+    hostname = (info.get('hostname') or '').strip()
+    if hostname:
+        candidates.append(hostname)
+
+    raw_name = (info.get('name') or '').strip()
+    if raw_name:
+        if ' - ' in raw_name:
+            left = raw_name.split(' - ', 1)[0].strip()
+            if left:
+                candidates.append(left)
+        candidates.append(raw_name)
+
+    ssdp_name = _ssdp_display_name(info)
+    if ssdp_name:
+        candidates.append(ssdp_name)
+
+    seen = set()
+    for candidate in candidates:
+        key = _norm_client_token(candidate)
+        if key in seen:
+            continue
+        seen.add(key)
+        if not _bad_client_name(candidate, ssid=ssid, ap=ap):
+            return candidate
+
+    return info.get('mac', '')
+
+
 async def get_active_clients() -> dict:
     output = await run_ndmc('show ip hotspot')
     if not output:
@@ -17370,13 +18005,21 @@ async def get_active_clients() -> dict:
         }
 
         in_ssdp = False
+        in_interface = False
         seen_flags = set()
         for raw in block.split('\n'):
             stripped = raw.strip()
             if not stripped:
                 continue
 
+            # NDMC prints both host.name and interface.name. The latter is the
+            # network segment label (e.g. Home), NOT the connected device.
+            if stripped == 'interface:':
+                in_interface = True
+                in_ssdp = False
+                continue
             if stripped == 'ssdp:':
+                in_interface = False
                 in_ssdp = True
                 continue
 
@@ -17385,6 +18028,15 @@ async def get_active_clients() -> dict:
             k, v = stripped.split(':', 1)
             k = k.strip()
             v = v.strip()
+
+            # Fields following the network interface stanza belong to the
+            # hotspot host again. Its nested name/description/id are ignored.
+            if in_interface:
+                if k in ('expires', 'registered', 'access', 'active',
+                         'link', 'ssid', 'authenticated'):
+                    in_interface = False
+                else:
+                    continue
 
             # ssdp: manufacturer / model / model-desc
             if in_ssdp:
@@ -17445,13 +18097,26 @@ async def get_active_clients() -> dict:
         if c['active'] != 'yes' and c.get('link', '') != 'up':
             continue
 
-        display = (known_names.get(mac)
-                   or (c['name'] if c['name'] and ' - ' not in c['name'] else None)
-                   or c['hostname']
-                   or (c['name'].split(' - ')[0].strip() if c['name'] and ' - ' in c['name'] else None)
-                   or mac)
-        c['name'] = display
         clients[mac] = c
+
+    # DHCP lease info is useful for devices without a hostname in hotspot.
+    # Do NOT use a DHCP lease as proof that a 0.0.0.0 hotspot address is live.
+    if any((not c.get('hostname') or c.get('ip') in ('', '0.0.0.0'))
+           for c in clients.values()):
+        bindings = await _dhcp_bindings_cached()
+        for mac, c in clients.items():
+            lease = bindings.get(mac.lower(), {})
+            if not c.get('hostname'):
+                hostname = lease.get('hostname', '') or lease.get('name', '')
+                if not _bad_client_name(hostname, c.get('ssid', ''), c.get('ap', '')):
+                    c['hostname'] = hostname
+            if c.get('ip') in ('', '0.0.0.0'):
+                lease_ip = lease.get('ip', '')
+                if lease_ip and lease_ip != '0.0.0.0':
+                    c['last_dhcp_ip'] = lease_ip
+
+    for mac, c in clients.items():
+        c['name'] = _pick_client_display_name(c, known_names.get(mac, ''))
 
     return clients
 
@@ -17764,8 +18429,8 @@ async def build_status_message():
         lines = [f'📡 <b>Активные клиенты ({len(clients)}):</b>']
         for mac, info in clients.items():
             is_blocked = mac in blocked
-            name = html.escape(info['name'])
-            ip = html.escape(info.get('ip', 'unknown'))
+            name = html.escape(_client_visible_name(info))
+            ip = html.escape(_client_visible_ip(info))
             mac_esc = html.escape(mac)
             icon = device_icon(
                 info['name'],
@@ -17785,7 +18450,7 @@ async def build_status_message():
             lines.append(f'        <code>{ip}</code>')
             lines.append(f'        <code>{mac_esc}</code>')
 
-            btn_name = info['name']
+            btn_name = _client_visible_name(info)
             if len(btn_name) > 28:
                 btn_name = btn_name[:25] + '...'
             name_btn = InlineKeyboardButton(f'{icon} {btn_name}', callback_data=f'dev:{mac}')
@@ -17806,8 +18471,8 @@ async def build_status_message():
 async def build_device_card(info: dict, blocked: list):
     """info — словарь из get_active_clients (или урезанный для офлайн)."""
     mac = info.get('mac', '')
-    name = info.get('name', mac)
-    ip = info.get('ip', 'unknown')
+    name = _client_visible_name(info)
+    ip = _client_visible_ip(info)
     hostname = info.get('hostname', '')
     is_blocked = mac in blocked
     history = get_history(mac, HISTORY_LIMIT)
@@ -17870,6 +18535,9 @@ async def build_device_card(info: dict, blocked: list):
 
     lines.append('')
     lines.append(f'IP: <code>{html.escape(ip)}</code>')
+    if info.get('last_dhcp_ip') and ip == 'IPv4 неизвестен':
+        lines.append('Последняя DHCP-аренда: <code>'
+                     + html.escape(info['last_dhcp_ip']) + '</code>')
     lines.append(f'MAC: <code>{html.escape(mac)}</code>')
 
     # --- Статус ---
@@ -17916,7 +18584,7 @@ async def build_device_card(info: dict, blocked: list):
 async def safe_edit(q, text, markup=None):
     """edit_message_text; при 'not modified' просто игнорируем."""
     try:
-        await q.edit_message_text(text, parse_mode='HTML', reply_markup=markup)
+        await safe_query_edit_text(q, text, parse_mode='HTML', reply_markup=markup)
     except Exception as e:
         if 'not modified' in str(e).lower():
             return
@@ -17995,8 +18663,8 @@ def _connection_line(info: dict) -> str:
 
 
 def _connect_text(info: dict) -> str:
-    name = info.get('name') or info.get('mac', '?')
-    ip = info.get('ip', 'unknown')
+    name = _client_visible_name(info)
+    ip = _client_visible_ip(info)
     mac = info.get('mac', '?')
     conn = _connection_line(info)
     return (
@@ -18008,7 +18676,7 @@ def _connect_text(info: dict) -> str:
 
 
 def _disconnect_text(info: dict) -> str:
-    name = info.get('name') or info.get('mac', '?')
+    name = _client_visible_name(info)
     mac = info.get('mac', '?')
     return (
         f'🔴 <b>Отключилось:</b> {html.escape(name)}\n'
@@ -18267,7 +18935,7 @@ class NetWatchModule(ModuleBase):
         await show_card(update, ctx, text, kb=kb)
 
     async def handle_callback(self, action: str, query, ctx):
-        await query.answer()
+        await safe_query_answer(query)
 
         if action == 'main':
             return await self._show_module_card(query, ctx)
@@ -18387,7 +19055,7 @@ class NetWatchModule(ModuleBase):
         if mac not in blocked:
             ok = await block_client(mac)
             if not ok:
-                await q.answer('❌ Не удалось заблокировать', show_alert=True)
+                await safe_query_answer(q, '❌ Не удалось заблокировать', show_alert=True)
                 return
             blocked.append(mac)
             save_json(BLOCKED_FILE, blocked)
@@ -18398,7 +19066,7 @@ class NetWatchModule(ModuleBase):
         blocked = load_json(BLOCKED_FILE, [])
         ok = await unblock_client(mac)
         if not ok:
-            await q.answer('❌ Не удалось разблокировать', show_alert=True)
+            await safe_query_answer(q, '❌ Не удалось разблокировать', show_alert=True)
             return
         if mac in blocked:
             blocked.remove(mac)
@@ -18430,17 +19098,17 @@ class NetWatchModule(ModuleBase):
         await safe_edit(q, text, kb)
 
     async def _do_sync_known(self, q, ctx):
-        await q.answer('Синхронизирую...')
+        await safe_query_answer(q, 'Синхронизирую...')
         try:
             added = await sync_known_hosts_from_router()
         except Exception as e:
             log.exception('sync_known failed: %s', e)
-            await q.answer('Ошибка: %s' % e, show_alert=True)
+            await safe_query_answer(q, 'Ошибка: %s' % e, show_alert=True)
             return
         if added:
-            await q.answer('Добавлено имён: %d' % added, show_alert=True)
+            await safe_query_answer(q, 'Добавлено имён: %d' % added, show_alert=True)
         else:
-            await q.answer('Новых имён с роутера нет', show_alert=True)
+            await safe_query_answer(q, 'Новых имён с роутера нет', show_alert=True)
         await self._show_module_card(q, ctx)
 
     async def _do_autoname(self, mac, q, ctx):
@@ -18703,6 +19371,7 @@ mkdir -p '/opt/router_bot/modules/ssh_control'
 echo "  → /opt/router_bot/modules/ssh_control/module.py"
 cat > '/opt/router_bot/modules/ssh_control/module.py' << 'RB_MODULES_SSH_CONTROL_MODULE_PY_EOF'
 """Модуль SSH Control: управление устройствами по SSH."""
+from core.utils import safe_query_answer, safe_query_edit_text
 from core.module_base import ModuleBase
 import asyncio
 import html
@@ -18850,7 +19519,7 @@ class SSHControlModule(ModuleBase):
         self.interactive_out_buffer = []
 
     async def handle_callback(self, action: str, q, ctx):
-        await q.answer()
+        await safe_query_answer(q)
 
         if action == 'main':
             return await self._show_card(q, ctx)
@@ -18990,7 +19659,7 @@ class SSHControlModule(ModuleBase):
     async def _wizard_port_default(self, q, ctx):
         self.temp['port'] = 22
         self.state = 'wizard:user'
-        await q.edit_message_text(
+        await safe_query_edit_text(q, 
             f"<b>Шаг 3/4.</b> Отправьте имя пользователя:\n"
             f"<i>Например: root или admin</i>",
             parse_mode='HTML',
@@ -19200,15 +19869,15 @@ class SSHControlModule(ModuleBase):
         if not all([ip, user, password]):
             self.state = 'idle'
             self.temp = {}
-            await q.answer('Данные потеряны, начните заново', show_alert=True)
+            await safe_query_answer(q, 'Данные потеряны, начните заново', show_alert=True)
             return
 
         hid = add_host(ip, port, user, password, fingerprint, key_type)
         self.state = 'idle'
         self.temp = {}
-        await q.answer('✅ Хост сохранён')
+        await safe_query_answer(q, '✅ Хост сохранён')
         try:
-            await q.edit_message_text(
+            await safe_query_edit_text(q, 
                 f'✅ <b>Хост добавлен</b>\n\n'
                 f'<code>{_esc(user)}@{_esc(ip)}:{port}</code>',
                 parse_mode='HTML',
@@ -19227,7 +19896,7 @@ class SSHControlModule(ModuleBase):
     async def _fp_reject(self, q, ctx):
         self.state = 'idle'
         self.temp = {}
-        await q.answer('Отклонено')
+        await safe_query_answer(q, 'Отклонено')
         await self._show_card(q, ctx)
 
     async def _delete_retry(self, ctx):
@@ -19424,10 +20093,10 @@ class SSHControlModule(ModuleBase):
 
     async def _answer_question(self, q, ctx, data: bytes):
         if not self.interactive:
-            await q.answer('Сессия уже завершена', show_alert=True)
+            await safe_query_answer(q, 'Сессия уже завершена', show_alert=True)
             return
         await self.interactive.send(data)
-        await q.answer(f'Отправлено: {data.decode().strip() or "Enter"}')
+        await safe_query_answer(q, f'Отправлено: {data.decode().strip() or "Enter"}')
         try:
             await q.message.delete()
         except Exception:
@@ -19440,7 +20109,7 @@ class SSHControlModule(ModuleBase):
                 self.interactive.kill()
             except Exception:
                 pass
-        await q.answer('Прервано')
+        await safe_query_answer(q, 'Прервано')
         try:
             await q.message.delete()
         except Exception:
@@ -19448,24 +20117,24 @@ class SSHControlModule(ModuleBase):
 
     async def _abort_interactive(self, q, ctx):
         if not self.interactive:
-            await q.answer('Уже завершено', show_alert=False)
+            await safe_query_answer(q, 'Уже завершено', show_alert=False)
             return
         try:
             self.interactive.kill()
         except Exception:
             pass
-        await q.answer('🛑 Прервано')
+        await safe_query_answer(q, '🛑 Прервано')
 
     async def _abort_script(self, q, ctx):
         if not self.current_script_proc:
-            await q.answer('Уже завершено', show_alert=False)
+            await safe_query_answer(q, 'Уже завершено', show_alert=False)
             return
         try:
             self.current_script_proc.kill()
         except Exception:
             pass
         self.current_script_proc = None
-        await q.answer('🛑 Прервано')
+        await safe_query_answer(q, '🛑 Прервано')
 
     async def _wait_interactive(self, ctx, chat_id, sess, hid):
         rc = await sess.wait(timeout=600)
@@ -19545,7 +20214,7 @@ class SSHControlModule(ModuleBase):
 
     async def _edit(self, q, text, kb):
         try:
-            await q.edit_message_text(text, parse_mode='HTML', reply_markup=kb)
+            await safe_query_edit_text(q, text, parse_mode='HTML', reply_markup=kb)
             set_last_msg(self.chat_id, q.message.message_id)
         except Exception as e:
             if 'not modified' in str(e).lower():
@@ -20111,6 +20780,7 @@ mkdir -p '/opt/router_bot/modules/system'
 echo "  → /opt/router_bot/modules/system/module.py"
 cat > '/opt/router_bot/modules/system/module.py' << 'RB_MODULES_SYSTEM_MODULE_PY_EOF'
 """Модуль System — состояние роутера."""
+from core.utils import safe_query_answer, safe_query_edit_text
 from core.module_base import ModuleBase
 import asyncio
 import html
@@ -20954,9 +21624,9 @@ class SystemModule(ModuleBase):
                      _cfg_login or '(none)', bool(_cfg_password))
 
             if _cfg_password:
-                await q.answer('Запускаю обновление...')
+                await safe_query_answer(q, 'Запускаю обновление...')
                 try:
-                    await q.edit_message_text(
+                    await safe_query_edit_text(q, 
                         '\u2b06\ufe0f <b>Обновление запущено</b>\n\n'
                         'Команда передана ядру KeeneticOS через ndmc.\n'
                         'Роутер начнёт обновление и перезагрузится '
@@ -20978,12 +21648,12 @@ class SystemModule(ModuleBase):
             self._fw_password = None
             self._fw_state = 'login'
             try:
-                await q.answer('Авторизация в ndmc')
+                await safe_query_answer(q, 'Авторизация в ndmc')
             except Exception as e:
                 log.warning('update_go answer failed: %s', e)
 
             try:
-                await q.edit_message_text(
+                await safe_query_edit_text(q, 
                     '\U0001f510 <b>Авторизация в ndmc</b>',
                     parse_mode='HTML',
                     reply_markup=None,
@@ -21020,12 +21690,12 @@ class SystemModule(ModuleBase):
                 log.info('fw_login: selected login=%s, waiting for password', _login)
 
                 try:
-                    await q.answer(f'Логин: {_login}')
+                    await safe_query_answer(q, f'Логин: {_login}')
                 except Exception:
                     pass
 
                 try:
-                    await q.edit_message_text(
+                    await safe_query_edit_text(q, 
                         f'\U0001f510 Логин: <code>{html.escape(str(_login))}</code>',
                         parse_mode='HTML',
                         reply_markup=None,
@@ -21049,13 +21719,13 @@ class SystemModule(ModuleBase):
             except Exception as e:
                 log.exception('fw_login processing failed: %s', e)
                 try:
-                    await q.answer('Ошибка при выборе логина', show_alert=True)
+                    await safe_query_answer(q, 'Ошибка при выборе логина', show_alert=True)
                 except Exception:
                     pass
             return
 
         if action == 'update_later':
-            await q.answer('Напомню через 7 дней')
+            await safe_query_answer(q, 'Напомню через 7 дней')
             st = _load_update_state()
             until = (datetime.now() + timedelta(days=7)).isoformat(timespec='seconds')
             st['snoozed_until'] = until
@@ -21063,7 +21733,7 @@ class SystemModule(ModuleBase):
             _save_update_state(st)
             log.info('update snoozed until %s', until)
             try:
-                await q.edit_message_text(
+                await safe_query_edit_text(q, 
                     '\u23ed <b>Напомню через 7 дней</b>\n\n'
                     f'До: <code>{until[:10]}</code>',
                     parse_mode='HTML',
@@ -21074,13 +21744,13 @@ class SystemModule(ModuleBase):
 
         if action in ('main', 'refresh', 'check_upd'):
             if action == 'check_upd':
-                await q.answer('Проверяю обновления...')
+                await safe_query_answer(q, 'Проверяю обновления...')
             else:
-                await q.answer()
+                await safe_query_answer(q)
             upd = await asyncio.to_thread(get_update_info, action == 'check_upd')
             text = await asyncio.to_thread(build_system_card, upd=upd)
             try:
-                await q.edit_message_text(
+                await safe_query_edit_text(q, 
                     text, parse_mode='HTML',
                     reply_markup=_kb(upd.get('update_available', False)),
                 )
@@ -21099,7 +21769,7 @@ class SystemModule(ModuleBase):
             return
 
         if action == 'update_ask':
-            await q.answer()
+            await safe_query_answer(q)
             kb = InlineKeyboardMarkup([
                 [InlineKeyboardButton('\u2705 Да, установить', callback_data='system:update_go')],
                 [InlineKeyboardButton('\u274c Отмена', callback_data='system:refresh')],
@@ -21111,7 +21781,7 @@ class SystemModule(ModuleBase):
                 'Продолжить?'
             )
             try:
-                await q.edit_message_text(text, parse_mode='HTML', reply_markup=kb)
+                await safe_query_edit_text(q, text, parse_mode='HTML', reply_markup=kb)
             except Exception as e:
                 if 'not modified' not in str(e).lower():
                     raise
@@ -21119,7 +21789,7 @@ class SystemModule(ModuleBase):
 
         if action == 'fw_save:yes':
             try:
-                await q.answer('Сохраняю...')
+                await safe_query_answer(q, 'Сохраняю...')
             except Exception:
                 pass
             cfg_path = '/opt/router_bot/config.env'
@@ -21132,7 +21802,7 @@ class SystemModule(ModuleBase):
                 log.info('NDMC credentials saved to config.env')
             except Exception as e:
                 log.warning('save ndmc creds failed: %s', e)
-                await q.edit_message_text(
+                await safe_query_edit_text(q, 
                     '❌ Не удалось безопасно сохранить учётные данные. '
                     'Обновление не запущено.',
                     reply_markup=InlineKeyboardMarkup([[
@@ -21146,7 +21816,7 @@ class SystemModule(ModuleBase):
 
         if action == 'fw_save:no':
             try:
-                await q.answer()
+                await safe_query_answer(q)
             except Exception:
                 pass
             await self._fw_start(q, ctx, self._fw_login, self._fw_password,
@@ -21177,7 +21847,7 @@ class SystemModule(ModuleBase):
             text = header + footer
 
         try:
-            await q.edit_message_text(text, parse_mode='HTML')
+            await safe_query_edit_text(q, text, parse_mode='HTML')
         except Exception as e:
             log.warning('_fw_start edit failed: %s', e)
 
@@ -21350,6 +22020,7 @@ mkdir -p '/opt/router_bot/modules/usque_keenetic'
 echo "  → /opt/router_bot/modules/usque_keenetic/module.py"
 cat > '/opt/router_bot/modules/usque_keenetic/module.py' << 'RB_MODULES_USQUE_KEENETIC_MODULE_PY_EOF'
 """Модуль usque-keenetic — Cloudflare WARP (MASQUE) для Keenetic."""
+from core.utils import safe_query_answer, safe_query_edit_text
 from core.module_base import ModuleBase
 import asyncio, html, logging, os, pty, re, time
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
@@ -21540,18 +22211,18 @@ class UsqueKeeneticModule(ModuleBase):
 
     async def handle_callback(self, action, q, ctx):
         if action == 'main':
-            await q.answer()
+            await safe_query_answer(q)
             text, kb = self._build_card()
             try:
-                await q.edit_message_text(text, parse_mode='HTML', reply_markup=kb)
+                await safe_query_edit_text(q, text, parse_mode='HTML', reply_markup=kb)
             except Exception as e:
                 if 'not modified' not in str(e).lower(): raise
             return
         if action == 'kill':
-            await q.answer('Прерываю...')
+            await safe_query_answer(q, 'Прерываю...')
             self._kill()
             try:
-                await q.edit_message_text(
+                await safe_query_edit_text(q, 
                     '\U0001f6d1 Операция прервана.',
                     reply_markup=InlineKeyboardMarkup([
                         [InlineKeyboardButton('\u2b05\ufe0f Назад',
@@ -21561,25 +22232,25 @@ class UsqueKeeneticModule(ModuleBase):
             except Exception: pass
             return
         if action == 'cleanup:all':
-            await q.answer()
+            await safe_query_answer(q)
             return await self._do_cleanup(q, ctx)
         if action == 'show_config':
-            await q.answer()
+            await safe_query_answer(q)
             return await self._show_config(q, ctx)
         if action == 'edit_config':
-            await q.answer()
+            await safe_query_answer(q)
             return await self._ask_new_config(q, ctx)
         if action == 'ask:uninstall':
-            await q.answer()
+            await safe_query_answer(q)
             return await self._show_uninstall_menu(q, ctx)
         if action.startswith('opt:'):
             return await self._handle_opt(q, ctx, action[4:])
         if action.startswith('ask:'):
             key = action[4:]
-            await q.answer()
+            await safe_query_answer(q)
             a = ACTIONS.get(key)
             if not a:
-                await q.answer('Неизвестное действие', show_alert=True)
+                await safe_query_answer(q, 'Неизвестное действие', show_alert=True)
                 return
             desc = a['desc']
             if key == 'install':
@@ -21604,18 +22275,18 @@ class UsqueKeeneticModule(ModuleBase):
                                       callback_data='usque_keenetic:main')],
             ])
             try:
-                await q.edit_message_text(text, parse_mode='HTML', reply_markup=kb)
+                await safe_query_edit_text(q, text, parse_mode='HTML', reply_markup=kb)
             except Exception as e:
                 if 'not modified' not in str(e).lower(): raise
             return
         if action.startswith('go:'):
             key = action[3:]
-            await q.answer()
+            await safe_query_answer(q)
             a = ACTIONS.get(key)
             if a:
                 await self._start_action(q, ctx, key, a)
             return
-        await q.answer()
+        await safe_query_answer(q)
 
     async def _start_action(self, q, ctx, key, action):
         if self._running:
@@ -21849,7 +22520,7 @@ class UsqueKeeneticModule(ModuleBase):
             prefix='usque_keenetic',
         )
         try:
-            await q.edit_message_text(text, parse_mode='HTML', reply_markup=kb)
+            await safe_query_edit_text(q, text, parse_mode='HTML', reply_markup=kb)
         except Exception as e:
             if 'not modified' not in str(e).lower(): raise
 
@@ -21857,11 +22528,11 @@ class UsqueKeeneticModule(ModuleBase):
         if key in self._uninstall_opts:
             toggle_opt(self._uninstall_opts, key)
             state = 'вкл' if self._uninstall_opts[key] else 'выкл'
-            await q.answer(f'{state}: {key}')
+            await safe_query_answer(q, f'{state}: {key}')
             await self._show_uninstall_menu(q, ctx)
             return
         if key == 'go':
-            await q.answer()
+            await safe_query_answer(q)
             targets = existing_targets(UNINSTALL_TARGETS)
             cmd = collect_uninstall_cmd(targets, self._uninstall_opts, UNINSTALL_CMD)
             self._uninstall_opts = {}
@@ -21884,7 +22555,7 @@ class UsqueKeeneticModule(ModuleBase):
             self._proc_pid = pid; self._master = master
             asyncio.create_task(self._reader_loop(ctx, pid, master))
             return
-        await q.answer()
+        await safe_query_answer(q)
 
     async def _show_config(self, q, ctx):
         cfg_path = '/opt/etc/usque/usque.conf'
@@ -21910,7 +22581,7 @@ class UsqueKeeneticModule(ModuleBase):
                                   callback_data='usque_keenetic:main')],
         ])
         try:
-            await q.edit_message_text(text, parse_mode='HTML', reply_markup=kb)
+            await safe_query_edit_text(q, text, parse_mode='HTML', reply_markup=kb)
         except Exception as e:
             if 'not modified' not in str(e).lower():
                 raise
@@ -21930,7 +22601,7 @@ class UsqueKeeneticModule(ModuleBase):
                                   callback_data='usque_keenetic:main')],
         ])
         try:
-            await q.edit_message_text(text, parse_mode='HTML', reply_markup=kb)
+            await safe_query_edit_text(q, text, parse_mode='HTML', reply_markup=kb)
         except Exception as e:
             if 'not modified' not in str(e).lower():
                 raise
@@ -21985,7 +22656,7 @@ class UsqueKeeneticModule(ModuleBase):
 
     async def _do_cleanup(self, q, ctx):
         if not getattr(self, '_leftovers', None):
-            await q.answer('Нечего удалять', show_alert=True); return
+            await safe_query_answer(q, 'Нечего удалять', show_alert=True); return
         parts = []
         total = len(self._leftovers)
         for p in self._leftovers:
@@ -22300,6 +22971,7 @@ mkdir -p '/opt/router_bot/modules/xkeen'
 echo "  → /opt/router_bot/modules/xkeen/module.py"
 cat > '/opt/router_bot/modules/xkeen/module.py' << 'RB_MODULES_XKEEN_MODULE_PY_EOF'
 """Модуль XKeen — установка/управление XKeen."""
+from core.utils import safe_query_answer, safe_query_edit_text
 from core.module_base import ModuleBase
 import asyncio
 import html
@@ -22681,55 +23353,55 @@ class XKeenModule(ModuleBase):
 
     async def handle_callback(self, action, q, ctx):
         if action == 'main':
-            await q.answer()
+            await safe_query_answer(q)
             self._submenu = None
             text, kb = self._build_card()
             try:
-                await q.edit_message_text(text, parse_mode='HTML', reply_markup=kb)
+                await safe_query_edit_text(q, text, parse_mode='HTML', reply_markup=kb)
             except Exception as e:
                 if 'not modified' not in str(e).lower():
                     raise
             return
 
         if action == 'service_menu':
-            await q.answer()
+            await safe_query_answer(q)
             self._submenu = 'service'
             text, kb = self._build_service_menu()
             try:
-                await q.edit_message_text(text, parse_mode='HTML', reply_markup=kb)
+                await safe_query_edit_text(q, text, parse_mode='HTML', reply_markup=kb)
             except Exception as e:
                 if 'not modified' not in str(e).lower():
                     raise
             return
 
         if action == 'system_menu':
-            await q.answer()
+            await safe_query_answer(q)
             self._submenu = 'system'
             text, kb = self._build_system_menu()
             try:
-                await q.edit_message_text(text, parse_mode='HTML', reply_markup=kb)
+                await safe_query_edit_text(q, text, parse_mode='HTML', reply_markup=kb)
             except Exception as e:
                 if 'not modified' not in str(e).lower():
                     raise
             return
 
         if action == 'updates_menu':
-            await q.answer()
+            await safe_query_answer(q)
             self._submenu = 'updates'
             text, kb = self._build_updates_menu()
             try:
-                await q.edit_message_text(text, parse_mode='HTML', reply_markup=kb)
+                await safe_query_edit_text(q, text, parse_mode='HTML', reply_markup=kb)
             except Exception as e:
                 if 'not modified' not in str(e).lower():
                     raise
             return
 
         if action == 'cleanup:all':
-            await q.answer()
+            await safe_query_answer(q)
             return await self._do_cleanup(q, ctx)
 
         if action == 'ask:uninstall':
-            await q.answer()
+            await safe_query_answer(q)
             return await self._show_uninstall_menu(q, ctx)
 
         if action.startswith('opt:'):
@@ -22737,10 +23409,10 @@ class XKeenModule(ModuleBase):
 
         if action.startswith('ask:'):
             key = action[4:]
-            await q.answer()
+            await safe_query_answer(q)
             a = ACTIONS.get(key)
             if not a:
-                await q.answer('Неизвестное действие', show_alert=True)
+                await safe_query_answer(q, 'Неизвестное действие', show_alert=True)
                 return
             desc = a['desc']
             if key == 'install':
@@ -22767,7 +23439,7 @@ class XKeenModule(ModuleBase):
                                       callback_data='xkeen:main')],
             ])
             try:
-                await q.edit_message_text(text, parse_mode='HTML', reply_markup=kb)
+                await safe_query_edit_text(q, text, parse_mode='HTML', reply_markup=kb)
             except Exception as e:
                 if 'not modified' not in str(e).lower():
                     raise
@@ -22775,7 +23447,7 @@ class XKeenModule(ModuleBase):
 
         if action.startswith('go:'):
             key = action[3:]
-            await q.answer()
+            await safe_query_answer(q)
             a = ACTIONS.get(key)
             if not a:
                 return
@@ -22783,10 +23455,10 @@ class XKeenModule(ModuleBase):
             return
 
         if action == 'kill':
-            await q.answer('Прерываю...')
+            await safe_query_answer(q, 'Прерываю...')
             self._kill()
             try:
-                await q.edit_message_text(
+                await safe_query_edit_text(q, 
                     '\U0001f6d1 Операция прервана.',
                     reply_markup=InlineKeyboardMarkup([
                         [InlineKeyboardButton('\u2b05\ufe0f Назад',
@@ -22814,20 +23486,20 @@ class XKeenModule(ModuleBase):
                 await self._answer(q, (digit + '\r').encode())
                 return
 
-        await q.answer()
+        await safe_query_answer(q)
 
     async def _answer(self, q, payload: bytes):
         if not getattr(self, '_proc_pid', None) or self._master is None:
-            await q.answer('Сессия завершена', show_alert=False)
+            await safe_query_answer(q, 'Сессия завершена', show_alert=False)
             return
         try:
             os.write(self._master, payload)
-            await q.answer(
+            await safe_query_answer(q, 
                 f'Отправлено: {payload.decode(errors="replace").strip() or "Enter"}',
             )
         except OSError as e:
             log.warning('write failed: %s', e)
-            await q.answer(f'Ошибка: {e}', show_alert=True)
+            await safe_query_answer(q, f'Ошибка: {e}', show_alert=True)
             return
         self._awaiting_yn = False
         await self._update_status(bot=q.bot)
@@ -22855,7 +23527,7 @@ class XKeenModule(ModuleBase):
 
     async def _do_cleanup(self, q, ctx):
         if not getattr(self, '_leftovers', None):
-            await q.answer('Нечего удалять', show_alert=True)
+            await safe_query_answer(q, 'Нечего удалять', show_alert=True)
             return
 
         parts = []
@@ -22911,7 +23583,7 @@ class XKeenModule(ModuleBase):
             prefix='xkeen',
         )
         try:
-            await q.edit_message_text(text, parse_mode='HTML', reply_markup=kb)
+            await safe_query_edit_text(q, text, parse_mode='HTML', reply_markup=kb)
         except Exception as e:
             if 'not modified' not in str(e).lower():
                 raise
@@ -22919,12 +23591,12 @@ class XKeenModule(ModuleBase):
         if key in self._uninstall_opts:
             toggle_opt(self._uninstall_opts, key)
             state = 'вкл' if self._uninstall_opts[key] else 'выкл'
-            await q.answer(f'{state}: {key}')
+            await safe_query_answer(q, f'{state}: {key}')
             await self._show_uninstall_menu(q, ctx)
             return
 
         if key == 'go':
-            await q.answer()
+            await safe_query_answer(q)
             targets = existing_targets(UNINSTALL_TARGETS)
             base_cmd = ('xkeen -remove 2>&1 || true ; '
                         'opkg remove '
@@ -22961,7 +23633,7 @@ class XKeenModule(ModuleBase):
             asyncio.create_task(self._reader_loop(ctx, pid, master))
             return
 
-        await q.answer()
+        await safe_query_answer(q)
     async def _start_action(self, q, ctx, key, action):
         if self._running:
             return
@@ -23758,14 +24430,22 @@ cat > /opt/router_bot/telegram_routes_persist.sh << 'RB_KEENETIC_TG_ROUTES_EOF'
 # Keenetic-managed interfaces: persistent ndmc routes, saved to KeeneticOS configuration.
 # All selected VPN types: reconcile active kernel routes on router network events.
 # A saved NDM route is not proof that the route is active in Linux table main.
-# Never overwrite an existing static route pointing elsewhere.
-CONF=/opt/router_bot/config.env
+# Only an EXPLICIT user-selected route switch may replace existing exact Telegram
+# destinations not registered to Router Bot. Background apply/repair remains strict.
+CONF=${RB_TG_CONFIG_FILE:-/opt/router_bot/config.env}
 NDMC=/bin/ndmc
 HOOK=95-routerbot-telegram-routes.sh
 ACTION=${1:-apply}
 TG_NETS='149.154.166.110|32|255.255.255.255 149.154.160.0|20|255.255.240.0 91.108.4.0|22|255.255.252.0'
 
 case "$ACTION" in apply|status|repair|fallback-repair) ;; *) echo 'Использование: telegram_routes_persist.sh {apply|status|repair}'; exit 2 ;; esac
+# Do not let a periodic cron/NDM repair restore the OLD interface while the
+# installer is testing new static routes from staged configuration.
+if [ "$ACTION" = repair ] || [ "$ACTION" = fallback-repair ]; then
+    if [ -d /opt/tmp/routerbot-install.lock ] && [ -z "${RB_TG_CONFIG_FILE:-}" ]; then
+        exit 0
+    fi
+fi
 [ -f "$CONF" ] || { echo 'Telegram: config.env отсутствует'; exit 1; }
 
 read_key() {
@@ -23775,20 +24455,27 @@ USE_VPN=$(read_key USE_VPN)
 VPN_IF=$(read_key VPN_IF)
 VPN_SRC=$(read_key VPN_SRC)
 K_IF_CFG=$(read_key TG_KEENETIC_IF)
-[ "$USE_VPN" = yes ] || exit 0
-[ -n "$VPN_IF" ] || { echo 'Telegram: VPN_IF не выбран'; exit 1; }
-case "$VPN_IF" in *[!a-zA-Z0-9_.:-]*|'') echo 'Telegram: небезопасное имя интерфейса'; exit 1 ;; esac
+[ "$USE_VPN" = yes ] || : # cleanup is handled below
+[ "$USE_VPN" != yes ] || [ -n "$VPN_IF" ] || { echo 'Telegram: VPN_IF не выбран'; exit 1; }
+if [ "$USE_VPN" = yes ]; then
+    case "$VPN_IF" in *[!a-zA-Z0-9_.:-]*|'') echo 'Telegram: небезопасное имя интерфейса'; exit 1 ;; esac
+fi
 
 # Detect current tunnel IPv4 (do not rely on a stale VPN_SRC from old config).
-_live_src=$(ip -4 -o addr show dev "$VPN_IF" 2>/dev/null | awk '$3=="inet" {split($4,a,"/"); print a[1]; exit}')
-[ -n "$_live_src" ] && VPN_SRC=$_live_src
-case "$VPN_SRC" in *[!0-9.]*|'') echo "Telegram: нет IPv4 на выбранном $VPN_IF"; exit 1 ;; esac
+if [ "$USE_VPN" = yes ]; then
+    _live_src=$(ip -4 -o addr show dev "$VPN_IF" 2>/dev/null | awk '$3=="inet" {split($4,a,"/"); print a[1]; exit}')
+    [ -n "$_live_src" ] && VPN_SRC=$_live_src
+    case "$VPN_SRC" in *[!0-9.]*|'') echo "Telegram: нет IPv4 на выбранном $VPN_IF"; exit 1 ;; esac
+fi
 
 # Query Keenetic's own system-name resolver rather than inferring nwg/awg/ovpn/etc.
 # CLI since KeeneticOS 4.03: "show interface Wireguard4 system-name" -> "nwg4".
 resolve_keenetic_interface() {
     [ -x "$NDMC" ] || return 1
-    /opt/bin/python3 - "$VPN_IF" "$K_IF_CFG" <<'PY'
+    _resolve_if=${1:-$VPN_IF}
+    _resolve_manual=''
+    [ "$_resolve_if" != "$VPN_IF" ] || _resolve_manual=$K_IF_CFG
+    /opt/bin/python3 - "$_resolve_if" "$_resolve_manual" <<'PY'
 import re, subprocess, sys
 linux_name, manual = sys.argv[1:3]
 
@@ -23875,61 +24562,251 @@ HOOKEOF
     rm -f /opt/router_bot/data/telegram_routes_linux_fallback
 }
 
-# Explicit, safe reconciliation for Linux table main. An NDM route in
-# running-config can be temporarily missing from the kernel after a VPN change.
-# Route creation is ADD-only: never replace or delete someone else's entry.
-# Preflight all three exact destinations before making any modification.
-repair_linux_routes() {
-    failed=0
-    kernel_before=$(ip -4 route show table main 2>/dev/null) || {
-        echo '⚠️ Не удалось прочитать Linux main'; return 1;
-    }
-    for entry in $TG_NETS; do
-        dst=${entry%%|*}; rem=${entry#*|}; prefix=${rem%%|*}
-        net="$dst/$prefix"
-        existing=$(printf '%s\n' "$kernel_before" |
-            awk -v net="$net" -v dst="$dst" '$1==net || $1==dst')
-        [ -n "$existing" ] || continue
-        if ! printf '%s\n' "$existing" | awk -v dev="$VPN_IF" '
-            {found=0; for(i=1;i<NF;i++) if($i=="dev" && $(i+1)==dev)found=1;
-             if(!found)bad=1} END{exit bad}' ; then
-            echo "⚠️ $net в Linux main направлен не через $VPN_IF; чужой маршрут не изменён"
-            failed=1
+# The NDM static route is often replicated into multiple Linux routing tables.
+# A competing HydraRoute route can still take precedence, e.g. opkgtun0 metric
+# 0 vs opkgtun3 metric 1000. Do not delete or overwrite someone else's route.
+# Router Bot uses an isolated policy table and destination-only RPDB rules.
+# Priorities 2000..2002 are AFTER the current Keenetic fwmark policy rules
+# (1150..1156) but BEFORE source rules (2152..), and Linux main (32766).
+# Preflight refuses to occupy somebody else's table or rule priorities.
+POLICY_TABLE=22097
+POLICY_STATE=/opt/router_bot/data/telegram_policy_owner
+POLICY_PREF=2000
+NDM_OWNER=/opt/router_bot/data/telegram_ndm_owner
+OWNER_MAGIC=routerbot-telegram-ndm-v1
+
+# Last successfully managed NDM interface. Unlike Linux routes, this file is
+# persisted on /opt, so it survives a reboot and survives a lost VPN interface.
+ndm_owner_read() {
+    [ -f "$NDM_OWNER" ] || return 1
+    [ "$(sed -n '1p' "$NDM_OWNER")" = "$OWNER_MAGIC" ] || return 1
+    sed -n '2p' "$NDM_OWNER"
+}
+ndm_owner_save() {
+    mkdir -p /opt/router_bot/data || return 1
+    _tmp="$NDM_OWNER.$$"
+    printf '%s\n%s\n%s\n' "$OWNER_MAGIC" "$K_IF" "$VPN_IF" > "$_tmp" || return 1
+    chmod 600 "$_tmp" && mv -f "$_tmp" "$NDM_OWNER"
+}
+
+# Ownership marker is used for automatic idempotent upkeep. An explicit
+# RB_TG_REPLACE_EXISTING=yes switch additionally authorizes replacement of
+# ONLY the three exact Telegram static destinations, after journaling them.
+previous_ndm_interface() {
+    _own=$(ndm_owner_read 2>/dev/null) || _own=''
+    if [ -n "$_own" ]; then
+        case "$_own" in *[!a-zA-Z0-9_/-]*|'') return 1 ;; esac
+        printf '%s\n' "$_own"
+        return 0
+    fi
+    _old_linux=${RB_PREVIOUS_VPN_IF:-}
+    case "$_old_linux" in ''|*[!a-zA-Z0-9_.:-]*) return 1 ;; esac
+    _previous=$(resolve_keenetic_interface "$_old_linux" 2>/dev/null) || _previous=''
+    # Old inactive opkgtun interfaces may no longer be listed by NDM;
+    # this fallback is ONLY used to match the exact interface name in a
+    # previously saved, exact Telegram-specific route, not to touch others.
+    case "$_old_linux" in
+        opkgtun[0-9]*) [ -n "$_previous" ] || _previous="OpkgTun${_old_linux#opkgtun}" ;;
+        opkgtap[0-9]*) [ -n "$_previous" ] || _previous="OpkgTap${_old_linux#opkgtap}" ;;
+    esac
+    [ -n "$_previous" ] || return 1
+    printf '%s\n' "$_previous"
+}
+
+# Interface field varies for host routes and subnet routes in running-config.
+route_ndm_if() {
+    _line=$1; _mask=$2
+    printf '%s\n' "$_line" | awk -v mask="$_mask" '
+        $1=="ip" && $2=="route" {
+            if ($4==mask) print $5;
+            else print $4;
+        }'
+}
+
+# An exact destination and exact NDM interface avoid deleting unrelated routes.
+ndm_remove_exact() {
+    _dst=$1; _mask=$2; _prefix=$3; _iface=$4
+    if [ "$_prefix" = 32 ]; then
+        "$NDMC" -c "no ip route $_dst $_iface" >/dev/null 2>&1
+    else
+        "$NDMC" -c "no ip route $_dst $_mask $_iface" >/dev/null 2>&1
+    fi
+}
+
+policy_routes() {
+    # Stable preference numbers for all supported Telegram destinations.
+    printf '%s\n' '149.154.166.110/32|2000|149.154.166.110' \
+        '149.154.160.0/20|2001|149.154.160.1' \
+        '91.108.4.0/22|2002|91.108.4.1'
+}
+
+policy_rule_exists() {
+    # Check the exact owned rule, not any rule at the same preference.
+    ip -4 rule show 2>/dev/null | awk -v p="$1" -v n="$2" -v tab="$POLICY_TABLE" '
+        $1 == p ":" {
+            found = 0; matchto = 0; matchtab = 0
+            for (i=1;i<=NF;i++) {
+                if ($i == "to" && ($(i+1) == n || (n ~ /\/32$/ && $(i+1) == substr(n, 1, length(n)-3)))) matchto = 1
+                if ($i == "lookup" && $(i+1) == tab) matchtab = 1
+            }
+            if (matchto && matchtab) found = 1
+        }
+        END {exit !found}'
+}
+
+policy_preflight() {
+    _rules=$(ip -4 rule show 2>/dev/null) || return 1
+    _table=$(ip -4 route show table "$POLICY_TABLE" 2>/dev/null) || _table=''  # absent table
+    if [ ! -f "$POLICY_STATE" ] && [ -n "$_table" ]; then
+        echo "⚠️ Таблица $POLICY_TABLE уже занята, ничего не меняю"
+        return 1
+    fi
+    if [ -f "$POLICY_STATE" ] && [ "$(head -n 1 "$POLICY_STATE")" != 'routerbot-telegram-policy-v1' ]; then
+        echo '⚠️ Маркер таблицы Telegram неизвестен, ничего не меняю'
+        return 1
+    fi
+    # Do not insert before fwmark rules: that would override HydraRoute policy.
+    if printf '%s\n' "$_rules" | awk '
+        /fwmark/ {
+            split($1, a, ":")
+            if (a[1] ~ /^[0-9]+$/ && a[1] >= 2000) bad=1
+        }
+        END {exit !bad}'; then
+        echo '⚠️ Найден fwmark приоритетом 2000 или ниже: автоматическое правило небезопасно'
+        return 1
+    fi
+    if printf '%s\n' "$_rules" | awk -v tab="$POLICY_TABLE" '
+        {for(i=1;i<NF;i++) if($i=="lookup" && $(i+1)==tab) {
+            if($1 != "2000:" && $1 != "2001:" && $1 != "2002:") bad=1
+        }} END{exit !bad}'; then
+        echo "⚠️ Таблица $POLICY_TABLE используется посторонним правилом"
+        return 1
+    fi
+    for _entry in $(policy_routes); do
+        _net=${_entry%%|*}; _rem=${_entry#*|}; _pref=${_rem%%|*}
+        _existing=$(printf '%s\n' "$_rules" | awk -v p="$_pref:" '$1 == p')
+        if [ -n "$_existing" ] && ! policy_rule_exists "$_pref" "$_net"; then
+            echo "⚠️ Приоритет $_pref занят чужим правилом, ничего не меняю"
+            return 1
         fi
     done
-    [ "$failed" -eq 0 ] || return 1
+    # If owned table exists, it must contain ONLY our three networks.
+    if [ -n "$_table" ] && ! printf '%s\n' "$_table" | awk '
+        NF && $1 != "149.154.166.110" && $1 != "149.154.166.110/32" &&
+              $1 != "149.154.160.0/20" && $1 != "91.108.4.0/22" {bad=1}
+        END {exit bad}'; then
+        echo "⚠️ В таблице $POLICY_TABLE есть посторонние маршруты"
+        return 1
+    fi
+    return 0
+}
 
-    for entry in $TG_NETS; do
-        dst=${entry%%|*}; rem=${entry#*|}; prefix=${rem%%|*}
-        net="$dst/$prefix"
-        existing=$(printf '%s\n' "$kernel_before" |
-            awk -v net="$net" -v dst="$dst" '$1==net || $1==dst')
-        if [ -n "$existing" ]; then
-            [ "$ACTION" = repair ] || [ "$ACTION" = fallback-repair ] || \
-                echo "✓ Активный маршрут $net через $VPN_IF"
+policy_enable() {
+    policy_preflight || return 1
+    if [ "$ACTION" = status ]; then
+        return 0
+    fi
+    mkdir -p /opt/router_bot/data || return 1
+    # Write ownership marker BEFORE making changes; interrupted setup can be
+    # safely reconciled by a later repair hook.
+    if [ ! -f "$POLICY_STATE" ]; then
+        printf 'routerbot-telegram-policy-v1\n' > "$POLICY_STATE" || return 1
+        chmod 600 "$POLICY_STATE" || return 1
+    fi
+    for _entry in $(policy_routes); do
+        _net=${_entry%%|*}; _rem=${_entry#*|}; _pref=${_rem%%|*}
+        ip -4 route replace "$_net" dev "$VPN_IF" src "$VPN_SRC" \
+            table "$POLICY_TABLE" >/dev/null 2>&1 || {
+            echo "⚠️ Не удалось настроить $_net в таблице $POLICY_TABLE"
+            return 1
+        }
+    done
+    for _entry in $(policy_routes); do
+        _net=${_entry%%|*}; _rem=${_entry#*|}; _pref=${_rem%%|*}
+        if ! policy_rule_exists "$_pref" "$_net"; then
+            ip -4 rule add pref "$_pref" to "$_net" lookup "$POLICY_TABLE" \
+                2>/dev/null || policy_rule_exists "$_pref" "$_net" || {
+                echo "⚠️ Не удалось создать правило $_pref для $_net"
+                return 1
+            }
+        fi
+    done
+    return 0
+}
+
+policy_disable() {
+    # Clean up ONLY our own rules, after an explicit USE_VPN=no change.
+    [ -f "$POLICY_STATE" ] || return 0
+    [ "$(head -n 1 "$POLICY_STATE")" = 'routerbot-telegram-policy-v1' ] || return 1
+    for _entry in $(policy_routes); do
+        _net=${_entry%%|*}; _rem=${_entry#*|}; _pref=${_rem%%|*}
+        if policy_rule_exists "$_pref" "$_net"; then
+            ip -4 rule del pref "$_pref" to "$_net" lookup "$POLICY_TABLE" || return 1
+        fi
+        ip -4 route del "$_net" table "$POLICY_TABLE" >/dev/null 2>&1 || true
+    done
+    rm -f "$POLICY_STATE"
+}
+
+if [ "$USE_VPN" != yes ]; then
+    policy_disable
+    exit $?
+fi
+
+repair_linux_routes() {
+    _failed=0
+    _kernel_before=$(ip -4 route show table main 2>/dev/null) || {
+        echo '⚠️ Не удалось прочитать Linux main'; return 1;
+    }
+    for _entry in $TG_NETS; do
+        _dst=${_entry%%|*}; _rem=${_entry#*|}; _prefix=${_rem%%|*}
+        _net="$_dst/$_prefix"
+        _existing=$(printf '%s\n' "$_kernel_before" |
+            awk -v net="$_net" -v dst="$_dst" '$1==net || $1==dst')
+        if [ -n "$_existing" ]; then
+            # Older versions treated ANY foreign route as a fatal error,
+            # even if a valid selected route existed with a higher metric.
+            if printf '%s\n' "$_existing" | awk -v dev="$VPN_IF" '
+                {ok=0; for(i=1;i<NF;i++) if($i=="dev" && $(i+1)==dev) ok=1;
+                 if(!ok)other=1} END{exit !other}'; then
+                echo "· $_net: Linux main содержит маршрут другого VPN; сохраняю его"
+            fi
             continue
         fi
         if [ "$ACTION" = status ]; then
-            echo "✗ $net настроен, но отсутствует в Linux main"
-            failed=1
+            echo "· $_net отсутствует в Linux main"
             continue
         fi
-        if ip -4 route add "$net" dev "$VPN_IF" src "$VPN_SRC" table main 2>/dev/null; then
-            echo "✓ Восстановлен Linux-маршрут $net через $VPN_IF"
+        if ip -4 route add "$_net" dev "$VPN_IF" src "$VPN_SRC" table main 2>/dev/null; then
+            echo "✓ Добавлен маршрут Linux main: $_net через $VPN_IF"
         else
-            echo "⚠️ Не удалось восстановить Linux-маршрут $net через $VPN_IF"
-            failed=1
+            echo "⚠️ Не удалось добавить $_net в Linux main"
+            _failed=1
         fi
     done
-    # Both routing tables and ip rule priorities affect the actual decision.
-    # Report a warning instead of silently declaring a saved config sufficient.
-    actual=$(ip -4 route get 149.154.166.110 2>/dev/null | head -1)
-    case " $actual " in
-        *" dev $VPN_IF "*) : ;;
-        *) echo "⚠️ Фактический маршрут к Telegram не через $VPN_IF: ${actual:-нет маршрута}";
-           failed=1 ;;
-    esac
-    return "$failed"
+    if [ "$ACTION" = status ]; then
+        for _entry in $(policy_routes); do
+            _net=${_entry%%|*}; _rem=${_entry#*|}; _pref=${_rem%%|*}
+            policy_rule_exists "$_pref" "$_net" || {
+                echo "· $_net: правило Router Bot $_pref не найдено"
+            }
+        done
+    else
+        policy_enable || _failed=1
+    fi
+    for _entry in $(policy_routes); do
+        _net=${_entry%%|*}; _rem=${_entry#*|}; _pref=${_rem%%|*}; _probe=${_rem#*|}
+        _actual=$(ip -4 route get "$_probe" 2>/dev/null | head -1)
+        case " $_actual " in
+            *" dev $VPN_IF "*)
+                [ "$ACTION" = repair ] || [ "$ACTION" = fallback-repair ] || \
+                    echo "✓ $_net: фактический выход через $VPN_IF" ;;
+            *)
+                echo "⚠️ $_net: фактический маршрут не через $VPN_IF: ${_actual:-нет маршрута}"
+                _failed=1 ;;
+        esac
+    done
+    return "$_failed"
 }
 
 if [ "$ACTION" = repair ] || [ "$ACTION" = fallback-repair ]; then
@@ -23939,15 +24816,81 @@ fi
 
 K_IF=$(resolve_keenetic_interface 2>/dev/null) || K_IF=''
 if [ -z "$K_IF" ]; then
-    echo "ℹ️ $VPN_IF не зарегистрирован в KeeneticOS; использую Linux-маршруты с восстановлением по событиям."
+    echo "⚠️ Не удалось сопоставить Linux $VPN_IF с именем интерфейса KeeneticOS."
+    echo '  Постоянные ip route KeeneticOS для этого VPN не создаются.'
+    echo '  Восстановление работает через Linux policy routing и события интерфейсов.' 
     if [ "$ACTION" = apply ]; then
         install_repair_hooks || { echo '⚠️ Не удалось включить восстановление маршрутов'; exit 1; }
     fi
-    repair_linux_routes
-    exit $?
+    # Configure the new real Linux path first, before removing old NDM routes.
+    repair_linux_routes || exit 1
+    [ "$ACTION" != apply ] || {
+        _old_ndm=$(previous_ndm_interface 2>/dev/null) || _old_ndm=''
+        if [ -n "$_old_ndm" ]; then
+            _config=$(get_running_config) || exit 1
+            _journal=/opt/tmp/routerbot-tg-ndm-linux.$$
+            : > "$_journal" || exit 1
+            chmod 600 "$_journal" || exit 1
+            # Refuse foreign routes on any of the three exact destinations.
+            for _entry in $TG_NETS; do
+                _dst=${_entry%%|*}; _rem=${_entry#*|}; _pre=${_rem%%|*}; _mask=${_rem#*|}
+                _rows=$(printf '%s
+' "$_config" | find_routes "$_dst" "$_pre" "$_mask")
+                while IFS= read -r _row; do
+                    [ -n "$_row" ] || continue
+                    _iface=$(route_ndm_if "$_row" "$_mask")
+                    if [ "$_iface" != "$_old_ndm" ] && [ "${RB_TG_REPLACE_EXISTING:-}" != yes ]; then
+                        echo "❌ Статический маршрут $_dst/$_pre у чужого интерфейса $_iface; не удаляю"
+                        rm -f "$_journal"
+                        exit 1
+                    fi
+                    printf '%s
+' "$_row" >> "$_journal"
+                done <<OLD_NDM_ROWS_EOF
+$_rows
+OLD_NDM_ROWS_EOF
+            done
+            _failed=0
+            while IFS= read -r _row; do
+                [ -n "$_row" ] || continue
+                _dst=$(printf '%s
+' "$_row" | awk '{print $3}')
+                _dst=${_dst%%/*}
+                case "$_dst" in
+                    149.154.166.110) _pre=32; _mask=255.255.255.255 ;;
+                    149.154.160.0) _pre=20; _mask=255.255.240.0 ;;
+                    91.108.4.0) _pre=22; _mask=255.255.252.0 ;;
+                    *) _failed=1; break ;;
+                esac
+                _route_iface=$(route_ndm_if "$_row" "$_mask")
+                [ -n "$_route_iface" ] || { _failed=1; break; }
+                ndm_remove_exact "$_dst" "$_mask" "$_pre" "$_route_iface" || { _failed=1; break; }
+                echo "✓ Удалён старый постоянный маршрут $_dst/$_pre через $_route_iface"
+            done < "$_journal"
+            if [ "$_failed" = 0 ]; then
+                "$NDMC" -c 'system configuration save' >/dev/null 2>&1 || _failed=1
+            fi
+            if [ "$_failed" != 0 ]; then
+                echo '⚠️ Сбой при удалении старых NDM-маршрутов, восстанавливаю их'
+                while IFS= read -r _row; do
+                    [ -n "$_row" ] || continue
+                    "$NDMC" -c "$_row" >/dev/null 2>&1 || true
+                done < "$_journal"
+                "$NDMC" -c 'system configuration save' >/dev/null 2>&1 || true
+                rm -f "$_journal"
+                exit 1
+            fi
+            rm -f "$_journal" "$NDM_OWNER"
+        fi
+    }
+    exit 0
 fi
 
 echo "Telegram: $VPN_IF соответствует интерфейсу KeeneticOS $K_IF"
+if [ "$ACTION" = status ]; then
+    repair_linux_routes
+    exit $?
+fi
 # Keenetic-managed tunnels also need hooks: NDM may temporarily withdraw its
 # routes when another VPN interface is created.
 [ "$ACTION" != apply ] || install_repair_hooks || {
@@ -23956,63 +24899,294 @@ echo "Telegram: $VPN_IF соответствует интерфейсу Keenetic
 BEFORE=$(get_running_config) || { echo '⚠️ Не удалось прочитать конфигурацию KeeneticOS'; exit 1; }
 [ -n "$BEFORE" ] || { echo '⚠️ Конфигурация KeeneticOS пуста'; exit 1; }
 
-# Check ALL conflicting routes before modifying anything.
+# Transactional replacement of NDM static routes for exactly three Telegram
+# destinations. Routine automatic apply requires prior ownership. Explicit
+# user-selected changes may replace legacy/unregistered static Telegram routes.
+# Never touch unrelated destinations, default routes, or HydraRoute tables.
+OLD_K_IF=$(previous_ndm_interface 2>/dev/null) || OLD_K_IF=''
+case "$OLD_K_IF" in *[!a-zA-Z0-9_/-]*) OLD_K_IF='' ;; esac
+# An upgrade user must explicitly answer "y" to switch their Telegram tunnel.
+# This flag is process-local. Cron, boot hooks and routine repairs never set it.
+RB_TG_ALLOW_REPLACE=no
+if [ "$ACTION" = apply ] && [ "${RB_TG_REPLACE_EXISTING:-}" = yes ]; then
+    RB_TG_ALLOW_REPLACE=yes
+fi
+
+# First, check the whole change is safe BEFORE removing any route.
 for entry in $TG_NETS; do
     dst=${entry%%|*}; rem=${entry#*|}; prefix=${rem%%|*}; mask=${rem#*|}
     existing=$(printf '%s\n' "$BEFORE" | find_routes "$dst" "$prefix" "$mask")
-    if [ -n "$existing" ] && ! printf '%s\n' "$existing" | route_via_selected; then
-        echo "⚠️ Статический маршрут $dst/$prefix уже ведёт через другой интерфейс. Ничего не меняю."
-        exit 1
-    fi
+    [ -n "$existing" ] || continue
+    _prev_ifs=$(printf '%s\n' "$existing" | while IFS= read -r _line; do
+        [ -n "$_line" ] || continue
+        route_ndm_if "$_line" "$mask"
+    done)
+    for _iface in $_prev_ifs; do
+        if [ "$_iface" != "$K_IF" ] && [ "$_iface" != "$OLD_K_IF" ]; then
+            if [ "$RB_TG_ALLOW_REPLACE" = yes ]; then
+                echo "  ↪ $dst/$prefix: найден прежний маршрут через $_iface; будет заменён на $K_IF"
+            else
+                echo "❌ $dst/$prefix закреплён за $_iface и не зарегистрирован в Router Bot."
+                echo '   Для замены выберите новый туннель в интерактивном мастере или rb config tun.'
+                exit 1
+            fi
+        fi
+    done
 done
 
+# Journal of old NDM commands allows restoring previous running-config if
+# any delete/add/verification/save operation fails.
+JOURNAL=/opt/tmp/routerbot-tg-ndm.$$  # outside /opt/router_bot/data, no secret
+: > "$JOURNAL" || exit 1
+chmod 600 "$JOURNAL" || exit 1
+added=''
 changed=0
 failed=0
+ndm_rollback() {
+    echo '⚠️ Отменяю неудачную замену постоянных маршрутов Telegram...'
+    for _created in $added; do
+        _dst=${_created%%|*}; _rest=${_created#*|}
+        _pre=${_rest%%|*}; _mask=${_rest#*|}
+        ndm_remove_exact "$_dst" "$_mask" "$_pre" "$K_IF" >/dev/null 2>&1 || true
+    done
+    while IFS= read -r _saved; do
+        [ -n "$_saved" ] || continue
+        "$NDMC" -c "$_saved" >/dev/null 2>&1 || true
+    done < "$JOURNAL"
+    "$NDMC" -c 'system configuration save' >/dev/null 2>&1 || true
+    rm -f "$JOURNAL"
+    return 1
+}
+
 for entry in $TG_NETS; do
     dst=${entry%%|*}; rem=${entry#*|}; prefix=${rem%%|*}; mask=${rem#*|}
     existing=$(printf '%s\n' "$BEFORE" | find_routes "$dst" "$prefix" "$mask")
+    _have_selected=no
     if [ -n "$existing" ]; then
+        _old_rows=$(printf '%s\n' "$existing" | while IFS= read -r _line; do
+            [ -n "$_line" ] || continue
+            _iface=$(route_ndm_if "$_line" "$mask")
+            [ "$_iface" = "$K_IF" ] || printf '%s\n' "$_line"
+        done)
+        if [ -n "$_old_rows" ]; then
+            while IFS= read -r _line; do
+                [ -n "$_line" ] || continue
+                _iface=$(route_ndm_if "$_line" "$mask")
+                printf '%s\n' "$_line" >> "$JOURNAL" || { ndm_rollback; exit 1; }
+                if ! ndm_remove_exact "$dst" "$mask" "$prefix" "$_iface"; then
+                    echo "❌ KeeneticOS отказался удалить $dst/$prefix с $_iface"
+                    ndm_rollback; exit 1
+                fi
+                echo "✓ Удалён старый постоянный маршрут $dst/$prefix через $_iface"
+                changed=1
+            done <<ROUTE_OLD_ROWS_EOF
+$_old_rows
+ROUTE_OLD_ROWS_EOF
+        fi
+    fi
+    current=$(get_running_config) || { ndm_rollback; exit 1; }
+    leftover=$(printf '%s\n' "$current" | find_routes "$dst" "$prefix" "$mask")
+    if [ -n "$leftover" ]; then
+        if ! printf '%s\n' "$leftover" | route_via_selected; then
+            echo "❌ После удаления $dst/$prefix остался неподтверждённый маршрут"
+            ndm_rollback; exit 1
+        fi
         echo "✓ $dst/$prefix уже закреплён за $K_IF"
+        BEFORE=$current
         continue
     fi
-    [ "$ACTION" = status ] && { echo "· $dst/$prefix не настроен"; continue; }
     if [ "$prefix" = 32 ]; then
         cmd="ip route $dst $K_IF auto"
     else
         cmd="ip route $dst $mask $K_IF auto"
     fi
     if ! "$NDMC" -c "$cmd" >/dev/null 2>&1; then
-        echo "⚠️ KeeneticOS не принял маршрут $dst/$prefix"; failed=1; continue
+        echo "❌ KeeneticOS не принял новый маршрут $dst/$prefix"
+        ndm_rollback; exit 1
     fi
-    current=$(get_running_config) || { failed=1; continue; }
+    added="$added $dst|$prefix|$mask"
+    current=$(get_running_config) || { ndm_rollback; exit 1; }
     found=$(printf '%s\n' "$current" | find_routes "$dst" "$prefix" "$mask")
     if [ -n "$found" ] && printf '%s\n' "$found" | route_via_selected; then
         echo "✓ Создан постоянный маршрут $dst/$prefix через $K_IF"
         changed=1; BEFORE=$current
     else
-        echo "⚠️ Не удалось подтвердить маршрут $dst/$prefix"; failed=1
+        echo "❌ Не удалось подтвердить новый $dst/$prefix"
+        ndm_rollback; exit 1
     fi
 done
 if [ "$changed" = 1 ]; then
-    if "$NDMC" -c 'system configuration save' >/dev/null 2>&1; then
-        echo '✅ Маршруты Telegram сохранены в KeeneticOS'
-    else
-        echo '⚠️ KeeneticOS не сохранила конфигурацию'; failed=1
+    if ! "$NDMC" -c 'system configuration save' >/dev/null 2>&1; then
+        echo '❌ KeeneticOS не сохранила новые постоянные маршруты'
+        ndm_rollback; exit 1
     fi
+    echo '✅ Постоянные маршруты Telegram заменены и сохранены в KeeneticOS'
 fi
-# Crucial: reconcile the ACTIVE table even if all three permanent NDM routes
-# were already present. This is the reported 0.0.10-01 regression.
-repair_linux_routes || failed=1
-[ "$failed" = 0 ]
+rm -f "$JOURNAL"
+# Persist ownership only after NDM commits. The Linux rules are separate and
+# are reconciled at each network event/reboot from this selected configuration.
+if [ "$ACTION" != status ]; then
+    ndm_owner_save || { echo '❌ Не удалось сохранить владельца NDM-маршрутов'; exit 1; }
+fi
+repair_linux_routes
+[ "$?" -eq 0 ]
 RB_KEENETIC_TG_ROUTES_EOF
 chmod +x /opt/router_bot/telegram_routes_persist.sh
 
+# ROUTERBOT-LEGACY-CLEANUP-v1: only known obsolete Router Bot artifacts.
+cat > /opt/router_bot/cleanup_legacy.sh << 'RB_LEGACY_CLEANUP_EOF'
+#!/bin/sh
+# Cleanup only allowlisted legacy Router Bot artifacts, not other Entware services.
+BASE=/opt/router_bot
+OLD=/opt/etc/init.d/S99wifihealthcheck
+SAVE=$BASE/data/legacy_disabled
+mkdir -p "$SAVE" || exit 1
+STAMP=$(date +%Y%m%d_%H%M%S)
+MATCH=no
+if [ -f "$OLD" ]; then
+    if grep -Fq '/opt/router_bot/config.env' "$OLD" &&
+       grep -Fq '/var/run/wifinotifier.fail' "$OLD" &&
+       grep -Fq '/opt/etc/init.d/S98routerbot' "$OLD"; then
+        MATCH=yes
+    else
+        echo "⚠️ $OLD не распознан как старый Router Bot; оставлен без изменений"
+    fi
+else
+    MATCH=yes
+fi
+if [ "$MATCH" = yes ]; then
+    if [ -f "$OLD" ]; then
+        mv "$OLD" "$SAVE/S99wifihealthcheck.$STAMP.disabled" || exit 1
+        echo '✓ Старый S99wifihealthcheck выключен и перемещён в резерв'
+    fi
+    _cr_changed=no
+    for _f in /opt/etc/crontab /opt/etc/crontabs/root /opt/var/spool/cron/crontabs/root; do
+        [ -f "$_f" ] || continue
+        if grep -Fq '/opt/etc/init.d/S99wifihealthcheck' "$_f"; then
+            cp -p "$_f" "$SAVE/$(echo "$_f" | tr / _).$STAMP.bak" || exit 1
+            sed -i '\|/opt/etc/init.d/S99wifihealthcheck|d' "$_f" || exit 1
+            echo "✓ Удалено старое задание из $_f"
+            _cr_changed=yes
+        fi
+    done
+    if [ "$_cr_changed" = yes ] && [ -x /opt/etc/init.d/S10cron ]; then
+        /opt/etc/init.d/S10cron restart >/dev/null 2>&1 || \
+            echo '⚠️ Не удалось перезапустить crond, новое расписание вступит в силу позже'
+    fi
+fi
+# Starting with 0.0.10-13, the bundle records ALL files it owns.
+# On future updates, move only previously owned files absent from the new
+# package manifest. No arbitrary scan/removal of user data or custom modules.
+if [ -r "${RB_OLD_MANIFEST:-}" ] && [ -r "$BASE/managed_files.list" ]; then
+    while IFS= read -r _old; do
+        case "$_old" in
+            /opt/router_bot/core/*|/opt/router_bot/modules/*|/opt/router_bot/init/*|/opt/router_bot/*.sh|/opt/router_bot/main.py) : ;;
+            *) continue ;;
+        esac
+        [ -f "$_old" ] || continue
+        if ! grep -Fxq "$_old" "$BASE/managed_files.list"; then
+            _name=$(printf '%s' "${_old#/opt/router_bot/}" | tr / _)
+            mv "$_old" "$SAVE/${_name}.${STAMP}.obsolete" || exit 1
+            echo "✓ Старый файл Router Bot выведен из эксплуатации: $_old"
+        fi
+    done < "$RB_OLD_MANIFEST"
+fi
+# Obsolete files created by earlier versions of this exact installer.
+for _old in "$BASE/core/tg_proxy.py" "$BASE/uninstall_helper.py"; do
+    if [ -f "$_old" ]; then
+        rm -f "$_old" || exit 1
+        echo "✓ Удалён устаревший файл $_old"
+    fi
+done
+if [ "$MATCH" = yes ]; then
+    rm -f /var/run/wifinotifier.fail 2>/dev/null || true
+fi
+exit 0
+RB_LEGACY_CLEANUP_EOF
+chmod 755 /opt/router_bot/cleanup_legacy.sh
+# Manifest of generated Router Bot-owned files. Unlisted files are user-owned.
+cat > /opt/router_bot/managed_files.list <<'RB_MANAGED_FILES_EOF'
+/opt/router_bot/cleanup_legacy.sh
+/opt/router_bot/core/__init__.py
+/opt/router_bot/core/config.py
+/opt/router_bot/core/list_modules.py
+/opt/router_bot/core/main.py
+/opt/router_bot/core/module_base.py
+/opt/router_bot/core/module_loader.py
+/opt/router_bot/core/rb
+/opt/router_bot/core/router.py
+/opt/router_bot/core/utils.py
+/opt/router_bot/core/wrapper.sh
+/opt/router_bot/ensure_init.sh
+/opt/router_bot/init/S97tgroutes
+/opt/router_bot/init/S98routerbot
+/opt/router_bot/init/S99routerbot_health
+/opt/router_bot/install.sh
+/opt/router_bot/main.py
+/opt/router_bot/managed_files.list
+/opt/router_bot/modules/__init__.py
+/opt/router_bot/modules/awg_manager/__init__.py
+/opt/router_bot/modules/awg_manager/actions.py
+/opt/router_bot/modules/awg_manager/module.py
+/opt/router_bot/modules/bird/__init__.py
+/opt/router_bot/modules/bird/actions.py
+/opt/router_bot/modules/bird/module.py
+/opt/router_bot/modules/flashkeen/__init__.py
+/opt/router_bot/modules/flashkeen/actions.py
+/opt/router_bot/modules/flashkeen/module.py
+/opt/router_bot/modules/hydraroute/__init__.py
+/opt/router_bot/modules/hydraroute/actions.py
+/opt/router_bot/modules/hydraroute/module.py
+/opt/router_bot/modules/hydraroute/neo_manager.py
+/opt/router_bot/modules/hydraroute/neo_ui.py
+/opt/router_bot/modules/keen_pbr/__init__.py
+/opt/router_bot/modules/keen_pbr/actions.py
+/opt/router_bot/modules/keen_pbr/module.py
+/opt/router_bot/modules/mtproxy/__init__.py
+/opt/router_bot/modules/mtproxy/actions.py
+/opt/router_bot/modules/mtproxy/module.py
+/opt/router_bot/modules/neofit/__init__.py
+/opt/router_bot/modules/neofit/actions.py
+/opt/router_bot/modules/neofit/module.py
+/opt/router_bot/modules/net_watch/__init__.py
+/opt/router_bot/modules/net_watch/module.py
+/opt/router_bot/modules/ssh_control/__init__.py
+/opt/router_bot/modules/ssh_control/module.py
+/opt/router_bot/modules/ssh_control/ssh_client.py
+/opt/router_bot/modules/ssh_control/storage.py
+/opt/router_bot/modules/system/__init__.py
+/opt/router_bot/modules/system/module.py
+/opt/router_bot/modules/usque_keenetic/__init__.py
+/opt/router_bot/modules/usque_keenetic/actions.py
+/opt/router_bot/modules/usque_keenetic/module.py
+/opt/router_bot/modules/xkeen/__init__.py
+/opt/router_bot/modules/xkeen/actions.py
+/opt/router_bot/modules/xkeen/module.py
+/opt/router_bot/restore_init.sh
+/opt/router_bot/telegram_routes_persist.sh
+/opt/router_bot/uninstall.sh
+RB_MANAGED_FILES_EOF
+chmod 600 /opt/router_bot/managed_files.list
+
+# Verify the transaction paths REALLY reached a child shell before touching
+# VPN routes or requesting secrets. The rollback trap remains active here.
+if ! sh -c '[ -n "$RB_ROUTE_TXN_MARKER" ] && [ -n "$RB_ROUTE_TARGET" ] && [ -d "${RB_ROUTE_TXN_MARKER%/*}" ]'; then
+    echo '❌ Внутреннему установщику не передана транзакция Telegram-маршрутов.'
+    exit 1
+fi
 sh /opt/router_bot/install.sh
 _RC=$?
 if [ "$_RC" -eq 0 ]; then
     echo "→ Проверяю маршруты Telegram для выбранного интерфейса..."
-    /opt/router_bot/telegram_routes_persist.sh apply || \
-        echo '⚠️ Автоматическая защита маршрутов Telegram требует проверки'
+    /opt/router_bot/telegram_routes_persist.sh apply || {
+        echo '❌ Автоматическая защита маршрутов Telegram не установлена'
+        exit 1
+    }
+    echo '→ Удаляю устаревшие компоненты Router Bot...'
+    RB_OLD_MANIFEST="$_RB_SAVE/opt/router_bot/managed_files.list" \
+        /opt/router_bot/cleanup_legacy.sh || {
+        echo '⚠️ Не удалось завершить очистку старых файлов (другие компоненты не затронуты)'
+    }
 fi
 
 
